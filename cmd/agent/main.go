@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -26,7 +27,11 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/jun-bank/infra/internal/auth"
 	"github.com/jun-bank/infra/internal/httpentry"
+	"github.com/jun-bank/infra/internal/store"
 )
 
 // role은 이 바이너리가 띄우는 역할의 닫힌 집합이다(DO-21).
@@ -83,9 +88,14 @@ func runMain() error {
 		return fmt.Errorf("설정 로딩 실패: %w", err)
 	}
 
+	deps, err := buildDeps()
+	if err != nil {
+		return fmt.Errorf("게이트 1·store 조립 실패: %w", err)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           httpentry.NewHandler(cfg),
+		Handler:           httpentry.NewHandler(cfg, deps),
 		ReadHeaderTimeout: 10 * time.Second, // slowloris 완화 — timeout 값은 [구현 검증](DO-15 ⑷)
 	}
 
@@ -111,6 +121,34 @@ func runMain() error {
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+// buildDeps는 진입 층이 판정을 위임할 협력자들을 환경에서 조립한다: 게이트 1
+// verifier(AGENT_HMAC_KEY)와 배포 스키마 store(DEPLOY_DB_DSN). 어느 하나라도 없으면
+// 오류를 반환해 기동을 막는다(fail-closed — 검증 못 하거나 원장에 쓸 수 없는 채로
+// 배포 수신을 열지 않는다, DO-17 ⑷). DB 핸들은 지연 연결이며(sql.Open은 접속하지
+// 않는다) 실제 접속 실패는 요청 시점에 fail-closed로 드러난다.
+func buildDeps() (httpentry.Deps, error) {
+	authCfg, err := auth.LoadConfig()
+	if err != nil {
+		return httpentry.Deps{}, fmt.Errorf("게이트 1 설정: %w", err)
+	}
+	verifier, err := auth.NewVerifier(authCfg, nil) // 기본 벽시계
+	if err != nil {
+		return httpentry.Deps{}, fmt.Errorf("게이트 1 verifier: %w", err)
+	}
+
+	dsn := os.Getenv("DEPLOY_DB_DSN")
+	if dsn == "" {
+		return httpentry.Deps{}, errors.New("DEPLOY_DB_DSN 미설정 (배포 스키마 접속은 .env에서 온다)")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return httpentry.Deps{}, fmt.Errorf("배포 DB 열기: %w", err)
+	}
+	st := store.New(db)
+
+	return httpentry.Deps{Verifier: verifier, Ledger: st, History: st}, nil
 }
 
 // runAgent는 ROLE=agent의 실행자 역할이다. 아직 미구현이므로 기동을 거부한다
