@@ -14,17 +14,32 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // ErrNotImplemented는 스캐폴드 표면을 표시한다.
 var ErrNotImplemented = errors.New("store: not implemented (scaffold)")
 
-// ErrReplay는 requestId나 jti가 이미 예약된 경우 — 즉 재생 — Reserve가 반환한다.
-// 재생은 ledger의 UNIQUE 제약에 의해 INSERT 시점에 거부된다(ADR-027 DO-10).
-// 이는 writer의 선의에 의존하지 않는 방어다.
+// ErrReplay는 요청이 이미 예약된 경우 — 즉 재생 — Reserve가 반환한다. 두 형태다:
+// 동일 requestId + 동일 body digest(같은 요청의 재전송), 또는 재사용된 OIDC jti
+// (토큰 재사용). 어느 쪽이든 재실행하지 않고 그 요청의 현재 상태를 반환해야 한다
+// (ADR-027 DO-10 ⑷ 앞가지). ledger의 UNIQUE 제약이 INSERT 시점에 재생을 거부하므로,
+// 이 방어는 writer의 선의에 의존하지 않는다.
 var ErrReplay = errors.New("store: request already reserved (replay)")
+
+// ErrDigestConflict는 동일 requestId가 다른 body digest로 다시 온 경우 Reserve가
+// 반환한다(ADR-027 DO-10 ⑷ 뒷가지 — "동일 requestId + 다른 digest = 거절·기록").
+// 재생과 달리 이것은 현재 상태 반환이 아니라 거절·기록해야 하는 충돌이다: 같은 멱등
+// 키로 다른 내용을 배포하려는 시도이기 때문이다.
+var ErrDigestConflict = errors.New("store: same requestId reused with a different body digest")
+
+// mysqlErrDupEntry는 MySQL의 중복 키 오류 코드다(ER_DUP_ENTRY). requestId(PK) 또는
+// jti(UNIQUE) 충돌이 이 코드로 온다.
+const mysqlErrDupEntry = 1062
 
 // HolderKind는 배포 윈도우 락을 누가 보유하는지 식별한다. agent와 batch/cutoff
 // 스케줄러가 동일한 단일 행을 두고 경합한다(CD-3).
@@ -97,9 +112,12 @@ type LockStore interface {
 // Reserve(INSERT)만 노출한다 — append-only이며, 삭제 메서드가 없으므로 재생 방어를
 // writer가 되돌릴 수 없다.
 type LedgerStore interface {
-	// Reserve는 예약을 INSERT한다. requestId가 이미 존재하거나 jti가 재사용되면
-	// ErrReplay를 반환한다. 동일 requestId/다른 digest 호출은 호출자가 거부 후
-	// 기록해야 하는 충돌이다(DO-10 ⑷).
+	// Reserve는 부작용 전에 requestId(와 OIDC jti)를 하나의 INSERT로 선점한다
+	// (DO-10 ⑶). 세 갈래로 갈린다(DO-10 ⑷):
+	//   - 신규          → nil (진행)
+	//   - 동일 id·동일 digest, 또는 jti 재사용 → ErrReplay (재실행 금지, 현재 상태 반환)
+	//   - 동일 id·다른 digest → ErrDigestConflict (거절·기록)
+	// 판정은 UNIQUE 제약에 의해 INSERT 시점에 서며, writer의 선의에 의존하지 않는다.
 	Reserve(ctx context.Context, requestID, jti, bodyDigest string) error
 }
 
@@ -140,16 +158,18 @@ type HistoryStore interface {
 
 // --- 스캐폴드 스텁 ---------------------------------------------------------
 
-// SQLStore는 네 개 store 모두의 (미구현) SQL 기반 구현이다. MySQL 드라이버가
-// 추가되면 *sql.DB를 보유할 것이나; 지금은 아무것도 보유하지 않으며 모든 메서드는
+// SQLStore는 네 개 store 모두의 SQL 기반 구현이다. *sql.DB(배포 스키마 전용, LAN 전용
+// — ADR-022 DT-10)를 보유한다. 이번 이슈(S1-2)에서 구현된 것은 재생 방어 원장의
+// Reserve(DO-10)뿐이며; 락 전이·mode·history는 다음 단계에서 채워질 때까지
 // ErrNotImplemented를 반환한다.
 type SQLStore struct {
-	// TODO(다음 단계): db *sql.DB — DEPLOY_DB_DSN에 대해 열림(LAN 전용, 배포 스키마
-	// 전용; ADR-022 DT-10). 드라이버는 이것이 구현될 때 추가된다.
+	db *sql.DB
 }
 
-// New는 미구현 SQLStore를 반환한다.
-func New() *SQLStore { return &SQLStore{} }
+// New는 열린 *sql.DB를 감싸 SQLStore를 만든다. DB 연결의 생애주기(열기·풀 설정·닫기)는
+// 호출자가 소유한다 — 이 store는 자격증명을 파싱하지 않고 이미 열린 핸들만 받는다
+// (DEPLOY_DB_DSN에 대해 배포 스키마 전용으로 열린다; DT-10).
+func New(db *sql.DB) *SQLStore { return &SQLStore{db: db} }
 
 // SQLStore가 모든 store 인터페이스를 만족한다는 컴파일 타임 단언.
 var (
@@ -191,8 +211,46 @@ func (*SQLStore) Read(context.Context) (LockState, error) {
 	return LockState{}, ErrNotImplemented
 }
 
-func (*SQLStore) Reserve(context.Context, string, string, string) error {
-	return ErrNotImplemented
+// Reserve는 append-only 원장에 예약 행 하나를 INSERT한다(DO-10 ⑶). grant는 이
+// 테이블에 SELECT+INSERT만 주므로(03_grants — UPDATE/DELETE 없음) 재생 방어를 writer가
+// 되돌릴 수 없다. jti가 비면 NULL로 넣는다 — UNIQUE 제약은 NULL을 충돌로 보지 않으므로
+// (OIDC 이전 단계에서) 여러 요청이 jti 없이 공존할 수 있다.
+func (s *SQLStore) Reserve(ctx context.Context, requestID, jti, bodyDigest string) error {
+	var jtiArg any
+	if jti != "" {
+		jtiArg = jti
+	}
+	_, err := s.db.ExecContext(ctx,
+		"INSERT INTO `deploy_request_ledger` (`request_id`, `jti`, `body_digest`) VALUES (?, ?, ?)",
+		requestID, jtiArg, bodyDigest)
+	if err == nil {
+		return nil // 신규 예약
+	}
+
+	// 중복 키가 아니면 그대로 올린다(연결·권한 오류 등 — 조용히 삼키지 않는다).
+	var myErr *mysql.MySQLError
+	if !errors.As(err, &myErr) || myErr.Number != mysqlErrDupEntry {
+		return err
+	}
+
+	// 중복 키 = requestId(PK) 또는 jti(UNIQUE) 충돌. 저장된 digest와 대조해 3분기한다.
+	var storedDigest string
+	qErr := s.db.QueryRowContext(ctx,
+		"SELECT `body_digest` FROM `deploy_request_ledger` WHERE `request_id` = ?",
+		requestID).Scan(&storedDigest)
+	switch {
+	case errors.Is(qErr, sql.ErrNoRows):
+		// requestId는 신규인데 INSERT가 중복으로 실패했다 = jti 재사용(토큰 재전송).
+		return ErrReplay
+	case qErr != nil:
+		return qErr
+	case storedDigest == bodyDigest:
+		// 동일 requestId + 동일 digest = 같은 요청의 재전송 → 재실행 금지.
+		return ErrReplay
+	default:
+		// 동일 requestId + 다른 digest = 거절·기록해야 하는 충돌.
+		return ErrDigestConflict
+	}
 }
 
 func (*SQLStore) Current(context.Context, string) (string, uint64, error) {
