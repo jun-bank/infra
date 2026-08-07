@@ -1,7 +1,7 @@
 // Package httpentry는 deploy-agent의 HTTP 진입 층이다 — agent 두 층 중 ⑴번
 // (ADR-029 IA-4 ⑴: HTTP 진입 미들웨어 = Go http.Handler 체인). 여기서는 요청을
-// 받아 전송 수준 제한(method·body 크기)을 강제하고, 서명·검증·멱등을 끼울 미들웨어
-// 체인의 뼈대만 세운다. 실제 판정(서명·OIDC)과 오케스트레이션은 이 층 밖이다.
+// 받아 전송 수준 제한(method·body 크기)을 강제하고, 게이트 1(HMAC)·게이트 2(OIDC)·멱등을
+// 미들웨어 체인으로 엮는다. 상태 있는 오케스트레이션(락·트랜잭션)은 이 층 밖이다.
 //
 // 계약 출처(정본 — 이 코드는 이를 재해석하지 않는다):
 //   - ADR-027 DO-1   (외부 진입은 엔드포인트 하나 — 엣지가 전달, agent가 수신;
@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/jun-bank/infra/internal/auth"
 	"github.com/jun-bank/infra/internal/store"
@@ -73,8 +74,16 @@ const (
 	headerRequestID = "X-Deploy-Request-Id"
 	headerIssuedAt  = "X-Deploy-Issued-At"
 	headerExpiresAt = "X-Deploy-Expires-At"
-	headerSignature = "X-Deploy-Signature" // hex 인코딩된 HMAC
+	headerSignature = "X-Deploy-Signature"  // hex 인코딩된 HMAC
+	headerOIDCToken = "X-Deploy-Oidc-Token" // GitHub Actions OIDC ID 토큰(JWT) — 게이트 2
 )
+
+// OIDCGate는 게이트 2다(OIDC claim 행렬 — DO-11). 소비 지점 인터페이스로 두어 이 층이
+// auth의 구체 타입에 묶이지 않게 한다(IA-5 Go 관용구). 토큰 문자열을 받아 서명·claim을
+// 판정하고, 통과 시 선점할 jti와 자기 신고 표식을 담은 결정을 낸다.
+type OIDCGate interface {
+	Verify(ctx context.Context, rawToken string) auth.OIDCDecision
+}
 
 // Deps는 진입 층이 판정을 위임하는 협력자들이다. 전부 인터페이스이며(auth.Verifier ·
 // store 인터페이스), 이 층은 그것들을 구성하지 않는다 — main이 실제 verifier·DB store를
@@ -82,6 +91,9 @@ const (
 type Deps struct {
 	// Verifier는 게이트 1(HMAC + 신선도)이다. nil이면 NewHandler가 기동을 거부한다.
 	Verifier auth.Verifier
+	// OIDC는 게이트 2(OIDC claim 행렬 — DO-11)다. nil이면 NewHandler가 기동을 거부한다
+	// (검증자 없이 진입 층을 세우는 것은 fail-open).
+	OIDC OIDCGate
 	// Ledger는 requestId 멱등 선점 원장이다(DO-10 ⑶⑷).
 	Ledger store.LedgerStore
 	// History는 거절·예약 이력을 기록하고(RL-8) 재생 시 현재 상태를 읽는다(DO-10 ⑷).
@@ -93,11 +105,14 @@ type ctxKey int
 
 const verifiedRequestKey ctxKey = 0
 
-// verifiedRequest는 withAuth가 검증을 통과시킨 요청을 담아 하류(withIdempotency)로
-// 넘긴다. 하류는 이 값을 재파싱·재검증하지 않는다 — 게이트 1의 판정을 신뢰한다.
+// verifiedRequest는 게이트들이 검증을 통과시킨 요청을 담아 하류(withIdempotency)로
+// 넘긴다. 하류는 이 값을 재파싱·재검증하지 않는다 — 게이트 1·2의 판정을 신뢰한다.
 type verifiedRequest struct {
 	req auth.Request
-	jti string // OIDC jti(S1-3에서 검증된 토큰에서 온다) — 지금은 항상 빈 값
+	jti string // OIDC jti — 게이트 2가 검증된 토큰에서 실어 넣는다(부작용 전 선점 · DO-10 ⑶)
+	// selfReport는 운영 승인이 자기 신고임을 나타낸다(게이트 2 · 잔여-5). 신규 예약을
+	// 이력에 남길 때 이 사실을 함께 적는다.
+	selfReport bool
 }
 
 // middleware는 하나의 http.Handler를 감싸 다음 핸들러로 잇는 함수다. 체인의 각 고리가
@@ -124,13 +139,17 @@ func NewHandler(cfg Config, deps Deps) http.Handler {
 	if deps.Verifier == nil {
 		panic("httpentry: Verifier가 nil이다 (검증자 없이 진입 층을 세울 수 없다 — fail-closed)")
 	}
+	if deps.OIDC == nil {
+		panic("httpentry: OIDC 게이트가 nil이다 (신원 검증 없이 진입 층을 세울 수 없다 — fail-closed)")
+	}
 	mux := http.NewServeMux()
 	mux.Handle("POST /deploy", chain(
 		deployReceiver(),
 		withBodyLimit(cfg.MaxBodyBytes), // 전송 제한(DO-15 ⑵) — 바깥에서 body를 캡
 		withAuth(deps),                  // 게이트 1 — HMAC + 신선도(DO-2·DO-10 ⑴⑵)
+		withOIDC(deps),                  // 게이트 2 — OIDC claim 행렬(DO-11) · HMAC과 AND
 		withValidate,                    // 요청 형태 검증 슬롯(통과 스텁)
-		withIdempotency(deps),           // requestId 멱등 선점·3분기(DO-10 ⑶⑷)
+		withIdempotency(deps),           // requestId·jti 멱등 선점·3분기(DO-10 ⑶⑷)
 	))
 	return mux
 }
@@ -152,9 +171,8 @@ func withBodyLimit(max int64) middleware {
 // 통과한 요청은 검증된 형태로 컨텍스트에 실어 하류로 넘기고, 본문은 다시 읽을 수 있게
 // 되돌린다.
 //
-// OIDC 클레임 매트릭스(DO-11)는 아직 이 게이트에 합류하지 않았다(S1-3). 따라서 jti는
-// 신뢰된 토큰에서 오지 않으며, 여기서는 빈 값으로 둔다 — 스푸핑 가능한 클라이언트
-// 헤더를 jti로 신뢰하지 않는다.
+// jti는 여기서 빈 값으로 둔다 — 게이트 2(withOIDC)가 서명 검증된 OIDC 토큰에서 실어
+// 넣는다. 스푸핑 가능한 클라이언트 헤더를 jti로 신뢰하지 않는다.
 func withAuth(d Deps) middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -227,6 +245,48 @@ func (d Deps) rejectUnverified(ctx context.Context, requestID, reason string) {
 	})
 }
 
+// withOIDC는 게이트 2다: 게이트 1을 통과한 요청에 대해 OIDC ID 토큰을 헤더에서 읽어
+// claim 행렬로 신원을 판정한다(DO-11 — HMAC과 AND). 실패하면 거절 사유를 이력에
+// 기록(RL-8)하고 401로 막는다 — 절대 통과시키지 않는다(fail-closed). 통과하면 서명
+// 검증된 토큰의 jti를 verifiedRequest에 실어 하류가 부작용 전에 선점하게 하고(DO-10 ⑶),
+// 운영 승인이 자기 신고임을 selfReport로 표시해 신규 예약 이력에 남긴다(잔여-5).
+//
+// OIDC 토큰은 HMAC 서명 범위 밖이다(DO-10 ⑴ "서명 밖의 값") — 그래도 판정에 쓰는 것은
+// 이 토큰이 발급자 서명으로 스스로를 증명하기 때문이고, 재전송은 jti 일회성 선점이 막는다.
+func withOIDC(d Deps) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			vr, ok := r.Context().Value(verifiedRequestKey).(verifiedRequest)
+			if !ok {
+				// 게이트 1을 거치지 않고 도달 = 조립 오류. 통과시키지 않는다(fail-closed).
+				http.Error(w, "검증되지 않은 요청 (내부 순서 오류)", http.StatusInternalServerError)
+				return
+			}
+
+			token := r.Header.Get(headerOIDCToken)
+			if strings.TrimSpace(token) == "" {
+				// OIDC 토큰 부재 = 신원 검증 불가 = 거절(RL-8).
+				d.rejectUnverified(r.Context(), vr.req.RequestID, "OIDC 토큰 부재")
+				http.Error(w, "OIDC 검증 실패", http.StatusUnauthorized)
+				return
+			}
+
+			dec := d.OIDC.Verify(r.Context(), token)
+			if !dec.Accepted {
+				d.rejectUnverified(r.Context(), vr.req.RequestID, "OIDC: "+dec.Reason)
+				http.Error(w, "OIDC 검증 실패", http.StatusUnauthorized)
+				return
+			}
+
+			// 통과 — 선점할 jti와 자기 신고 표식을 실어 하류로 넘긴다.
+			vr.jti = dec.JTI
+			vr.selfReport = dec.SelfReport
+			ctx := context.WithValue(r.Context(), verifiedRequestKey, vr)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
 // withValidate는 요청 형태(필수 헤더·manifest 구조)를 검증할 자리다. 지금은 통과 스텁.
 //
 // TODO: 서명 범위 밖의 값은 판정에 쓰지 않는다(DO-10 ⑴) · forwarded 헤더 불신(DO-15 ⑹).
@@ -260,13 +320,19 @@ func withIdempotency(d Deps) middleware {
 			err := d.Ledger.Reserve(r.Context(), v.req.RequestID, v.jti, v.req.BodyDigest)
 			switch {
 			case err == nil:
-				// 신규 예약 — 이력에 RESERVED를 남기고 하류로 진행한다.
+				// 신규 예약 — 이력에 RESERVED를 남기고 하류로 진행한다. 게이트 2가 운영
+				// 승인을 자기 신고로만 확인했으면(잔여-5) 그 한계를 이 행에 함께 적는다 —
+				// "우리 파이프라인에서 왔다"까지만 증명됐고 "운영 승인됐다"는 자기 신고다.
 				if d.History != nil {
-					_ = d.History.AppendEvent(r.Context(), store.HistoryEvent{
+					ev := store.HistoryEvent{
 						RequestID:      v.req.RequestID,
 						EventType:      "RESERVED",
 						ManifestDigest: v.req.BodyDigest,
-					})
+					}
+					if v.selfReport {
+						ev.Result = "OPERATIONAL_APPROVAL_SELF_REPORTED"
+					}
+					_ = d.History.AppendEvent(r.Context(), ev)
 				}
 				next.ServeHTTP(w, r)
 
