@@ -235,6 +235,40 @@ func TestSignDeterministic(t *testing.T) {
 	}
 }
 
+// TestEmptyRequestIDRejected는 검증된 requestId가 비었거나 공백만 있으면 거절하는지
+// 확인한다(codex medium). requestId는 서명 범위 안이라 서명은 유효하게 만들 수 있지만,
+// 빈 값이면 모든 무-ID 요청이 멱등 키 ""를 공유해 서로의 예약과 충돌한다(선점 붕괴·DoS).
+// 그러므로 예약(Reserve)에 닿기 전 게이트 1에서 막아야 한다.
+func TestEmptyRequestIDRejected(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	v := newTestVerifier(t, now)
+
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{
+		{"빈 문자열", ""},
+		{"공백만", "   "},
+		{"탭", "\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := baseRequest(now)
+			req.RequestID = tc.id
+			req.Signature = Sign(testKey, req) // 빈 requestId로도 유효하게 서명 — 서명 자체는 통과한다
+			dec, err := v.Verify(req)
+			if err != nil {
+				t.Fatalf("Verify 오류: %v", err)
+			}
+			if dec.Accepted {
+				t.Errorf("%s: 빈 requestId가 수락됐다 (거절 기대 — 멱등 키 필수)", tc.name)
+			}
+			if dec.Reason == "" {
+				t.Errorf("%s: 거절인데 Reason이 비었다 (기록 의무 — RL-8)", tc.name)
+			}
+		})
+	}
+}
+
 // TestExplicitZeroSkewRespected는 운영자가 명시한 무-skew(엄격, 0s)가 기본값(60s)으로
 // 조용히 완화되지 않는지 확인한다(codex·Opus medium). 만료를 1초 지난 요청은 스큐 0이면
 // 거절돼야 한다 — 기본 60s 스큐였다면 통과했을 경계 요청이다.
