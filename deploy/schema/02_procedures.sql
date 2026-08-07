@@ -10,7 +10,17 @@
 -- 각 프로시저는 하나의 조건부 UPDATE와 OUT ok 플래그이며; 성공은 ROW_COUNT() = 1이다.
 -- 어느 계정이 어느 전이를 호출할 수 있는지는 grant(03_grants)에서 분리된다:
 -- PREEMPT/override = deploy-agent 전용; ACK/debt-resolve = cutoff 전용;
--- acquire/renew/release = 둘 다.
+-- acquire/renew/release = 양방향이되 ★ 역할별 wrapper로 갈린다(S2-1 보안 수정).
+--
+-- ★ S2-1 보안 수정(2026-08-07): acquire·renew·release는 kind를 인자로 받는 공유
+-- 프로시저였고, 두 계정이 그것에 EXECUTE를 가진 채 락 행 SELECT로 상대 token을 읽어
+-- 상대 락을 해제·갱신할 수 있었다(cutoff가 AGENT 락 release 성공하는 구멍). 이를
+-- 막기 위해 로직은 kind를 인자로 받는 impl(sp_lock_*_impl)에 두되 ⚠ 어느 계정에도
+-- impl EXECUTE를 부여하지 않고, 각 계정은 kind를 리터럴로 결박한 자기 역할 wrapper
+-- (sp_lock_*_agent / sp_lock_*_cutoff)만 EXECUTE한다(03_grants). 그래서 "잡은 주체만
+-- 해제·갱신"을 DB가 강제한다 — 상대 kind로는 애초에 호출할 수 있는 프로시저가 없다.
+-- wrapper는 SQL SECURITY DEFINER라 스키마 소유자 권한으로 impl을 중첩 CALL한다(계정에
+-- impl EXECUTE가 없어도 성립 — DEFINER 권한 · CDV-19).
 --
 -- SQL SECURITY DEFINER는 EXECUTE 전용이고 테이블 권한이 없는 계정이 전이를 실행할 수
 -- 있게 한다. ⚠ 이것이 MySQL에서 실제로 성립하는지(DEFINER 권한; EXECUTE가 그 외 어떤
@@ -21,11 +31,18 @@ USE `deploy`;
 
 DELIMITER $$
 
--- 전이 1 — 획득 (acquire). agent와 cutoff 둘 다 호출 가능(양방향 경합). 락이 비어
--- 있거나 lease가 만료된 경우에만 성공하며; fencing token이 증가하므로 동시 획득자 중
--- 정확히 하나가 승리한다(CD-3).
-DROP PROCEDURE IF EXISTS `sp_lock_acquire` $$
-CREATE PROCEDURE `sp_lock_acquire`(
+-- 전이 1 — 획득 (acquire). agent와 cutoff 둘 다(양방향 경합) 자기 역할 wrapper로만
+-- 호출한다. 락이 비어 있거나 lease가 만료된 경우에만 성공하며; fencing token이 증가하므로
+-- 동시 획득자 중 정확히 하나가 승리한다(CD-3).
+--
+-- impl은 두 방어선을 함께 강제한다(S2-1):
+--   ⑴ 결함3(방어심층) — holder_kind ∈ {AGENT, BATCH_CUTOFF}만 허용. 'NONE'·미지 kind는
+--      거절한다(유령 락 금지). wrapper가 kind를 결박하므로 정상 경로에서는 도달하지 않지만,
+--      계약을 impl에 명시해 둔다.
+--   ⑵ 결함2 — lease < 1초(0·음수 포함)는 fail-closed로 거절한다(ok=1 금지). sub-second
+--      lease가 ok=1인 무보호 락으로 만들어지면 Confirm 직후 탈취되는 footgun이 열린다.
+DROP PROCEDURE IF EXISTS `sp_lock_acquire_impl` $$
+CREATE PROCEDURE `sp_lock_acquire_impl`(
   IN  p_holder_kind   VARCHAR(16),
   IN  p_holder_id     VARCHAR(255),
   IN  p_lease_seconds INT,
@@ -34,31 +51,69 @@ CREATE PROCEDURE `sp_lock_acquire`(
 )
 SQL SECURITY DEFINER
 BEGIN
-  UPDATE `deploy_window_lock`
-     SET `holder_kind`       = p_holder_kind,
-         `holder_id`         = p_holder_id,
-         `fencing_token`     = `fencing_token` + 1,
-         `lease_expires_at`  = NOW(6) + INTERVAL p_lease_seconds SECOND,
-         `preempt_requested` = 0,
-         `preempt_requester` = NULL,
-         `preempt_request_id`= NULL,
-         `preempt_deadline`  = NULL,
-         `safety_ack`        = 0
-   WHERE `lock_id` = 1
-     AND (`holder_kind` = 'NONE' OR `lease_expires_at` < NOW(6));
-  IF ROW_COUNT() = 1 THEN
-    SELECT `fencing_token` INTO p_token FROM `deploy_window_lock` WHERE `lock_id` = 1;
-    SET p_ok = 1;
-  ELSE
+  IF p_holder_kind NOT IN ('AGENT', 'BATCH_CUTOFF') OR p_lease_seconds < 1 THEN
+    -- 미지 kind(유령 락) 또는 최소 미만 lease(무보호 락) = fail-closed 거절.
     SET p_token = NULL;
     SET p_ok = 0;
+  ELSE
+    UPDATE `deploy_window_lock`
+       SET `holder_kind`       = p_holder_kind,
+           `holder_id`         = p_holder_id,
+           `fencing_token`     = `fencing_token` + 1,
+           `lease_expires_at`  = NOW(6) + INTERVAL p_lease_seconds SECOND,
+           `preempt_requested` = 0,
+           `preempt_requester` = NULL,
+           `preempt_request_id`= NULL,
+           `preempt_deadline`  = NULL,
+           `safety_ack`        = 0
+     WHERE `lock_id` = 1
+       AND (`holder_kind` = 'NONE' OR `lease_expires_at` < NOW(6));
+    IF ROW_COUNT() = 1 THEN
+      SELECT `fencing_token` INTO p_token FROM `deploy_window_lock` WHERE `lock_id` = 1;
+      SET p_ok = 1;
+    ELSE
+      SET p_token = NULL;
+      SET p_ok = 0;
+    END IF;
   END IF;
 END $$
 
--- 전이 2 — lease 갱신 (renew / 보유 재확인). 둘 다. 호출자가 여전히 holder이고
--- (kind + id + token) lease가 만료되지 않은 동안에만 갱신한다.
-DROP PROCEDURE IF EXISTS `sp_lock_renew` $$
-CREATE PROCEDURE `sp_lock_renew`(
+-- agent 역할 wrapper — kind를 'AGENT'로 결박. deploy_agent만 EXECUTE한다(03_grants).
+DROP PROCEDURE IF EXISTS `sp_lock_acquire_agent` $$
+CREATE PROCEDURE `sp_lock_acquire_agent`(
+  IN  p_holder_id     VARCHAR(255),
+  IN  p_lease_seconds INT,
+  OUT p_token         BIGINT UNSIGNED,
+  OUT p_ok            TINYINT
+)
+SQL SECURITY DEFINER
+BEGIN
+  CALL `sp_lock_acquire_impl`('AGENT', p_holder_id, p_lease_seconds, p_token, p_ok);
+END $$
+
+-- cutoff 역할 wrapper — kind를 'BATCH_CUTOFF'로 결박. cutoff_lock만 EXECUTE한다.
+DROP PROCEDURE IF EXISTS `sp_lock_acquire_cutoff` $$
+CREATE PROCEDURE `sp_lock_acquire_cutoff`(
+  IN  p_holder_id     VARCHAR(255),
+  IN  p_lease_seconds INT,
+  OUT p_token         BIGINT UNSIGNED,
+  OUT p_ok            TINYINT
+)
+SQL SECURITY DEFINER
+BEGIN
+  CALL `sp_lock_acquire_impl`('BATCH_CUTOFF', p_holder_id, p_lease_seconds, p_token, p_ok);
+END $$
+
+-- 전이 2 — lease 갱신 (renew / 보유 재확인). 둘 다 자기 역할 wrapper로만. 호출자가 여전히
+-- holder이고 (kind + id + token) lease가 만료되지 않은 동안에만 갱신한다.
+--
+-- impl은 두 방어선을 더한다(S2-1 결함2):
+--   ⑴ lease < 1초는 거절(무보호 락 금지) — Renew(...,0)이 ok=1을 주면 안 된다.
+--   ⑵ 유효 lease를 줄이지 못한다 — 새 만료가 현재 만료 이상일 때만 갱신한다. 이 가드가
+--      없으면 Renew(...,작은값)이 살아있는 lease를 앞당겨 Confirm 직후 탈취를 연다. 정상
+--      경로는 항상 lease를 연장하므로(NOW + lease > 현재 만료) 이 가드에 걸리지 않는다.
+DROP PROCEDURE IF EXISTS `sp_lock_renew_impl` $$
+CREATE PROCEDURE `sp_lock_renew_impl`(
   IN  p_holder_kind   VARCHAR(16),
   IN  p_holder_id     VARCHAR(255),
   IN  p_token         BIGINT UNSIGNED,
@@ -67,14 +122,44 @@ CREATE PROCEDURE `sp_lock_renew`(
 )
 SQL SECURITY DEFINER
 BEGIN
-  UPDATE `deploy_window_lock`
-     SET `lease_expires_at` = NOW(6) + INTERVAL p_lease_seconds SECOND
-   WHERE `lock_id` = 1
-     AND `holder_kind`     = p_holder_kind
-     AND `holder_id`       = p_holder_id
-     AND `fencing_token`   = p_token
-     AND `lease_expires_at` >= NOW(6);
-  SET p_ok = (ROW_COUNT() = 1);
+  IF p_lease_seconds < 1 THEN
+    SET p_ok = 0;
+  ELSE
+    UPDATE `deploy_window_lock`
+       SET `lease_expires_at` = NOW(6) + INTERVAL p_lease_seconds SECOND
+     WHERE `lock_id` = 1
+       AND `holder_kind`     = p_holder_kind
+       AND `holder_id`       = p_holder_id
+       AND `fencing_token`   = p_token
+       AND `lease_expires_at` >= NOW(6)
+       AND (NOW(6) + INTERVAL p_lease_seconds SECOND) >= `lease_expires_at`;
+    SET p_ok = (ROW_COUNT() = 1);
+  END IF;
+END $$
+
+-- agent / cutoff 역할 wrapper — kind 결박.
+DROP PROCEDURE IF EXISTS `sp_lock_renew_agent` $$
+CREATE PROCEDURE `sp_lock_renew_agent`(
+  IN  p_holder_id     VARCHAR(255),
+  IN  p_token         BIGINT UNSIGNED,
+  IN  p_lease_seconds INT,
+  OUT p_ok            TINYINT
+)
+SQL SECURITY DEFINER
+BEGIN
+  CALL `sp_lock_renew_impl`('AGENT', p_holder_id, p_token, p_lease_seconds, p_ok);
+END $$
+
+DROP PROCEDURE IF EXISTS `sp_lock_renew_cutoff` $$
+CREATE PROCEDURE `sp_lock_renew_cutoff`(
+  IN  p_holder_id     VARCHAR(255),
+  IN  p_token         BIGINT UNSIGNED,
+  IN  p_lease_seconds INT,
+  OUT p_ok            TINYINT
+)
+SQL SECURITY DEFINER
+BEGIN
+  CALL `sp_lock_renew_impl`('BATCH_CUTOFF', p_holder_id, p_token, p_lease_seconds, p_ok);
 END $$
 
 -- 전이 3 — PREEMPT_REQUESTED 기록 (record preempt). deploy-agent 전용. 행을
@@ -177,11 +262,15 @@ BEGIN
   SET p_ok = (ROW_COUNT() = 1);
 END $$
 
--- 전이 7 — 해제 (release). 둘 다. 호출자가 현재 holder(kind + id + token)인 경우에만
--- 해제한다. fencing token은 리셋되지 않으며(단조), open_debt는 여기서 지워지지 않는다
--- (채무는 전이 6까지 release를 넘어 존속한다).
-DROP PROCEDURE IF EXISTS `sp_lock_release` $$
-CREATE PROCEDURE `sp_lock_release`(
+-- 전이 7 — 해제 (release). 둘 다 자기 역할 wrapper로만. 호출자가 현재 holder(kind + id +
+-- token)인 경우에만 해제한다. fencing token은 리셋되지 않으며(단조), open_debt는 여기서
+-- 지워지지 않는다(채무는 전이 6까지 release를 넘어 존속한다).
+--
+-- ★ S2-1 결함1: kind를 wrapper가 결박한다 — 상대 계정이 락 행 SELECT로 읽은 token으로
+-- 남의 락을 해제하려 해도, cutoff_lock은 kind='BATCH_CUTOFF'로 결박된 wrapper만 EXECUTE할
+-- 수 있어 AGENT 보유 행에 매치되지 않는다(그 반대도 동일). "잡은 주체만 해제"를 DB가 강제.
+DROP PROCEDURE IF EXISTS `sp_lock_release_impl` $$
+CREATE PROCEDURE `sp_lock_release_impl`(
   IN  p_holder_kind VARCHAR(16),
   IN  p_holder_id   VARCHAR(255),
   IN  p_token       BIGINT UNSIGNED,
@@ -203,6 +292,29 @@ BEGIN
      AND `holder_id`     = p_holder_id
      AND `fencing_token` = p_token;
   SET p_ok = (ROW_COUNT() = 1);
+END $$
+
+-- agent / cutoff 역할 wrapper — kind 결박.
+DROP PROCEDURE IF EXISTS `sp_lock_release_agent` $$
+CREATE PROCEDURE `sp_lock_release_agent`(
+  IN  p_holder_id VARCHAR(255),
+  IN  p_token     BIGINT UNSIGNED,
+  OUT p_ok        TINYINT
+)
+SQL SECURITY DEFINER
+BEGIN
+  CALL `sp_lock_release_impl`('AGENT', p_holder_id, p_token, p_ok);
+END $$
+
+DROP PROCEDURE IF EXISTS `sp_lock_release_cutoff` $$
+CREATE PROCEDURE `sp_lock_release_cutoff`(
+  IN  p_holder_id VARCHAR(255),
+  IN  p_token     BIGINT UNSIGNED,
+  OUT p_ok        TINYINT
+)
+SQL SECURITY DEFINER
+BEGIN
+  CALL `sp_lock_release_impl`('BATCH_CUTOFF', p_holder_id, p_token, p_ok);
 END $$
 
 -- 모드 append — 단조 version 강제(ADR-027 DO-17 ⑵). 토글은 임의 version이 아니라

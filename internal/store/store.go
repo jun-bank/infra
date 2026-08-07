@@ -49,6 +49,19 @@ var ErrNoMode = errors.New("store: no mode row for target (fail-closed decision 
 // jti(UNIQUE) 충돌이 이 코드로 온다.
 const mysqlErrDupEntry = 1062
 
+// MinLease는 강제되는 최소 lease다(S2-1 결함2 — fail-closed). sub-second/0/음수 lease는
+// ok=true인 무보호 락으로 만들어져 Confirm 직후 탈취되는 footgun을 연다 — 그래서 1초
+// 미만은 Go 경계와 프로시저 양쪽에서 거절한다(계층 이중 강제).
+const MinLease = time.Second
+
+// ErrLeaseTooShort는 lease가 MinLease 미만일 때(0·음수 포함) Acquire/Renew가 반환한다.
+// 조용한 절삭(int(lease.Seconds())가 sub-second를 0으로)이 아니라 명시적 오류로 올린다.
+var ErrLeaseTooShort = errors.New("store: lease must be at least 1s (fail-closed — no sub-second/zero/negative lease)")
+
+// ErrInvalidHolderKind는 kind가 AGENT·BATCH_CUTOFF가 아닐 때 락 전이 메서드가 반환한다
+// (S2-1 결함3 — 유령 락 방지). 역할별 wrapper 프로시저로의 디스패치가 여기서 갈린다.
+var ErrInvalidHolderKind = errors.New("store: holder kind must be AGENT or BATCH_CUTOFF")
+
 // HolderKind는 배포 윈도우 락을 누가 보유하는지 식별한다. agent와 batch/cutoff
 // 스케줄러가 동일한 단일 행을 두고 경합한다(CD-3).
 type HolderKind string
@@ -84,12 +97,14 @@ type LockState struct {
 // 어느 호출자가 어느 전이를 호출할 수 있는지도 DB grant 수준에서 강제된다
 // (03_grants.sql); 여기 주석은 두 계층을 함께 읽을 수 있도록 의도된 호출자를 명시한다.
 type LockStore interface {
-	// Acquire — sp_lock_acquire (전이 1; 두 호출자 모두). 락이 비어 있거나 lease가
-	// 만료된 경우 성공하며; 새 토큰을 반환하고, 경합 시 ok=false를 반환한다.
+	// Acquire — sp_lock_acquire_{agent,cutoff} (전이 1; 두 호출자, kind별 역할 wrapper로
+	// 디스패치 — S2-1). 락이 비어 있거나 lease가 만료된 경우 성공하며; 새 토큰을 반환하고,
+	// 경합 시 ok=false를 반환한다. lease < 1초·미지 kind는 오류로 거절한다.
 	Acquire(ctx context.Context, kind HolderKind, holderID string, lease time.Duration) (token FencingToken, ok bool, err error)
 
-	// Renew — sp_lock_renew (전이 2; 두 호출자 모두). 호출자가 여전히 holder이고
-	// (kind+id+token) lease가 살아 있는 동안에만 lease를 연장한다.
+	// Renew — sp_lock_renew_{agent,cutoff} (전이 2; 두 호출자, kind별 역할 wrapper). 호출자가
+	// 여전히 holder이고 (kind+id+token) lease가 살아 있는 동안에만 lease를 연장한다(줄이지
+	// 못한다). lease < 1초는 오류로 거절한다(S2-1).
 	Renew(ctx context.Context, kind HolderKind, holderID string, token FencingToken, lease time.Duration) (ok bool, err error)
 
 	// RecordPreempt — sp_lock_record_preempt (전이 3; DEPLOY-AGENT 전용).
@@ -108,8 +123,9 @@ type LockStore interface {
 	// ResolveOpenDebt — sp_lock_resolve_open_debt (전이 6; CUTOFF 전용).
 	ResolveOpenDebt(ctx context.Context) (ok bool, err error)
 
-	// Release — sp_lock_release (전이 7; 두 호출자 모두). 호출자가 현재 holder인
-	// 경우에만 해제한다; 토큰은 리셋되지 않고 채무도 지워지지 않는다.
+	// Release — sp_lock_release_{agent,cutoff} (전이 7; 두 호출자, kind별 역할 wrapper —
+	// 상대 계정이 남의 락을 해제할 수 없다 · S2-1). 호출자가 현재 holder인 경우에만
+	// 해제한다; 토큰은 리셋되지 않고 채무도 지워지지 않는다.
 	Release(ctx context.Context, kind HolderKind, holderID string, token FencingToken) (ok bool, err error)
 
 	// Read는 락 행의 스냅샷을 반환한다(SELECT).
@@ -197,6 +213,33 @@ var (
 // 그래서 IN 인자만 ?이고 OUT은 리터럴 @var이며, 두 문장(CALL·SELECT)은 반드시 하나의
 // 고정된 커넥션에서 돌아야 한다(세션 변수는 커넥션 로컬이다). 매 호출은 자기 CALL이
 // @var를 먼저 덮어쓰므로 풀에서 재사용된 커넥션의 이전 값에 오염되지 않는다.
+// ValidateLease는 lease가 최소 1초 이상인지 확인한다(S2-1 결함2 — fail-closed). 락을 잡는
+// 오케스트레이션 경계(lock.go)와 store 진입 양쪽에서 같은 규칙을 부르도록 export한다.
+func ValidateLease(lease time.Duration) error {
+	if lease < MinLease {
+		return ErrLeaseTooShort
+	}
+	return nil
+}
+
+// roleSuffix는 holder kind를 역할별 wrapper 프로시저 접미사로 사상한다(S2-1). 이 접미사로
+// 각 계정은 자기 kind가 결박된 wrapper만 호출하게 되고, 상대 kind로는 호출 경로 자체가
+// 없다(DB grant가 그것을 강제). 미지 kind는 유령 락을 막기 위해 여기서 거절한다(결함3).
+func roleSuffix(kind HolderKind) (string, error) {
+	switch kind {
+	case HolderAgent:
+		return "_agent", nil
+	case HolderBatchCutoff:
+		return "_cutoff", nil
+	default:
+		return "", ErrInvalidHolderKind
+	}
+}
+
+// leaseSeconds는 lease를 정수 초로 변환한다. 조용한 sub-second 절삭이 아니라, 호출부가
+// ValidateLease로 1초 하한을 먼저 강제한 뒤에만 이 변환에 도달한다(그래서 최소 1이 보장된다).
+func leaseSeconds(lease time.Duration) int { return int(lease / time.Second) }
+
 func (s *SQLStore) callProc(ctx context.Context, callSQL string, args []any, selectSQL string, dest ...any) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -209,20 +252,29 @@ func (s *SQLStore) callProc(ctx context.Context, callSQL string, args []any, sel
 	return conn.QueryRowContext(ctx, selectSQL).Scan(dest...)
 }
 
-// Acquire는 sp_lock_acquire를 호출한다(전이 1 — 두 호출자 모두). 락이 비어 있거나 lease가
+// Acquire는 kind별 역할 wrapper sp_lock_acquire_{agent,cutoff}를 호출한다(전이 1 — S2-1). 락이 비어 있거나 lease가
 // 만료된 경우에만 성공한다: stale 회수도 여기서 일어난다(CD-3) — 비정상 종료로 만료된
 // 직전 점유는 이 획득이 회수하며, 호출자는 새 토큰을 받는 것 외에 특별히 할 일이 없다.
 // 성공하면 새 fencing 토큰(프로시저가 단조 증가시킨다)과 ok=true를, 경합(다른 배포·배치가
 // 유효 lease로 점유 중)이면 ok=false를 반환한다 — 경합은 오류가 아니라 거절이다(RL-4).
-// 연결·권한 오류만 err로 올린다. lease 정밀도는 프로시저 계약상 정수 초다.
+// 연결·권한 오류만 err로 올린다. lease 정밀도는 프로시저 계약상 정수 초이며, 1초 미만은
+// ErrLeaseTooShort로 거절한다(S2-1 결함2). kind에 따라 역할별 wrapper로 디스패치하므로,
+// 각 계정은 자기 kind가 결박된 프로시저만 호출한다(결함1) — 미지 kind는 ErrInvalidHolderKind.
 func (s *SQLStore) Acquire(ctx context.Context, kind HolderKind, holderID string, lease time.Duration) (FencingToken, bool, error) {
+	if err := ValidateLease(lease); err != nil {
+		return 0, false, err
+	}
+	suffix, err := roleSuffix(kind)
+	if err != nil {
+		return 0, false, err
+	}
 	var (
 		tok sql.NullInt64
 		ok  int64
 	)
-	err := s.callProc(ctx,
-		"CALL `sp_lock_acquire`(?, ?, ?, @tok, @ok)",
-		[]any{string(kind), holderID, int(lease.Seconds())},
+	err = s.callProc(ctx,
+		"CALL `sp_lock_acquire"+suffix+"`(?, ?, @tok, @ok)",
+		[]any{holderID, leaseSeconds(lease)},
 		"SELECT @tok, @ok", &tok, &ok)
 	if err != nil {
 		return 0, false, err
@@ -233,16 +285,25 @@ func (s *SQLStore) Acquire(ctx context.Context, kind HolderKind, holderID string
 	return FencingToken(tok.Int64), true, nil
 }
 
-// Renew는 sp_lock_renew를 호출한다(전이 2 — 두 호출자 모두). 호출자가 여전히 holder이고
+// Renew는 kind별 역할 wrapper sp_lock_renew_{agent,cutoff}를 호출한다(전이 2 — S2-1). 호출자가 여전히 holder이고
 // (kind+id+token) lease가 살아 있는 동안에만 lease를 연장한다. 이것이 곧 불가역 단계
 // 직전의 「보유 재확인(fencing)」 프리미티브다(CD-3): 내 fencing 토큰이 그 행에 그대로일
 // 때만 참을, 만료·인계로 토큰이 어긋났으면 거짓을 반환한다 — 호출자는 거짓이면 그 단계를
-// 시작하지 않는다(좀비 차단). 연결·권한 오류만 err로 올린다.
+// 시작하지 않는다(좀비 차단). 연결·권한 오류만 err로 올린다. 1초 미만 lease는
+// ErrLeaseTooShort로 거절하고(S2-1 결함2 — Renew(...,0)로 살아있는 lease를 줄이는 것 금지),
+// kind에 따라 역할별 wrapper로 디스패치한다(결함1).
 func (s *SQLStore) Renew(ctx context.Context, kind HolderKind, holderID string, token FencingToken, lease time.Duration) (bool, error) {
+	if err := ValidateLease(lease); err != nil {
+		return false, err
+	}
+	suffix, err := roleSuffix(kind)
+	if err != nil {
+		return false, err
+	}
 	var ok int64
-	err := s.callProc(ctx,
-		"CALL `sp_lock_renew`(?, ?, ?, ?, @ok)",
-		[]any{string(kind), holderID, uint64(token), int(lease.Seconds())},
+	err = s.callProc(ctx,
+		"CALL `sp_lock_renew"+suffix+"`(?, ?, ?, @ok)",
+		[]any{holderID, uint64(token), leaseSeconds(lease)},
 		"SELECT @ok", &ok)
 	if err != nil {
 		return false, err
@@ -271,15 +332,22 @@ func (*SQLStore) ResolveOpenDebt(context.Context) (bool, error) {
 	return false, ErrNotImplemented
 }
 
-// Release는 sp_lock_release를 호출한다(전이 7 — 두 호출자 모두). 호출자가 현재
+// Release는 kind별 역할 wrapper sp_lock_release_{agent,cutoff}를 호출한다(전이 7 — S2-1). 호출자가 현재
 // holder(kind+id+token)인 경우에만 해제하며; 토큰은 리셋되지 않고 open_debt도 지워지지
 // 않는다. 거짓 반환은 이미 보유하지 않음(만료 회수됨·인계됨)을 뜻한다 — 해제 실패는
 // 치명적이지 않다: lease 만료가 어차피 그 행을 회수한다(CD-3). 연결·권한 오류만 err로 올린다.
+// kind에 따라 역할별 wrapper로 디스패치하므로, 상대 계정이 락 행 SELECT로 읽은 token으로
+// 남의 락을 해제하려 해도 호출할 수 있는 프로시저가 없다(S2-1 결함1) — 미지 kind는
+// ErrInvalidHolderKind.
 func (s *SQLStore) Release(ctx context.Context, kind HolderKind, holderID string, token FencingToken) (bool, error) {
+	suffix, err := roleSuffix(kind)
+	if err != nil {
+		return false, err
+	}
 	var ok int64
-	err := s.callProc(ctx,
-		"CALL `sp_lock_release`(?, ?, ?, @ok)",
-		[]any{string(kind), holderID, uint64(token)},
+	err = s.callProc(ctx,
+		"CALL `sp_lock_release"+suffix+"`(?, ?, @ok)",
+		[]any{holderID, uint64(token)},
 		"SELECT @ok", &ok)
 	if err != nil {
 		return false, err

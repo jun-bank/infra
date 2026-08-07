@@ -24,14 +24,15 @@ CREATE USER IF NOT EXISTS 'deploy_agent'@'%'
 -- 락 행: SELECT만(읽기/비교용). raw DML 없음(DT-12).
 GRANT SELECT ON `deploy`.`deploy_window_lock` TO 'deploy_agent'@'%';
 
--- agent가 호출할 수 있는 락 전이: acquire, renew, record_preempt,
--- override_acquire, release. ack_safety_boundary는 아님, resolve_open_debt도 아님
--- (그것들은 cutoff 전용 — DT-12).
-GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_acquire`          TO 'deploy_agent'@'%';
-GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_renew`            TO 'deploy_agent'@'%';
+-- agent가 호출할 수 있는 락 전이: acquire, renew, release는 ★ agent 역할 wrapper만
+-- (kind='AGENT' 결박 — S2-1). record_preempt, override_acquire는 agent 전용.
+-- ⚠ 공유 impl(sp_lock_*_impl)에는 EXECUTE를 주지 않는다 — 그래야 상대 kind로 호출할 수
+-- 있는 경로가 없다. ack_safety_boundary·resolve_open_debt도 아님(cutoff 전용 — DT-12).
+GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_acquire_agent`    TO 'deploy_agent'@'%';
+GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_renew_agent`      TO 'deploy_agent'@'%';
 GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_record_preempt`   TO 'deploy_agent'@'%';
 GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_override_acquire` TO 'deploy_agent'@'%';
-GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_release`          TO 'deploy_agent'@'%';
+GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_release_agent`    TO 'deploy_agent'@'%';
 
 -- Ledger, mode, history: INSERT + SELECT만. Append-only — UPDATE/DELETE 없음 —
 -- 이므로 재생 ledger와 history를 writer가 다시 쓸 수 없다(DT-12 ⑵; C8-audit 형태).
@@ -59,13 +60,14 @@ CREATE USER IF NOT EXISTS 'cutoff_lock'@'%'
 -- "SELECT + 전이 EXECUTE"로 좁혀짐).
 GRANT SELECT ON `deploy`.`deploy_window_lock` TO 'cutoff_lock'@'%';
 
--- cutoff 계정이 호출할 수 있는 락 전이: acquire, renew, ack_safety_boundary,
--- resolve_open_debt, release. record_preempt는 아님, override_acquire도 아님(agent 전용).
-GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_acquire`             TO 'cutoff_lock'@'%';
-GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_renew`               TO 'cutoff_lock'@'%';
+-- cutoff 계정이 호출할 수 있는 락 전이: acquire, renew, release는 ★ cutoff 역할 wrapper만
+-- (kind='BATCH_CUTOFF' 결박 — S2-1). ack_safety_boundary, resolve_open_debt는 cutoff 전용.
+-- ⚠ 공유 impl에는 EXECUTE 없음. record_preempt·override_acquire도 아님(agent 전용).
+GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_acquire_cutoff`      TO 'cutoff_lock'@'%';
+GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_renew_cutoff`        TO 'cutoff_lock'@'%';
 GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_ack_safety_boundary` TO 'cutoff_lock'@'%';
 GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_resolve_open_debt`   TO 'cutoff_lock'@'%';
-GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_release`             TO 'cutoff_lock'@'%';
+GRANT EXECUTE ON PROCEDURE `deploy`.`sp_lock_release_cutoff`      TO 'cutoff_lock'@'%';
 
 -- history/ledger/mode 접근 없음, 다른 스키마도 없음(DT-11): cutoff 계정은 정확히
 -- 하나의 경계 객체 — 락 테이블 — 만 건드리고 그 밖에는 아무것도 건드리지 않는다.

@@ -49,6 +49,12 @@ func (h *Hold) Token() store.FencingToken { return h.token }
 // 점유의 lease가 만료돼 있으면 획득 프로시저가 그 자리에서 회수한다(stale 회수 — CD-3);
 // 호출자는 새 토큰을 관측하는 것 말고 특별히 할 일이 없다.
 func AcquireWindow(ctx context.Context, l WindowLock, holderID string, lease time.Duration) (h *Hold, held bool, err error) {
+	// S2-1 결함2: 최소 lease를 오케스트레이션 경계에서 먼저 강제한다(store·프로시저와
+	// 같은 규칙 — 계층 이중 강제). sub-second/0/음수 lease는 무보호 락(ok=true인데 Confirm
+	// 직후 탈취)을 만들 수 있으므로 획득을 시도하지 않고 fail-closed로 거절한다.
+	if err := store.ValidateLease(lease); err != nil {
+		return nil, false, err
+	}
 	token, ok, err := l.Acquire(ctx, store.HolderAgent, holderID, lease)
 	if err != nil {
 		return nil, false, err
