@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/jun-bank/infra/internal/auth"
+	"github.com/jun-bank/infra/internal/deploy"
 	"github.com/jun-bank/infra/internal/store"
 )
 
@@ -96,8 +97,11 @@ type Deps struct {
 	OIDC OIDCGate
 	// Ledger는 requestId 멱등 선점 원장이다(DO-10 ⑶⑷).
 	Ledger store.LedgerStore
-	// History는 거절·예약 이력을 기록하고(RL-8) 재생 시 현재 상태를 읽는다(DO-10 ⑷).
+	// History는 거절·예약 이력을 기록하고(RL-8) 재생 시 현재 상태를 읽는다(DO-10 ⑷ · DO-16).
 	History store.HistoryStore
+	// Deploy는 상태 있는 오케스트레이션 층이다(IA-4 ⑵) — 게이트·멱등을 통과한 요청을
+	// 모드·락·manifest 검증을 거쳐 실행 지점까지 엮는다. nil이면 NewHandler가 기동을 거부한다.
+	Deploy deploy.Coordinator
 }
 
 // ctxKey는 미들웨어 사이에서 검증된 요청을 나르는 컨텍스트 키의 사설 타입이다.
@@ -108,11 +112,15 @@ const verifiedRequestKey ctxKey = 0
 // verifiedRequest는 게이트들이 검증을 통과시킨 요청을 담아 하류(withIdempotency)로
 // 넘긴다. 하류는 이 값을 재파싱·재검증하지 않는다 — 게이트 1·2의 판정을 신뢰한다.
 type verifiedRequest struct {
-	req auth.Request
-	jti string // OIDC jti — 게이트 2가 검증된 토큰에서 실어 넣는다(부작용 전 선점 · DO-10 ⑶)
+	req  auth.Request
+	jti  string // OIDC jti — 게이트 2가 검증된 토큰에서 실어 넣는다(부작용 전 선점 · DO-10 ⑶)
+	body []byte // 서명·인증된 원본 body(manifest) — 오케스트레이션에 그대로 넘긴다
 	// selfReport는 운영 승인이 자기 신고임을 나타낸다(게이트 2 · 잔여-5). 신규 예약을
 	// 이력에 남길 때 이 사실을 함께 적는다.
 	selfReport bool
+	// resume은 이미 예약된 요청의 재전송 재개인지다(#9 · DO-16 ⑵). 멱등 슬롯이 재생을
+	// 재개로 분류했을 때 참이 되어, 오케스트레이션이 미완 배포를 완주시키게 한다.
+	resume bool
 }
 
 // middleware는 하나의 http.Handler를 감싸 다음 핸들러로 잇는 함수다. 체인의 각 고리가
@@ -142,9 +150,12 @@ func NewHandler(cfg Config, deps Deps) http.Handler {
 	if deps.OIDC == nil {
 		panic("httpentry: OIDC 게이트가 nil이다 (신원 검증 없이 진입 층을 세울 수 없다 — fail-closed)")
 	}
+	if deps.Deploy == nil {
+		panic("httpentry: Deploy 오케스트레이터가 nil이다 (오케스트레이션 없이 수신을 열 수 없다 — fail-closed)")
+	}
 	mux := http.NewServeMux()
 	mux.Handle("POST /deploy", chain(
-		deployReceiver(),
+		deployReceiver(deps),
 		withBodyLimit(cfg.MaxBodyBytes), // 전송 제한(DO-15 ⑵) — 바깥에서 body를 캡
 		withAuth(deps),                  // 게이트 1 — HMAC + 신선도(DO-2·DO-10 ⑴⑵)
 		withOIDC(deps),                  // 게이트 2 — OIDC claim 행렬(DO-11) · HMAC과 AND
@@ -217,9 +228,10 @@ func withAuth(d Deps) middleware {
 				return
 			}
 
-			// 통과 — 검증된 요청을 컨텍스트에 싣고 본문을 되돌린다. jti는 S1-3까지 빈 값.
+			// 통과 — 검증된 요청과 인증된 원본 body를 컨텍스트에 싣는다. body는 오케스트레이션이
+			// manifest로 파싱할 서명·인증된 바이트다(하류가 재검증하지 않는다). jti는 게이트 2가 채운다.
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			ctx := context.WithValue(r.Context(), verifiedRequestKey, verifiedRequest{req: areq, jti: ""})
+			ctx := context.WithValue(r.Context(), verifiedRequestKey, verifiedRequest{req: areq, jti: "", body: body})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -300,8 +312,8 @@ func withValidate(next http.Handler) http.Handler {
 // 검증된 요청(withAuth가 컨텍스트에 실은 것)만 여기 도달한다 — 인증되지 않은 요청은
 // 이미 게이트 1에서 막혔다. 선점은 store가 소유하는 지속 부작용이며(append-only 원장),
 // 이 슬롯은 그 결과로 흐름을 가른다:
-//   - 신규            → 예약을 이력에 남기고 하류(수신)로 진행.
-//   - 동일 id·동일 digest(또는 jti 재사용) → 재실행하지 않고 현재 상태를 반환.
+//   - 신규            → 예약을 이력에 남기고 하류(오케스트레이션)로 진행.
+//   - 재전송(ErrReplay) → 현재 이력 상태로 재개/상태 반환/에스컬레이션을 가른다(handleReplay).
 //   - 동일 id·다른 digest → 거절·기록(409).
 func withIdempotency(d Deps) middleware {
 	return func(next http.Handler) http.Handler {
@@ -337,8 +349,10 @@ func withIdempotency(d Deps) middleware {
 				next.ServeHTTP(w, r)
 
 			case errors.Is(err, store.ErrReplay):
-				// 재전송 — 재실행 금지. 그 요청의 현재 상태를 반환한다(DO-10 ⑷).
-				d.replayCurrentState(w, r, v.req.RequestID)
+				// 재전송 — 현재 이력 상태로 처리를 가른다(#9 · DO-16 ⑵). 완료면 재실행 없이
+				// 상태 반환, 미완(미실행·예약만)이면 같은 requestId로 재개해 완주시키고,
+				// UNKNOWN이면 무턱대고 재시도하지 않고 사람에게 올린다.
+				d.handleReplay(w, r, v, next)
 
 			case errors.Is(err, store.ErrDigestConflict):
 				// 같은 멱등 키로 다른 내용 — 거절·기록(RL-8).
@@ -353,9 +367,35 @@ func withIdempotency(d Deps) middleware {
 	}
 }
 
-// replayCurrentState는 재전송된 요청에 대해 재실행 없이 현재 상태를 반환한다. 이력이
-// 있으면 마지막 event_type을, 없으면 예약만 된 상태로 응답한다. 어느 쪽이든 하류(수신)를
-// 호출하지 않는다 — 재전송이 두 번째 배포를 일으키지 않는 것이 이 경로의 핵심이다.
+// handleReplay는 이미 예약된(재전송) 요청을 현재 이력 상태로 가른다(#9 갭 차단 · DO-16 ⑵).
+// 예약(RESERVED) 뒤 수신 실패로 미완이 된 배포가 ErrReplay로 영영 단락되던 갭을 닫는다:
+//   - 재개(REEXECUTE)  → 같은 requestId로 오케스트레이션 재진입해 완주시킨다(미실행=부작용 0
+//     증명이므로 중복 부작용 없음 — dispatcher는 requestId 단위 멱등).
+//   - 상태 반환(REPORT) → 이미 완료 — 재실행 없이 현재 상태만 반환한다(DO-10 ⑷).
+//   - 에스컬레이션(ESCALATE) → 직전 시도가 UNKNOWN — 무턱대고 재시도하지 않고 사람에게 올린다.
+func (d Deps) handleReplay(w http.ResponseWriter, r *http.Request, v verifiedRequest, next http.Handler) {
+	var latest store.HistoryEvent
+	if d.History != nil {
+		if ev, err := d.History.ReadLatest(r.Context(), v.req.RequestID); err == nil {
+			latest = ev
+		}
+	}
+	switch deploy.ClassifyReplay(latest) {
+	case deploy.ResumeReexecute:
+		v.resume = true
+		ctx := context.WithValue(r.Context(), verifiedRequestKey, v)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	case deploy.ResumeReport:
+		d.replayCurrentState(w, r, v.req.RequestID)
+	default: // ResumeEscalate
+		w.Header().Set("X-Deploy-Idempotent-Replay", "true")
+		http.Error(w, "직전 시도가 UNKNOWN 상태 — 자동 재시도 금지, 사람 개입 필요(DO-16 ⑵)", http.StatusConflict)
+	}
+}
+
+// replayCurrentState는 재전송된 요청에 대해 재실행 없이 현재 상태를 반환한다(완료 경로).
+// 이력이 있으면 마지막 event_type을, 없으면 예약만 된 상태로 응답한다. 하류(수신)를
+// 호출하지 않는다 — 완료된 배포를 재전송이 두 번 일으키지 않는 것이 이 경로의 핵심이다.
 func (d Deps) replayCurrentState(w http.ResponseWriter, r *http.Request, requestID string) {
 	status := "RESERVED"
 	if d.History != nil {
@@ -368,23 +408,49 @@ func (d Deps) replayCurrentState(w http.ResponseWriter, r *http.Request, request
 	_, _ = io.WriteString(w, "이미 수신된 요청 (재실행 없음) 상태="+status+"\n")
 }
 
-// deployReceiver는 체인의 종단 핸들러다. 미들웨어를 모두 통과한 요청의 본문을 상한
-// 안에서 읽고, 이후 단계(서명 검증 → 오케스트레이션)가 붙기 전까지는 처리하지 않는다.
-func deployReceiver() http.Handler {
+// deployReceiver는 체인의 종단 핸들러다. 게이트·멱등을 모두 통과한 검증된 요청을 상태
+// 있는 오케스트레이션 층(internal/deploy)에 넘긴다(IA-4 ⑵). body는 withAuth가 서명 검증과
+// 함께 인증한 원본이며(재검증하지 않는다), 오케스트레이터가 그것을 manifest로 파싱해
+// 모드·락·검증을 거쳐 실행 지점까지 엮는다. 결과는 전송 무관 Outcome이며 여기서 상태
+// 코드로 사상한다.
+func deployReceiver(d Deps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := io.ReadAll(r.Body); err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				http.Error(w, "요청 본문이 상한을 초과했다", http.StatusRequestEntityTooLarge)
-				return
-			}
-			http.Error(w, "요청 본문을 읽지 못했다", http.StatusBadRequest)
+		v, ok := r.Context().Value(verifiedRequestKey).(verifiedRequest)
+		if !ok {
+			// 게이트를 거치지 않고 도달 = 조립 오류. 통과시키지 않는다(fail-closed).
+			http.Error(w, "검증되지 않은 요청 (내부 순서 오류)", http.StatusInternalServerError)
 			return
 		}
-
-		// TODO(S1-2 이후): 게이트 1(withAuth)이 실제 판정을 하게 되면, 통과한 요청을
-		// internal/deploy 오케스트레이터에 넘긴다(IA-4 ⑵). 지금은 수신 골격만 서 있고
-		// 실제 배포 처리는 미구현이므로 요란하게 실패한다(fail-closed — 조용한 성공 위장 금지).
-		http.Error(w, "배포 처리 미구현 (S1-2 이후)", http.StatusNotImplemented)
+		res := d.Deploy.Orchestrate(r.Context(), deploy.Request{
+			RequestID: v.req.RequestID,
+			Body:      v.body,
+			Resume:    v.resume,
+		})
+		writeOutcome(w, res)
 	})
+}
+
+// writeOutcome은 오케스트레이션 결과를 HTTP 상태로 사상한다. 실행 지점 도달(dispatch
+// 미구현)은 501로 요란하게 드러낸다 — 조용한 성공 위장을 하지 않는다(#15 전까지 배포는
+// 완료되지 않는다). 거절·fail-closed는 각각의 4xx/5xx로 닫는다.
+func writeOutcome(w http.ResponseWriter, res deploy.Result) {
+	switch res.Outcome {
+	case deploy.OutcomeReachedDispatch:
+		http.Error(w, "오케스트레이션 통과·실행 지점 도달 — 배포 실행 미구현(#15)", http.StatusNotImplemented)
+	case deploy.OutcomeManifestInvalid:
+		http.Error(w, "manifest 검증 실패: "+res.Detail, http.StatusUnprocessableEntity)
+	case deploy.OutcomeLockContended:
+		http.Error(w, "배포 창 락 경합 — 다른 배포·배치 진행 중", http.StatusConflict)
+	case deploy.OutcomeModeChanged:
+		http.Error(w, "적용 직전 모드 토글 — 요청 거절(토글-요청 race)", http.StatusConflict)
+	case deploy.OutcomeFailClosed:
+		http.Error(w, "fail-closed: "+res.Detail, http.StatusServiceUnavailable)
+	case deploy.OutcomeCompleted:
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "배포 완료\n")
+	case deploy.OutcomeUnknown:
+		http.Error(w, "원격 실행 UNKNOWN — 사람 개입 필요(락 유지)", http.StatusConflict)
+	default:
+		http.Error(w, "알 수 없는 오케스트레이션 결과", http.StatusInternalServerError)
+	}
 }
