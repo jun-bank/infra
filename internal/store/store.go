@@ -7,11 +7,11 @@
 // DML은 grant에서 금지된 것과 마찬가지로 코드에서도 도달 불가능하다(DT-12) — 동일한
 // 규칙을 두 계층에서 강제한다.
 //
-// 구현 상태: 재생 방어 원장 Reserve(DO-10), mode 조회·append(DO-17), 그리고 정상 경로
-// 락 — Acquire·Renew·Release·Read(CD-3) — 가 실제 *sql.DB 위에 구현돼 있다. 핸드셰이크
-// 전이(RecordPreempt·AckSafetyBoundary·OverrideAcquire·ResolveOpenDebt — ADR-024 §2.4
-// 긴급 롤백 인계)는 S3, 배포 이력(AppendEvent·ReadLatest)은 다음 단계라 아직
-// ErrNotImplemented를 반환한다. 실 MySQL에 대해 프로시저 계약을 증명하는 것은
+// 구현 상태: 재생 방어 원장 Reserve(DO-10), mode 조회·append(DO-17), 정상 경로 락 —
+// Acquire·Renew·Release·Read(CD-3), 배포 이력 AppendEvent·ReadLatest(DO-16 상태 기록·조회)
+// 가 실제 *sql.DB 위에 구현돼 있다. 핸드셰이크 전이(RecordPreempt·AckSafetyBoundary·
+// OverrideAcquire·ResolveOpenDebt — ADR-024 §2.4 긴급 롤백 인계)는 S3라 아직
+// ErrNotImplemented를 반환한다. 실 MySQL에 대해 프로시저·grant 계약을 증명하는 것은
 // Testcontainers 통합 스위트다(store_integration_test.go 참조).
 package store
 
@@ -187,9 +187,9 @@ type HistoryStore interface {
 
 // SQLStore는 네 개 store 모두의 SQL 기반 구현이다. *sql.DB(배포 스키마 전용, LAN 전용
 // — ADR-022 DT-10)를 보유한다. 구현된 것은 재생 방어 원장 Reserve(DO-10), mode
-// 조회·append(DO-17), 정상 경로 락 Acquire·Renew·Release·Read(CD-3)다. 핸드셰이크
-// 전이(preempt·ack·override·debt — ADR-024 §2.4, S3)와 history는 아직
-// ErrNotImplemented를 반환한다.
+// 조회·append(DO-17), 정상 경로 락 Acquire·Renew·Release·Read(CD-3), 배포 이력
+// AppendEvent·ReadLatest(DO-16)다. 핸드셰이크 전이(preempt·ack·override·debt —
+// ADR-024 §2.4, S3)만 아직 ErrNotImplemented를 반환한다.
 type SQLStore struct {
 	db *sql.DB
 }
@@ -466,10 +466,69 @@ func (s *SQLStore) AppendMode(ctx context.Context, target, mode, actor string) e
 	return err
 }
 
-func (*SQLStore) AppendEvent(context.Context, HistoryEvent) error {
-	return ErrNotImplemented
+// AppendEvent는 배포 이력 행 하나를 INSERT한다(append-only — DT-9 ⑵ · DT-12 ⑵). grant는
+// 이 테이블에 SELECT+INSERT만 주므로(03_grants) 이력을 writer가 다시 쓸 수 없다. NULL 허용
+// 칸(target·commit·digest·step·result·reject_reason·fencing_token)은 빈 값이면 NULL로 넣는다
+// — 특히 target은 ENUM이라 빈 문자열이 들어가면 삽입이 실패하므로, 빈 값을 NULL로 접는 것이
+// 조용한 실패가 아니라 스키마 계약(NULL 허용)에 맞춘 정합이다.
+func (s *SQLStore) AppendEvent(ctx context.Context, ev HistoryEvent) error {
+	var target, commit, digest, step, result, reason, token any
+	if ev.Target != "" {
+		target = ev.Target
+	}
+	if ev.CommitSHA != "" {
+		commit = ev.CommitSHA
+	}
+	if ev.ManifestDigest != "" {
+		digest = ev.ManifestDigest
+	}
+	if ev.Step != "" {
+		step = ev.Step
+	}
+	if ev.Result != "" {
+		result = ev.Result
+	}
+	if ev.RejectReason != "" {
+		reason = ev.RejectReason
+	}
+	if ev.FencingToken != 0 {
+		token = uint64(ev.FencingToken)
+	}
+	_, err := s.db.ExecContext(ctx,
+		"INSERT INTO `deploy_history` "+
+			"(`request_id`, `event_type`, `target`, `commit_sha`, `manifest_digest`, `step`, `result`, `reject_reason`, `fencing_token`) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		ev.RequestID, ev.EventType, target, commit, digest, step, result, reason, token)
+	return err
 }
 
-func (*SQLStore) ReadLatest(context.Context, string) (HistoryEvent, error) {
-	return HistoryEvent{}, ErrNotImplemented
+// ReadLatest는 requestId에 대한 가장 최근 이력 이벤트를 반환한다(SELECT — DO-16 상태 조회).
+// deploy_history는 append-only이므로 "현재 상태"는 event_at·id가 가장 큰 행이다. 행이 없으면
+// 빈 이벤트 + nil을 반환한다 — 아직 아무 이력이 없다는 것은 오류가 아니라 "예약만 되고
+// 진전 없음"이며, 호출자는 그것을 재개 대상으로 본다(재전송 분류의 기본값 = 재개).
+func (s *SQLStore) ReadLatest(ctx context.Context, requestID string) (HistoryEvent, error) {
+	var (
+		ev                                           HistoryEvent
+		target, commit, digest, step, result, reason sql.NullString
+		token                                        sql.NullInt64
+	)
+	err := s.db.QueryRowContext(ctx,
+		"SELECT `request_id`, `event_type`, `target`, `commit_sha`, `manifest_digest`, `step`, `result`, `reject_reason`, `fencing_token` "+
+			"FROM `deploy_history` WHERE `request_id` = ? ORDER BY `event_at` DESC, `id` DESC LIMIT 1",
+		requestID).
+		Scan(&ev.RequestID, &ev.EventType, &target, &commit, &digest, &step, &result, &reason, &token)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return HistoryEvent{}, nil
+	case err != nil:
+		return HistoryEvent{}, err
+	}
+	ev.Target = target.String
+	ev.CommitSHA = commit.String
+	ev.ManifestDigest = digest.String
+	ev.Step = step.String
+	ev.Result = result.String
+	ev.RejectReason = reason.String
+	ev.FencingToken = FencingToken(token.Int64)
+	return ev, nil
 }
