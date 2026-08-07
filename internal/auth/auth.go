@@ -196,7 +196,16 @@ func (v *hmacVerifier) Verify(req Request) (Decision, error) {
 		return Decision{Accepted: false, Reason: "서명 불일치"}, nil
 	}
 
-	// ⑵ 신선도 — issuedAt/expiresAt를 RFC3339로 파싱한다. 파싱 실패도 거절이다
+	// ⑵ 멱등 키 필수 — requestId는 서명 범위 안이므로 서명 검증 자체는 위에서 끝났다.
+	// 여기서 막는 것은 "검증된 requestId가 빈 값인지"다: 비었거나 공백만 있으면 모든
+	// 무-ID 요청이 멱등 키 ""를 공유해 서로의 예약과 충돌한다(선점 붕괴·DoS). 예약
+	// (Reserve)에 닿기 전 게이트 1에서 거절한다. 최소 형식 검증(비어있지 않음)이며,
+	// 그 이상의 형식 규칙은 [구현 검증]이다.
+	if strings.TrimSpace(req.RequestID) == "" {
+		return Decision{Accepted: false, Reason: "requestId 비어 있음 (멱등 키 필수)"}, nil
+	}
+
+	// ⑶ 신선도 — issuedAt/expiresAt를 RFC3339로 파싱한다. 파싱 실패도 거절이다
 	// (서명은 이 문자열을 덮으므로 형식 오류 = 위조되었거나 잘못 만든 요청).
 	issuedAt, err := time.Parse(time.RFC3339, req.IssuedAt)
 	if err != nil {
