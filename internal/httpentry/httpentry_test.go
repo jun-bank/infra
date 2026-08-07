@@ -50,20 +50,43 @@ func newFakeLedger() *fakeLedger {
 func (f *fakeLedger) Reserve(_ context.Context, requestID, jti, bodyDigest string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if jti != "" && f.jtis[jti] {
-		return store.ErrReplay
-	}
+	// 실제 store.Reserve와 같은 우선순위: requestId(PK)를 먼저 본다 — 이미 있으면
+	// digest를 대조해 재생/충돌을 가른다. requestId가 신규일 때만 jti 재사용을 본다
+	// (동일 requestId + 동일 jti + 다른 digest는 충돌이지 jti 재생이 아니다).
 	if d, ok := f.digest[requestID]; ok {
 		if d == bodyDigest {
 			return store.ErrReplay
 		}
 		return store.ErrDigestConflict
 	}
+	if jti != "" && f.jtis[jti] {
+		return store.ErrReplay
+	}
 	f.digest[requestID] = bodyDigest
 	if jti != "" {
 		f.jtis[jti] = true
 	}
 	return nil
+}
+
+// --- OIDC 게이트 페이크 -------------------------------------------------------
+
+// fakeOIDC는 게이트 2를 대체한다. accept가 true면 fixedJTI를 실은 통과 결정을,
+// false면 거절 결정을 낸다 — 게이트 2 자체의 행렬은 auth 패키지가 검증하므로, 여기서는
+// 배선(토큰 헤더 읽기·jti 전달·거절 시 401·기록)만 못박는다.
+type fakeOIDC struct {
+	accept    bool
+	fixedJTI  string
+	reason    string
+	lastToken string
+}
+
+func (f *fakeOIDC) Verify(_ context.Context, rawToken string) auth.OIDCDecision {
+	f.lastToken = rawToken
+	if !f.accept {
+		return auth.OIDCDecision{Accepted: false, Reason: f.reason}
+	}
+	return auth.OIDCDecision{Accepted: true, JTI: f.fixedJTI, SelfReport: true}
 }
 
 // fakeHistory는 인메모리 이력이다. append와 최신 읽기만 지원한다(append-only).
@@ -105,8 +128,15 @@ func testConfig(maxBody int64) Config {
 	return Config{ListenAddr: "127.0.0.1:0", MaxBodyBytes: maxBody}
 }
 
-// testDeps는 실제 게이트 1 verifier(고정 시각)와 인메모리 store 페이크를 조립한다.
+// testDeps는 실제 게이트 1 verifier(고정 시각)·통과하는 게이트 2 페이크·인메모리 store
+// 페이크를 조립한다. 게이트 2 행렬 자체는 auth 패키지가 검증하므로 기본은 통과다.
 func testDeps(t *testing.T) (Deps, *fakeHistory) {
+	t.Helper()
+	return testDepsWithOIDC(t, &fakeOIDC{accept: true, fixedJTI: "jti-default"})
+}
+
+// testDepsWithOIDC는 지정한 게이트 2로 deps를 조립한다(거절·자기 신고 배선 테스트용).
+func testDepsWithOIDC(t *testing.T, oidc OIDCGate) (Deps, *fakeHistory) {
 	t.Helper()
 	skew := auth.DefaultClockSkew
 	v, err := auth.NewVerifier(auth.Config{Key: testHMACKey, Skew: &skew}, fixedClock{})
@@ -114,7 +144,7 @@ func testDeps(t *testing.T) (Deps, *fakeHistory) {
 		t.Fatalf("verifier 생성 실패: %v", err)
 	}
 	hist := newFakeHistory()
-	return Deps{Verifier: v, Ledger: newFakeLedger(), History: hist}, hist
+	return Deps{Verifier: v, OIDC: oidc, Ledger: newFakeLedger(), History: hist}, hist
 }
 
 // signedRequest는 지정한 본문·시각으로 올바르게 서명된 POST /deploy 요청을 만든다.
@@ -135,6 +165,8 @@ func signedRequest(body, requestID string, issuedAt, expiresAt time.Time) *http.
 	r.Header.Set(headerIssuedAt, areq.IssuedAt)
 	r.Header.Set(headerExpiresAt, areq.ExpiresAt)
 	r.Header.Set(headerSignature, hex.EncodeToString(sig))
+	// 게이트 2가 읽을 OIDC 토큰(더미) — 실제 검증은 주입된 게이트 페이크가 판정한다.
+	r.Header.Set(headerOIDCToken, "dummy-oidc-token")
 	return r
 }
 
@@ -346,6 +378,96 @@ func TestSameIDDifferentDigestRejected(t *testing.T) {
 	}
 	if hist.count("req-conflict") < 2 { // RESERVED + REJECTED
 		t.Error("충돌 거절이 이력에 기록되지 않았다 (RL-8)")
+	}
+}
+
+// --- 게이트 2(OIDC) 배선 -----------------------------------------------------
+
+// TestOIDCRejectedReturns401는 게이트 1을 통과해도 게이트 2가 거절하면 401로 막고
+// 이력에 남기는지 확인한다(HMAC AND OIDC — 한쪽만으로는 배포를 열지 않는다).
+func TestOIDCRejectedReturns401(t *testing.T) {
+	deps, hist := testDepsWithOIDC(t, &fakeOIDC{accept: false, reason: "repository_id 불일치"})
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+
+	iat, exp := freshWindow()
+	req := signedRequest(`{"target":"core"}`, "req-oidc-reject", iat, exp)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("OIDC 거절: 코드 = %d, 기대 = 401", rec.Code)
+	}
+	if hist.count("req-oidc-reject") == 0 {
+		t.Error("OIDC 거절이 이력에 기록되지 않았다 (RL-8)")
+	}
+}
+
+// TestMissingOIDCTokenRejected는 OIDC 토큰 헤더가 없으면 게이트 2에서 401로 막는지
+// 확인한다 — 게이트 2 판정을 부르기도 전에 토큰 부재로 거절한다.
+func TestMissingOIDCTokenRejected(t *testing.T) {
+	deps, hist := testDeps(t)
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+
+	iat, exp := freshWindow()
+	req := signedRequest(`{"target":"core"}`, "req-no-oidc", iat, exp)
+	req.Header.Del(headerOIDCToken) // OIDC 토큰 제거
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("OIDC 토큰 부재: 코드 = %d, 기대 = 401", rec.Code)
+	}
+	if hist.count("req-no-oidc") == 0 {
+		t.Error("토큰 부재 거절이 이력에 기록되지 않았다 (RL-8)")
+	}
+}
+
+// TestJTIReuseReturnsReplay는 서로 다른 requestId라도 게이트 2가 실어 온 jti가 재사용되면
+// 재실행 없이 재생으로 처리되는지 확인한다(토큰 재사용 = 재전송 · DO-10 ⑶ · DO-11).
+// 기본 게이트 페이크는 고정 jti("jti-default")를 모든 요청에 실으므로, 두 번째 요청은
+// 원장의 jti UNIQUE에 걸려 재생이 된다.
+func TestJTIReuseReturnsReplay(t *testing.T) {
+	deps, _ := testDeps(t)
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+	iat, exp := freshWindow()
+
+	// 1차 — 신규(jti-default 선점).
+	first := signedRequest(`{"target":"core"}`, "req-jti-A", iat, exp)
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, first)
+	if rec1.Code != http.StatusNotImplemented {
+		t.Fatalf("1차 요청: 코드 = %d, 기대 = 501", rec1.Code)
+	}
+
+	// 2차 — 다른 requestId·다른 본문이지만 같은 jti(토큰 재사용).
+	second := signedRequest(`{"target":"ledger"}`, "req-jti-B", iat, exp)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, second)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("jti 재사용: 코드 = %d, 기대 = 200(재실행 없음)", rec2.Code)
+	}
+	if rec2.Header().Get("X-Deploy-Idempotent-Replay") != "true" {
+		t.Error("jti 재사용 응답에 멱등 재생 표식이 없다")
+	}
+}
+
+// TestSelfReportRecordedOnReserve는 게이트 2가 자기 신고로 통과한 요청의 신규 예약
+// 이력에 그 한계가 남는지 확인한다(잔여-5 — 운영 승인은 기계 보증이 아니다).
+func TestSelfReportRecordedOnReserve(t *testing.T) {
+	deps, hist := testDeps(t)
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+
+	iat, exp := freshWindow()
+	req := signedRequest(`{"target":"core"}`, "req-selfreport", iat, exp)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	ev, err := hist.ReadLatest(context.Background(), "req-selfreport")
+	if err != nil {
+		t.Fatalf("이력 읽기 오류: %v", err)
+	}
+	if ev.Result != "OPERATIONAL_APPROVAL_SELF_REPORTED" {
+		t.Errorf("자기 신고 한계가 예약 이력에 남지 않았다: Result = %q", ev.Result)
 	}
 }
 
