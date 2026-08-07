@@ -1,0 +1,324 @@
+// 오케스트레이션 시퀀스의 단위 테스트(DO-16·17·18 · CD-3·4). 거절/안전 경로를 우선
+// 밟는다 — 승인 게이트가 장애로 열리거나(fail-open), 경합을 획득으로 오인하거나, 미완
+// 배포가 조용히 방치되는 것이 이 층의 치명적 실패이기 때문이다. 협력자(mode·lock·history·
+// dispatch)는 인메모리 페이크로 대체한다 — 실 SQL 계약은 store 통합 테스트가 진다.
+package deploy
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/jun-bank/infra/internal/store"
+)
+
+// --- 페이크 -------------------------------------------------------------------
+
+// seqModeReader는 호출마다 다음 응답을 돌려주는 ModeReader다(수락 시 vs 적용 직전의
+// version 변화를 흉내낸다). 응답이 소진되면 마지막 응답을 반복한다.
+type seqModeReader struct {
+	resp []modeResp
+	i    int
+}
+type modeResp struct {
+	mode    string
+	version uint64
+	err     error
+}
+
+func (r *seqModeReader) Current(context.Context, string) (string, uint64, error) {
+	resp := r.resp[len(r.resp)-1]
+	if r.i < len(r.resp) {
+		resp = r.resp[r.i]
+	}
+	r.i++
+	return resp.mode, resp.version, resp.err
+}
+
+// orchLock은 고정 결과를 돌려주며 획득·해제 호출을 센다.
+type orchLock struct {
+	acquireTok store.FencingToken
+	acquireOK  bool
+	acquireErr error
+	releaseOK  bool
+	acquired   int
+	released   int
+}
+
+func (l *orchLock) Acquire(context.Context, store.HolderKind, string, time.Duration) (store.FencingToken, bool, error) {
+	l.acquired++
+	return l.acquireTok, l.acquireOK, l.acquireErr
+}
+func (l *orchLock) Renew(context.Context, store.HolderKind, string, store.FencingToken, time.Duration) (bool, error) {
+	return true, nil
+}
+func (l *orchLock) Release(context.Context, store.HolderKind, string, store.FencingToken) (bool, error) {
+	l.released++
+	return l.releaseOK, nil
+}
+
+// recHistory는 append를 순서대로 담고 최신 조회를 지원하는 인메모리 이력이다.
+type recHistory struct {
+	events []store.HistoryEvent
+}
+
+func (h *recHistory) AppendEvent(_ context.Context, ev store.HistoryEvent) error {
+	h.events = append(h.events, ev)
+	return nil
+}
+func (h *recHistory) ReadLatest(_ context.Context, requestID string) (store.HistoryEvent, error) {
+	for i := len(h.events) - 1; i >= 0; i-- {
+		if h.events[i].RequestID == requestID {
+			return h.events[i], nil
+		}
+	}
+	return store.HistoryEvent{}, nil
+}
+func (h *recHistory) last() store.HistoryEvent {
+	if len(h.events) == 0 {
+		return store.HistoryEvent{}
+	}
+	return h.events[len(h.events)-1]
+}
+
+// fakeDispatcher는 고정 상태·오류를 낸다(실행 지점 대체).
+type fakeDispatcher struct {
+	state RemoteState
+	err   error
+}
+
+func (d fakeDispatcher) Dispatch(context.Context, Manifest, store.FencingToken) (RemoteState, error) {
+	return d.state, d.err
+}
+
+// --- 하네스 -------------------------------------------------------------------
+
+func validManifest(requestID string) []byte {
+	return []byte(`{"target":"core","commitSha":"c1","imageDigest":"sha256:abc","composeRevision":"rev1","configVersion":"v1","requestId":"` + requestID + `"}`)
+}
+
+// baseDeps는 정상 경로(dev·락 획득·UNEXECUTED dispatch)를 조립한다. 개별 테스트가 필요한
+// 조각만 덮어쓴다.
+func baseDeps() (Deps, *orchLock, *recHistory) {
+	l := &orchLock{acquireTok: 7, acquireOK: true, releaseOK: true}
+	h := &recHistory{}
+	return Deps{
+		Mode:       &seqModeReader{resp: []modeResp{{mode: "dev", version: 3}}},
+		Lock:       l,
+		History:    h,
+		Dispatcher: fakeDispatcher{state: StateUnexecuted},
+		HolderID:   "deploy-1",
+		Lease:      60 * time.Second,
+	}, l, h
+}
+
+// --- manifest 검증 순수 함수 --------------------------------------------------
+
+func TestParseManifest_TargetGate(t *testing.T) {
+	if _, err := ParseManifest([]byte(`{"target":"staging"}`)); !errors.Is(err, ErrManifestTarget) {
+		t.Fatalf("닫힌 집합 밖 대상: err=%v, ErrManifestTarget 기대", err)
+	}
+	if _, err := ParseManifest([]byte(`not-json`)); !errors.Is(err, ErrManifestMalformed) {
+		t.Fatalf("깨진 JSON: err=%v, ErrManifestMalformed 기대", err)
+	}
+	if m, err := ParseManifest([]byte(`{"target":"core"}`)); err != nil || m.Target != TargetCore {
+		t.Fatalf("유효 대상 파싱 실패: m=%+v err=%v", m, err)
+	}
+}
+
+func TestVerifyManifest(t *testing.T) {
+	full := Manifest{Target: TargetCore, CommitSHA: "c1", ImageDigest: "sha256:abc", ComposeRevision: "r1", ConfigVersion: "v1", RequestID: "req-1"}
+	if err := VerifyManifest(full, "req-1"); err != nil {
+		t.Fatalf("완전·일치 manifest가 거절됐다: %v", err)
+	}
+	// 필드 누락.
+	miss := full
+	miss.ComposeRevision = ""
+	if err := VerifyManifest(miss, "req-1"); !errors.Is(err, ErrManifestIncomplete) {
+		t.Fatalf("필드 누락: err=%v, ErrManifestIncomplete 기대", err)
+	}
+	// 태그(digest 형식 아님).
+	tag := full
+	tag.ImageDigest = "latest"
+	if err := VerifyManifest(tag, "req-1"); !errors.Is(err, ErrManifestDigest) {
+		t.Fatalf("가변 태그: err=%v, ErrManifestDigest 기대", err)
+	}
+	// requestId 불일치(서명된 것과 다름).
+	if err := VerifyManifest(full, "req-OTHER"); !errors.Is(err, ErrManifestRequestID) {
+		t.Fatalf("requestId 불일치: err=%v, ErrManifestRequestID 기대", err)
+	}
+}
+
+// --- 오케스트레이션 거절/안전 경로 -------------------------------------------
+
+// manifest가 깨졌으면 락을 잡지 않고 거절한다.
+func TestOrchestrate_ManifestMalformed_NoLock(t *testing.T) {
+	d, l, h := baseDeps()
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "r", Body: []byte("nope")})
+	if res.Outcome != OutcomeManifestInvalid {
+		t.Fatalf("깨진 manifest: outcome=%v, MANIFEST_INVALID 기대", res.Outcome)
+	}
+	if l.acquired != 0 {
+		t.Fatalf("깨진 manifest인데 락을 잡았다(acquired=%d) — 검증 전 락 금지", l.acquired)
+	}
+	if h.last().EventType != "REJECTED" {
+		t.Fatalf("거절이 이력에 기록되지 않았다: %+v", h.last())
+	}
+}
+
+// 모드 저장 접근 실패 = operational fail-closed → 락을 잡지 않고 FAIL_CLOSED.
+func TestOrchestrate_ModeFailClosed_NoLock(t *testing.T) {
+	d, l, _ := baseDeps()
+	d.Mode = &seqModeReader{resp: []modeResp{{err: errors.New("db 접근 불가")}}}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeFailClosed {
+		t.Fatalf("모드 읽기 실패: outcome=%v, FAIL_CLOSED 기대(fail-closed)", res.Outcome)
+	}
+	if l.acquired != 0 {
+		t.Fatalf("모드 fail-closed인데 락을 잡았다 — 자동 배포 미시작이어야 한다")
+	}
+}
+
+// 락 경합 = 기록할 거절(오류 아님) → LOCK_CONTENDED, 흐름 중단.
+func TestOrchestrate_LockContended(t *testing.T) {
+	d, l, h := baseDeps()
+	l.acquireOK = false
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeLockContended {
+		t.Fatalf("락 경합: outcome=%v, LOCK_CONTENDED 기대", res.Outcome)
+	}
+	if h.last().EventType != "REJECTED" {
+		t.Fatalf("경합 거절이 이력에 남지 않았다: %+v", h.last())
+	}
+}
+
+// 락 획득 연결·권한 오류 = fail-closed(조용히 삼키지 않는다).
+func TestOrchestrate_LockError_FailClosed(t *testing.T) {
+	d, _, _ := baseDeps()
+	d.Lock = &orchLock{acquireErr: errors.New("db 접근 불가")}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeFailClosed {
+		t.Fatalf("락 오류: outcome=%v, FAIL_CLOSED 기대", res.Outcome)
+	}
+}
+
+// 수락 시(version=5) 뒤 적용 직전 토글(version=6)이면 락 획득 후 검증에서 거절하고 락을
+// 해제한다(#9 원자 검증 — VerifyModeUnchanged가 락 획득과 같은 자리).
+func TestOrchestrate_ModeChangedUnderLock_Rejects_ReleasesLock(t *testing.T) {
+	d, l, h := baseDeps()
+	d.Mode = &seqModeReader{resp: []modeResp{
+		{mode: "operational", version: 5}, // DecideMode
+		{mode: "operational", version: 6}, // VerifyModeUnchanged — 토글됨
+	}}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeModeChanged {
+		t.Fatalf("적용 직전 토글: outcome=%v, MODE_CHANGED 기대(race 차단)", res.Outcome)
+	}
+	if l.acquired != 1 || l.released != 1 {
+		t.Fatalf("모드 변경 거절 시 락 획득·해제 각 1회 기대: acquired=%d released=%d", l.acquired, l.released)
+	}
+	if h.last().EventType != "REJECTED" {
+		t.Fatalf("모드 변경 거절이 이력에 남지 않았다: %+v", h.last())
+	}
+}
+
+// 락은 잡았지만 manifest가 불완전(락 보유 중 DO-18 검증 실패)하면 거절하고 락을 해제한다.
+func TestOrchestrate_ManifestIncompleteUnderLock_ReleasesLock(t *testing.T) {
+	d, l, _ := baseDeps()
+	// 대상은 유효(모드 판정 통과)하지만 나머지 필드가 비어 VerifyManifest에서 걸린다.
+	body := []byte(`{"target":"core"}`)
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: body})
+	if res.Outcome != OutcomeManifestInvalid {
+		t.Fatalf("불완전 manifest: outcome=%v, MANIFEST_INVALID 기대", res.Outcome)
+	}
+	if l.acquired != 1 || l.released != 1 {
+		t.Fatalf("락 보유 중 거절 시 획득·해제 각 1회 기대: acquired=%d released=%d", l.acquired, l.released)
+	}
+}
+
+// requestId가 서명된 것과 다르면(manifest 위조된 id) 거절한다.
+func TestOrchestrate_RequestIDMismatch(t *testing.T) {
+	d, _, _ := baseDeps()
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-SIGNED", Body: validManifest("req-OTHER")})
+	if res.Outcome != OutcomeManifestInvalid {
+		t.Fatalf("requestId 불일치: outcome=%v, MANIFEST_INVALID 기대", res.Outcome)
+	}
+}
+
+// --- 정상 경로 + dispatch 상태 사상 ------------------------------------------
+
+// 완전 manifest → 실행 지점 도달. dispatch 스텁은 UNEXECUTED → REACHED_DISPATCH, 락 해제,
+// STEP_RESULT(UNEXECUTED) 이력.
+func TestOrchestrate_ReachesDispatch(t *testing.T) {
+	d, l, h := baseDeps()
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeReachedDispatch || res.State != StateUnexecuted {
+		t.Fatalf("정상 경로: outcome=%v state=%v, REACHED_DISPATCH·UNEXECUTED 기대", res.Outcome, res.State)
+	}
+	if l.released != 1 {
+		t.Fatalf("실행 지점 도달 후 락 해제 기대: released=%d", l.released)
+	}
+	if h.last().EventType != "STEP_RESULT" || h.last().Result != string(StateUnexecuted) {
+		t.Fatalf("dispatch 상태가 이력에 남지 않았다: %+v", h.last())
+	}
+	if h.last().FencingToken != 7 {
+		t.Fatalf("이력에 fencing 토큰이 실리지 않았다: %+v", h.last())
+	}
+}
+
+// dispatch가 COMPLETED면 완료로 사상하고 락을 해제한다.
+func TestOrchestrate_CompletedReleasesLock(t *testing.T) {
+	d, l, h := baseDeps()
+	d.Dispatcher = fakeDispatcher{state: StateCompleted}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("dispatch 완료: outcome=%v, COMPLETED 기대", res.Outcome)
+	}
+	if l.released != 1 {
+		t.Fatalf("완료 후 락 해제 기대: released=%d", l.released)
+	}
+	if h.last().EventType != string(OutcomeCompleted) {
+		t.Fatalf("완료 이력 event_type=%q, COMPLETED 기대", h.last().EventType)
+	}
+}
+
+// dispatch가 UNKNOWN이면 락을 유지한 채 사람에게 올린다(DO-16 ⑵ — 재시도·실패 접기 금지).
+func TestOrchestrate_UnknownKeepsLock(t *testing.T) {
+	d, l, h := baseDeps()
+	d.Dispatcher = fakeDispatcher{state: StateUnknown}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeUnknown {
+		t.Fatalf("dispatch UNKNOWN: outcome=%v, UNKNOWN 기대", res.Outcome)
+	}
+	if l.released != 0 {
+		t.Fatalf("UNKNOWN은 락을 유지해야 한다: released=%d", l.released)
+	}
+	if h.last().EventType != string(OutcomeUnknown) {
+		t.Fatalf("UNKNOWN 이력 event_type=%q, UNKNOWN 기대", h.last().EventType)
+	}
+}
+
+// --- 재전송 분류(#9) ---------------------------------------------------------
+
+func TestClassifyReplay(t *testing.T) {
+	// 미완(예약·미실행) → 재개.
+	if a := ClassifyReplay(store.HistoryEvent{EventType: "RESERVED"}); a != ResumeReexecute {
+		t.Fatalf("예약만: %v, REEXECUTE 기대(재개)", a)
+	}
+	if a := ClassifyReplay(store.HistoryEvent{EventType: "STEP_RESULT", Result: "UNEXECUTED"}); a != ResumeReexecute {
+		t.Fatalf("미실행: %v, REEXECUTE 기대(재개)", a)
+	}
+	// 완료 → 재실행 없이 상태 반환.
+	if a := ClassifyReplay(store.HistoryEvent{EventType: "COMPLETED"}); a != ResumeReport {
+		t.Fatalf("완료: %v, REPORT 기대(재실행 없음)", a)
+	}
+	// UNKNOWN → 재시도 금지.
+	if a := ClassifyReplay(store.HistoryEvent{EventType: "UNKNOWN"}); a != ResumeEscalate {
+		t.Fatalf("UNKNOWN: %v, ESCALATE 기대(재시도 금지)", a)
+	}
+	// 이력 없음 → 재개하지 않는다(이 requestId 미예약 — jti 재사용 등). 예약-우선 불변식.
+	if a := ClassifyReplay(store.HistoryEvent{}); a != ResumeReport {
+		t.Fatalf("이력 없음: %v, REPORT 기대(미예약이면 부작용 금지)", a)
+	}
+}
