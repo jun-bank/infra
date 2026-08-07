@@ -138,6 +138,17 @@ func buildDeps() (httpentry.Deps, error) {
 		return httpentry.Deps{}, fmt.Errorf("게이트 1 verifier: %w", err)
 	}
 
+	// 게이트 2(OIDC claim 행렬 — DO-11). 정책(기대 claim 값)은 환경에서 오고, 서명
+	// 검증은 발급자 JWKS 공개키로 한다. 실제 JWKS 페치는 스캐폴드 뒤에 있다(아래).
+	oidcPolicy, err := auth.LoadOIDCPolicy()
+	if err != nil {
+		return httpentry.Deps{}, fmt.Errorf("게이트 2 정책: %w", err)
+	}
+	oidcGate, err := auth.NewOIDCVerifier(auth.NewJWKSTokenVerifier(jwksScaffold{}), oidcPolicy, nil)
+	if err != nil {
+		return httpentry.Deps{}, fmt.Errorf("게이트 2 verifier: %w", err)
+	}
+
 	dsn := os.Getenv("DEPLOY_DB_DSN")
 	if dsn == "" {
 		return httpentry.Deps{}, errors.New("DEPLOY_DB_DSN 미설정 (배포 스키마 접속은 .env에서 온다)")
@@ -148,7 +159,18 @@ func buildDeps() (httpentry.Deps, error) {
 	}
 	st := store.New(db)
 
-	return httpentry.Deps{Verifier: verifier, Ledger: st, History: st}, nil
+	return httpentry.Deps{Verifier: verifier, OIDC: oidcGate, Ledger: st, History: st}, nil
+}
+
+// jwksScaffold는 게이트 2의 JWKS 공개키 페치 자리를 잡는 스캐폴드다(store 스캐폴드와
+// 같은 방식). 실제 구현은 발급자 JWKS 엔드포인트를 HTTPS로 페치·캐시하며 키 회전을
+// 따라간다 — ⚠️ 발급자 URL·회전·캐시는 [구현 검증]이다. 다음 마일스톤에서 채워질
+// 때까지 오류를 반환한다: 공개키를 얻지 못하면 게이트 2가 서명을 검증할 수 없어
+// fail-closed로 거절한다(검증 못 하는 경계를 열지 않는다).
+type jwksScaffold struct{}
+
+func (jwksScaffold) VerificationKey(context.Context, string) (any, error) {
+	return nil, errors.New("JWKS 공개키 페치 미구현 (다음 마일스톤 — 발급자 JWKS HTTPS 페치)")
 }
 
 // runAgent는 ROLE=agent의 실행자 역할이다. 아직 미구현이므로 기동을 거부한다
