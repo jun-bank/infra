@@ -30,9 +30,15 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/jun-bank/infra/internal/auth"
+	"github.com/jun-bank/infra/internal/deploy"
 	"github.com/jun-bank/infra/internal/httpentry"
 	"github.com/jun-bank/infra/internal/store"
 )
+
+// defaultDeployLease는 배포 창 락의 기본 lease다(AGENT_DEPLOY_LEASE로 덮어쓴다). ⚠️ 이
+// 값은 [구현 검증]이다 — 한 배포 시퀀스를 넉넉히 덮으면서 죽은 주체를 오래 붙들지 않는
+// 실측 값은 배포 시간과 함께 정해진다. store.MinLease(1초) 이상이어야 한다.
+const defaultDeployLease = 2 * time.Minute
 
 // role은 이 바이너리가 띄우는 역할의 닫힌 집합이다(DO-21).
 type role string
@@ -159,7 +165,40 @@ func buildDeps() (httpentry.Deps, error) {
 	}
 	st := store.New(db)
 
-	return httpentry.Deps{Verifier: verifier, OIDC: oidcGate, Ledger: st, History: st}, nil
+	coord, err := buildCoordinator(st)
+	if err != nil {
+		return httpentry.Deps{}, fmt.Errorf("오케스트레이터 조립: %w", err)
+	}
+
+	return httpentry.Deps{Verifier: verifier, OIDC: oidcGate, Ledger: st, History: st, Deploy: coord}, nil
+}
+
+// buildCoordinator는 상태 있는 오케스트레이션 층을 조립한다(IA-4 ⑵). 모드·락·이력은
+// 같은 배포 스키마 store가, 실행 지점은 아직 스텁(#15)이 소유한다. holderID는 이 agent
+// 인스턴스를 락에서 식별하며(CD-3), lease는 환경에서 온다(기본값·[구현 검증]).
+func buildCoordinator(st *store.SQLStore) (deploy.Coordinator, error) {
+	holderID, err := os.Hostname()
+	if err != nil || holderID == "" {
+		return nil, errors.New("락 holder 식별자 확정 불가 (hostname)")
+	}
+
+	lease := defaultDeployLease
+	if raw := os.Getenv("AGENT_DEPLOY_LEASE"); raw != "" {
+		d, perr := time.ParseDuration(raw)
+		if perr != nil || d < store.MinLease {
+			return nil, fmt.Errorf("AGENT_DEPLOY_LEASE 값이 올바르지 않다 (>= %s Go duration): %q", store.MinLease, raw)
+		}
+		lease = d
+	}
+
+	return deploy.NewCoordinator(deploy.Deps{
+		Mode:       st,
+		Lock:       st,
+		History:    st,
+		Dispatcher: deploy.StubDispatcher{}, // 실행 지점은 #15 — 지금은 UNEXECUTED(부작용 0)
+		HolderID:   holderID,
+		Lease:      lease,
+	}), nil
 }
 
 // jwksScaffold는 게이트 2의 JWKS 공개키 페치 자리를 잡는 스캐폴드다(store 스캐폴드와
