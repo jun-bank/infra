@@ -108,7 +108,8 @@ func testConfig(maxBody int64) Config {
 // testDeps는 실제 게이트 1 verifier(고정 시각)와 인메모리 store 페이크를 조립한다.
 func testDeps(t *testing.T) (Deps, *fakeHistory) {
 	t.Helper()
-	v, err := auth.NewVerifier(auth.Config{Key: testHMACKey, Skew: auth.DefaultClockSkew}, fixedClock{})
+	skew := auth.DefaultClockSkew
+	v, err := auth.NewVerifier(auth.Config{Key: testHMACKey, Skew: &skew}, fixedClock{})
 	if err != nil {
 		t.Fatalf("verifier 생성 실패: %v", err)
 	}
