@@ -99,3 +99,16 @@ func TestVerifyModeUnchanged_FailClosedOnError(t *testing.T) {
 		t.Fatalf("검증 중 읽기 실패: %+v — 거절·FailClosed 기대", v)
 	}
 }
+
+// version은 그대로여도 mode 문자열이 손상(닫힌 집합 밖)되면 거절한다 — DecideMode의
+// 손상=fail-closed 계약과 일관. version만 대조하고 mode를 버리면, version이 안 바뀐 채
+// mode가 미지 값으로 손상됐을 때 OK=true로 새어 승인 게이트가 장애로 열린다.
+func TestVerifyModeUnchanged_FailClosedOnCorruptMode(t *testing.T) {
+	v := VerifyModeUnchanged(context.Background(), fakeModeReader{mode: "staging", version: 5}, "core", 5)
+	if v.OK || !v.FailClosed {
+		t.Fatalf("손상된 mode(version 동일): %+v — 거절·FailClosed 기대(fail-closed)", v)
+	}
+	if v.CurrentVersion != 5 {
+		t.Fatalf("거절 기록용 CurrentVersion = %d, 5 기대", v.CurrentVersion)
+	}
+}

@@ -1,9 +1,11 @@
 -- deploy/schema/02_procedures.sql
 --
--- 일곱 개의 락 전이(ADR-022 DT-12; ADR-024 §2.4 핸드셰이크). 락 행은 오직 이들을
--- 통해서만 변경된다 — 어떤 계정도 여기에 raw DML을 갖지 않는다. fencing-token
--- 단조성, holder 조건, lease 검사, 전이 가드는 프로시저 내부에 살기 때문에, EXECUTE할
--- 수 있는 계정조차 owner/token/lease를 위조할 수 없다(DB 권한으로 강제되는 CD-3 원자 계약).
+-- 일곱 개의 락 전이(ADR-022 DT-12; ADR-024 §2.4 핸드셰이크) + 모드 append 프로시저
+-- (ADR-027 DO-17 ⑵ 단조 version). 락 행은 오직 이 전이들을 통해서만 변경된다 — 어떤
+-- 계정도 여기에 raw DML을 갖지 않는다. fencing-token 단조성, holder 조건, lease 검사,
+-- 전이 가드는 프로시저 내부에 살기 때문에, EXECUTE할 수 있는 계정조차 owner/token/lease를
+-- 위조할 수 없다(DB 권한으로 강제되는 CD-3 원자 계약). 같은 이유로 mode의 단조 version도
+-- 프로시저 안(현재 max + 1 계산·삽입)에 가둔다 — 임의 version 삽입 경로를 없앤다.
 --
 -- 각 프로시저는 하나의 조건부 UPDATE와 OUT ok 플래그이며; 성공은 ROW_COUNT() = 1이다.
 -- 어느 계정이 어느 전이를 호출할 수 있는지는 grant(03_grants)에서 분리된다:
@@ -201,6 +203,29 @@ BEGIN
      AND `holder_id`     = p_holder_id
      AND `fencing_token` = p_token;
   SET p_ok = (ROW_COUNT() = 1);
+END $$
+
+-- 모드 append — 단조 version 강제(ADR-027 DO-17 ⑵). 토글은 임의 version이 아니라
+-- 「현재 max + 1」로만 들어간다: 대상별 현재 최대 version을 읽어 그 다음 값으로 INSERT하므로,
+-- append된 행은 항상 최신(= Current가 반환하는 행)이 된다. 임의 version 삽입을 허용하면
+-- 더 작은 version이 들어가 토글이 Current에 반영되지 않는 fail-open이 생긴다(현재 dev/v2인데
+-- operational/v1이 삽입돼도 Current는 dev/v2 — 운영 토글 무반영). 계산·삽입을 프로시저
+-- 내부 단일 문장에 가둬 임의 version 삽입 경로를 없앤다(락 전이와 같은 패턴, EXECUTE로만
+-- 호출). 동시 두 호출이 같은 max를 읽어 같은 version을 노려도 UNIQUE(target, mode_version)가
+-- 한쪽을 INSERT 시점에 거부한다 — 단조성이 두 계층(프로시저 계산 + UNIQUE)에서 강제된다.
+-- target/mode의 유효성은 deploy_mode의 ENUM 컬럼이 INSERT 시점에 거른다.
+DROP PROCEDURE IF EXISTS `sp_mode_append` $$
+CREATE PROCEDURE `sp_mode_append`(
+  IN p_target VARCHAR(32),
+  IN p_mode   VARCHAR(16),
+  IN p_actor  VARCHAR(255)
+)
+SQL SECURITY DEFINER
+BEGIN
+  INSERT INTO `deploy_mode` (`target`, `mode`, `mode_version`, `actor`)
+  SELECT p_target, p_mode, COALESCE(MAX(`mode_version`), 0) + 1, p_actor
+    FROM `deploy_mode`
+   WHERE `target` = p_target;
 END $$
 
 DELIMITER ;
