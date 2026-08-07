@@ -37,6 +37,11 @@ var ErrReplay = errors.New("store: request already reserved (replay)")
 // 키로 다른 내용을 배포하려는 시도이기 때문이다.
 var ErrDigestConflict = errors.New("store: same requestId reused with a different body digest")
 
+// ErrNoMode는 대상에 아직 mode 행이 하나도 없을 때 Current가 반환한다. store는
+// 기본값을 지어내지 않는다(ModeStore 주석) — "행이 없다"를 조용한 dev로 뭉개지 않고
+// 명시적 오류로 올려, 호출자가 fail-closed로 operational로 닫게 한다(ADR-027 DO-17 ⑷).
+var ErrNoMode = errors.New("store: no mode row for target (fail-closed decision belongs to caller)")
+
 // mysqlErrDupEntry는 MySQL의 중복 키 오류 코드다(ER_DUP_ENTRY). requestId(PK) 또는
 // jti(UNIQUE) 충돌이 이 코드로 온다.
 const mysqlErrDupEntry = 1062
@@ -253,12 +258,40 @@ func (s *SQLStore) Reserve(ctx context.Context, requestID, jti, bodyDigest strin
 	}
 }
 
-func (*SQLStore) Current(context.Context, string) (string, uint64, error) {
-	return "", 0, ErrNotImplemented
+// Current는 대상의 현재 mode와 mode version을 읽는다(SELECT — ADR-027 DO-17 ⑵).
+// deploy_mode는 append-only이므로 "현재"는 대상별 mode_version이 가장 큰 행이다
+// (토글은 덮어쓰기가 아니라 새 행 — DT-12 ⑵). 대상에 행이 하나도 없으면 ErrNoMode를
+// 올린다 — store는 기본값을 지어내지 않고, fail-closed(operational) 판정은 호출자 몫이다.
+func (s *SQLStore) Current(ctx context.Context, target string) (string, uint64, error) {
+	var (
+		mode    string
+		version uint64
+	)
+	err := s.db.QueryRowContext(ctx,
+		"SELECT `mode`, `mode_version` FROM `deploy_mode` WHERE `target` = ? ORDER BY `mode_version` DESC LIMIT 1",
+		target).Scan(&mode, &version)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", 0, ErrNoMode
+	case err != nil:
+		// 연결·권한 오류 등은 그대로 올린다 — 조용히 삼켜 dev로 열지 않는다(fail-closed는
+		// 호출자가 이 오류를 보고 operational로 닫는다).
+		return "", 0, err
+	default:
+		return mode, version, nil
+	}
 }
 
-func (*SQLStore) AppendMode(context.Context, string, string, uint64, string) error {
-	return ErrNotImplemented
+// AppendMode는 새 mode 행 하나를 INSERT한다(append-only 토글 원장 — DT-12 ⑵). grant는
+// 이 테이블에 SELECT+INSERT만 주므로 이전 행을 덮어쓰거나 지울 수 없다. version은
+// 대상별 단조 증가여야 하며, UNIQUE(target, mode_version)가 같은 version 재사용을 INSERT
+// 시점에 거부한다 — 토글-요청 race를 닫는 version의 단조성이 DB 제약으로 강제된다.
+// actor는 인증된 subject에서 파생되며 절대 자기 보고가 아니다(DO-12 ⑶).
+func (s *SQLStore) AppendMode(ctx context.Context, target, mode string, version uint64, actor string) error {
+	_, err := s.db.ExecContext(ctx,
+		"INSERT INTO `deploy_mode` (`target`, `mode`, `mode_version`, `actor`) VALUES (?, ?, ?, ?)",
+		target, mode, version, actor)
+	return err
 }
 
 func (*SQLStore) AppendEvent(context.Context, HistoryEvent) error {
