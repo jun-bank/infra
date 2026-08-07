@@ -1,0 +1,28 @@
+# golangci-lint configuration for jun-bank/infra.
+# Advisory until golangci-lint is provisioned on the CI runner; `go vet` is the
+# enforced gate in the meantime (see Makefile).
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  enable:
+    - errcheck      # unchecked errors — critical for a deploy path
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+    - bodyclose     # HTTP response bodies must be closed (agent receiver)
+    - gosec         # security-oriented checks for host-facing tooling
+
+issues:
+  exclude-rules:
+    # Scaffold stubs intentionally return a sentinel and do nothing else.
+    - path: _test\.go
+      linters:
+        - gosec
