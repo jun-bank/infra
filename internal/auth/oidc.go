@@ -23,6 +23,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -47,8 +48,13 @@ type Claims struct {
 	Environment    string   // environment — 운영 승인 결박(현재는 자기 신고 · 잔여-5)
 	JTI            string   // jti — 부작용 전 선점(토큰 재사용 = 재전송)
 	IssuedAt       int64    // iat — unix 초
-	NotBefore      int64    // nbf — unix 초(0이면 미설정)
+	NotBefore      int64    // nbf — unix 초(0이면 부재 · 있는데 형식 오류는 malformedTime으로)
 	ExpiresAt      int64    // exp — unix 초
+
+	// malformedTime은 값이 존재하나 수치가 아닌 시간 claim의 이름이다(exp/iat/nbf 중 하나).
+	// 비어 있으면 형식 문제 없음. 있으면 checkClaims가 거절한다 — absent(없음)와 invalid
+	// (형식 오류)를 구분해, 있는데 형식 오류인 시간 claim을 무음 스킵하지 않는다.
+	malformedTime string
 }
 
 // OIDCPolicy는 claim 행렬이 대조하는 기대값들이다. 전부 식별자이며 시크릿은 아니지만
@@ -139,7 +145,10 @@ func (t *jwksTokenVerifier) VerifyToken(ctx context.Context, rawToken string) (C
 // claimsFromMap은 검증된 payload에서 우리가 쓰는 claim을 뽑는다. GitHub OIDC는
 // repository_id·repository_owner_id를 문자열로, 시간 claim을 수치로 싣는다.
 func claimsFromMap(mc jwt.MapClaims) Claims {
-	return Claims{
+	iat, iatBad := mapUnix(mc, "iat")
+	nbf, nbfBad := mapUnix(mc, "nbf")
+	exp, expBad := mapUnix(mc, "exp")
+	c := Claims{
 		Issuer:         mapString(mc, "iss"),
 		Audience:       mapAudience(mc, "aud"),
 		Subject:        mapString(mc, "sub"),
@@ -150,10 +159,22 @@ func claimsFromMap(mc jwt.MapClaims) Claims {
 		JobWorkflowRef: mapString(mc, "job_workflow_ref"),
 		Environment:    mapString(mc, "environment"),
 		JTI:            mapString(mc, "jti"),
-		IssuedAt:       mapUnix(mc, "iat"),
-		NotBefore:      mapUnix(mc, "nbf"),
-		ExpiresAt:      mapUnix(mc, "exp"),
+		IssuedAt:       iat,
+		NotBefore:      nbf,
+		ExpiresAt:      exp,
 	}
+	// 값이 존재하나 수치가 아닌 시간 claim은 거절 대상으로 표시한다 — 서명된 토큰의
+	// `"nbf":"invalid"` 같은 형식 오류가 0으로 무음 치환돼 검증을 건너뛰는 것을 막는다
+	// (있는데 형식 오류 → 거절 · 반-silent-failure). 여럿이면 첫 칸을 사유로 짚는다.
+	switch {
+	case expBad:
+		c.malformedTime = "exp"
+	case iatBad:
+		c.malformedTime = "iat"
+	case nbfBad:
+		c.malformedTime = "nbf"
+	}
+	return c
 }
 
 func mapString(mc jwt.MapClaims, key string) string {
@@ -182,11 +203,25 @@ func mapAudience(mc jwt.MapClaims, key string) []string {
 }
 
 // mapUnix는 수치 시간 claim을 unix 초로 뽑는다(JSON 수는 기본 float64로 디코드된다).
-func mapUnix(mc jwt.MapClaims, key string) int64 {
-	if v, ok := mc[key].(float64); ok {
-		return int64(v)
+// malformed는 키가 존재하나 수치가 아님을 나타낸다 — 이때 0으로 무음 치환하지 않고
+// 거절 대상으로 표시해야 한다(있는데 형식 오류 → 거절 · absent와 구분). 키 부재는
+// malformed=false·0이며, 필수 여부는 checkClaims가 판정한다.
+func mapUnix(mc jwt.MapClaims, key string) (seconds int64, malformed bool) {
+	raw, ok := mc[key]
+	if !ok {
+		return 0, false // 부재 — 무음 스킵이 아니라 "없음"이다
 	}
-	return 0
+	switch v := raw.(type) {
+	case float64:
+		return int64(v), false
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return n, false
+		}
+		return 0, true // 수치 문자열이 아님 → 형식 오류
+	default:
+		return 0, true // 존재하나 수치 아님(문자열·bool 등) → 형식 오류
+	}
 }
 
 // OIDCVerifier는 게이트 2다: 서명 검증(TokenVerifier)과 claim 행렬(checkClaims)을 잇는다.
@@ -235,8 +270,11 @@ func (v *OIDCVerifier) checkClaims(c Claims, now time.Time) string {
 	if c.Issuer != v.policy.Issuer {
 		return "iss 불일치 (다른 발급자)"
 	}
-	if !contains(c.Audience, v.policy.Audience) {
-		return "aud 불일치 (우리 배포 전용 audience 아님)"
+	// aud는 정확히 우리 audience 하나여야 한다 — 포함(contains) 검사면 우리값에 다른
+	// audience가 섞인 다중 aud 토큰도 통과한다. DO-11의 "전용" 문언은 단일값 기대이므로,
+	// 배열이면 원소가 1개이고 그 값이 우리 audience와 같아야 한다(정확 일치).
+	if len(c.Audience) != 1 || c.Audience[0] != v.policy.Audience {
+		return "aud 불일치 (우리 배포 전용 audience 정확히 하나 아님)"
 	}
 	if c.Repository != v.policy.Repository {
 		return "repository 불일치"
@@ -248,6 +286,10 @@ func (v *OIDCVerifier) checkClaims(c Claims, now time.Time) string {
 	if c.OwnerID != v.policy.OwnerID {
 		return "repository_owner_id 불일치 (수치 ID)"
 	}
+	// ★ repository_owner(이름)·ref_type을 별도 칸으로 보지 않는 것은 무음 누락이 아니라
+	// 의도된 대체다 — owner는 위 수치 repository_owner_id(이름 재사용에 강함)로, ref_type은
+	// 아래 완전 ref 허용목록(refs/heads/main 등 ref 전체 대조)으로 각각 더 강하게 판정한다
+	// (DO-11 문언의 이름·ref_type 검사보다 강한 검사로 대체).
 	if !contains(v.policy.RefAllowlist, c.Ref) {
 		return "ref 허용목록 밖 (임의 브랜치·태그 배포 금지)"
 	}
@@ -256,6 +298,11 @@ func (v *OIDCVerifier) checkClaims(c Claims, now time.Time) string {
 	}
 
 	// 시간 — exp/nbf/iat. 게이트 1의 신선도와 같은 축이며 허용 skew를 함께 본다.
+	// 값이 존재하나 형식이 깨진 시간 claim은 무음 스킵하지 않고 거절한다(absent와 invalid를
+	// 구분: 없으면 아래 필수 여부로, 있는데 형식 오류면 여기서 거절).
+	if c.malformedTime != "" {
+		return "시간 claim 형식 오류 (" + c.malformedTime + " 값이 수치 아님 — 무음 스킵 금지)"
+	}
 	if c.ExpiresAt == 0 || c.IssuedAt == 0 {
 		return "시간 claim 부재 (exp/iat)"
 	}
