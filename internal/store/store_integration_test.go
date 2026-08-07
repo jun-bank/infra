@@ -155,14 +155,15 @@ func TestLedgerAppendOnlyEnforced(t *testing.T) {
 	}
 }
 
-// TestModeCurrentContract는 모드 조회의 실 계약을 실제 MySQL에 대해 검증한다
+// TestModeCurrentContract는 모드 조회·append의 실 계약을 실제 MySQL에 대해 검증한다
 // (ADR-027 DO-5·DO-17). 인메모리 페이크가 확인할 수 없는 것들을 우선 밟는다 — 대상별
-// 최신 행 선택, 행 부재 시 ErrNoMode(조용한 dev 금지), UNIQUE(target, version)에 의한
-// version 단조 강제.
+// 최신 행 선택, 행 부재 시 ErrNoMode(조용한 dev 금지), 그리고 sp_mode_append가 강제하는
+// 단조 version(호출자가 version을 정하지 않는다 → 임의·저 version 삽입 경로 부재).
 func TestModeCurrentContract(t *testing.T) {
 	host, port := startMySQL(t)
 	dsn := fmt.Sprintf("test:test@tcp(%s:%s)/deploy?parseTime=true", host, port)
-	st := New(openDB(t, dsn))
+	db := openDB(t, dsn)
+	st := New(db)
 	ctx := context.Background()
 
 	// ⑴ 행이 없으면 ErrNoMode — store는 기본값을 지어내지 않는다(fail-closed 판정은
@@ -171,20 +172,20 @@ func TestModeCurrentContract(t *testing.T) {
 		t.Fatalf("행 부재: err = %v, ErrNoMode 기대", err)
 	}
 
-	// ⑵ append 후 최신(=version 최대) 행이 현재 mode다. operational(v1) 위에 dev(v2)를
-	//    쌓으면 Current는 dev·2를 준다 — 덮어쓰기가 아니라 최신 행 선택.
-	if err := st.AppendMode(ctx, "core", "operational", 1, "tester"); err != nil {
-		t.Fatalf("mode append(v1) 실패: %v", err)
+	// ⑵ append는 version을 자동으로 「현재 max + 1」로 매긴다(호출자가 정하지 않는다).
+	//    operational 위에 dev를 쌓으면 Current는 최신 행(dev·2)을 준다 — 최신 행 선택.
+	if err := st.AppendMode(ctx, "core", "operational", "tester"); err != nil {
+		t.Fatalf("mode append(#1) 실패: %v", err)
 	}
-	if err := st.AppendMode(ctx, "core", "dev", 2, "tester"); err != nil {
-		t.Fatalf("mode append(v2) 실패: %v", err)
+	if err := st.AppendMode(ctx, "core", "dev", "tester"); err != nil {
+		t.Fatalf("mode append(#2) 실패: %v", err)
 	}
 	mode, version, err := st.Current(ctx, "core")
 	if err != nil {
 		t.Fatalf("Current(core) 실패: %v", err)
 	}
 	if mode != "dev" || version != 2 {
-		t.Fatalf("Current(core) = (%q, %d), (dev, 2) 기대 — 최신 행 선택", mode, version)
+		t.Fatalf("Current(core) = (%q, %d), (dev, 2) 기대 — 자동 단조 version·최신 행", mode, version)
 	}
 
 	// ⑶ 대상은 격리된다: settlement에 행이 없으면 core의 행과 무관하게 ErrNoMode.
@@ -192,10 +193,36 @@ func TestModeCurrentContract(t *testing.T) {
 		t.Fatalf("대상 격리: settlement err = %v, ErrNoMode 기대", err)
 	}
 
-	// ⑷ 같은 (target, version)을 다시 append하면 UNIQUE(target, mode_version)가 거부한다
-	//    — version 단조성이 DB 제약으로 강제된다(토글-요청 race를 닫는 version).
-	if err := st.AppendMode(ctx, "core", "operational", 2, "tester"); err == nil {
-		t.Error("동일 (target, version) 재사용이 성공했다 — UNIQUE 거부 기대(단조 위반)")
+	// ⑷ 단조 강제 + 토글 반영(HIGH fail-open 회귀 방지). 현재 dev/v2인 상태에서
+	//    operational로 토글하면, 그 행이 「max + 1 = v3」으로 들어가 Current가 곧바로
+	//    operational/v3을 반환한다. 임의 version이었다면 operational/v1이 들어가도
+	//    Current는 dev/v2 그대로 — 운영 토글이 무반영되는 fail-open이었다.
+	if err := st.AppendMode(ctx, "core", "operational", "tester"); err != nil {
+		t.Fatalf("operational 토글 append 실패: %v", err)
+	}
+	mode, version, err = st.Current(ctx, "core")
+	if err != nil {
+		t.Fatalf("토글 후 Current(core) 실패: %v", err)
+	}
+	if mode != "operational" || version != 3 {
+		t.Fatalf("토글 후 Current(core) = (%q, %d), (operational, 3) 기대 — 토글이 Current에 반영", mode, version)
+	}
+
+	// ⑸ 저 version 삽입은 Current를 끌어내리지 못한다(단조 강제). deploy_mode는 append-only
+	//    INSERT를 허용하지만(위 grant), 이미 쓰인 version(≤ 현재 max)은 UNIQUE가 거부하고,
+	//    설령 미사용 저 version이 들어가더라도 Current = MAX(version)이므로 최신을 밀어낼 수
+	//    없다. 여기서는 현재 max(3)에 대한 raw 재삽입이 UNIQUE로 거부됨을 확인한다.
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO `deploy_mode` (`target`, `mode`, `mode_version`, `actor`) VALUES (?, ?, ?, ?)",
+		"core", "dev", 3, "tester"); err == nil {
+		t.Error("현재 max version(3) 재삽입이 성공했다 — UNIQUE 거부 기대(단조 위반)")
+	}
+	mode, version, err = st.Current(ctx, "core")
+	if err != nil {
+		t.Fatalf("저 version 삽입 시도 후 Current(core) 실패: %v", err)
+	}
+	if mode != "operational" || version != 3 {
+		t.Fatalf("저 version 삽입 시도 후 Current(core) = (%q, %d), (operational, 3) 불변 기대", mode, version)
 	}
 }
 

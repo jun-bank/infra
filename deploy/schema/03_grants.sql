@@ -40,6 +40,12 @@ GRANT SELECT, INSERT ON `deploy`.`deploy_request_ledger` TO 'deploy_agent'@'%';
 GRANT SELECT, INSERT ON `deploy`.`deploy_mode`           TO 'deploy_agent'@'%';
 GRANT SELECT, INSERT ON `deploy`.`deploy_history`        TO 'deploy_agent'@'%';
 
+-- 모드 토글의 유일한 쓰기 경로 = sp_mode_append (ADR-027 DO-17 ⑵ 단조 version). store는
+-- 임의 version을 INSERT하지 않고 이 프로시저를 EXECUTE해 「현재 max + 1」로만 append한다.
+-- (위 deploy_mode INSERT grant는 append-only 계약을 위한 것이며, 단조 version 쓰기는
+-- 프로시저를 경유한다.)
+GRANT EXECUTE ON PROCEDURE `deploy`.`sp_mode_append` TO 'deploy_agent'@'%';
+
 -- 다른 어떤 스키마에도 GRANT 없음. 그 부재가 곧 강제다(DT-10 ⑵): deploy-agent는
 -- core/settlement/ledger에 접근이 전혀 없다 — 읽기 포함(R7).
 

@@ -81,14 +81,26 @@ type ModeVerify struct {
 // 바뀌었으면(진행 전 토글) OK=false로 거절한다. 저장 접근 실패도 거절(FailClosed) —
 // 검증하지 못하는 채로 부작용을 열지 않는다(fail-closed).
 //
+// 재조회한 mode가 닫힌 집합(dev|operational) 밖이면 손상으로 보고 거절한다 —
+// version만 대조하고 mode를 버리면, version이 안 바뀐 채 mode가 미지 값으로 손상됐을 때
+// OK=true로 새어 승인 게이트가 장애로 열린다. DecideMode의 손상=fail-closed 계약과
+// 일관되게, 검증 시에도 mode 유효성을 확인한다(DO-17 ⑷).
+//
 // ⚠️ 지금은 acceptedVersion과 재조회 version의 비교다. DO-17 ⑵·§2.2(저장 정본 이관)가
 // 요구하는 "락 획득과 한 트랜잭션에서의 원자 검증"은 락 전이가 구현될 때 그 트랜잭션
 // 안으로 이 비교가 들어가며, 그 전까지 비교와 락 획득 사이의 창은 [구현 검증]으로
 // 남는다(ADR-027 §7 잔여-2 · ADR-022 CDT-3).
 func VerifyModeUnchanged(ctx context.Context, r ModeReader, target string, acceptedVersion uint64) ModeVerify {
-	_, version, err := r.Current(ctx, target)
+	mode, version, err := r.Current(ctx, target)
 	if err != nil {
 		return ModeVerify{OK: false, FailClosed: true}
+	}
+	switch Mode(mode) {
+	case ModeDev, ModeOperational:
+		// 닫힌 집합 안 — version 대조로 진행.
+	default:
+		// 닫힌 집합 밖의 값 = 손상 = fail-closed(DecideMode와 일관).
+		return ModeVerify{OK: false, CurrentVersion: version, FailClosed: true}
 	}
 	return ModeVerify{OK: version == acceptedVersion, CurrentVersion: version}
 }

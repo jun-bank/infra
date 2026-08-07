@@ -133,9 +133,12 @@ type LedgerStore interface {
 type ModeStore interface {
 	// Current는 대상의 최신 mode와 버전을 반환한다(SELECT).
 	Current(ctx context.Context, target string) (mode string, version uint64, err error)
-	// AppendMode는 새 mode 행을 INSERT한다. actor는 인증된 subject에서 파생되며,
-	// 절대 자기 보고가 아니다(DO-12 ⑶).
-	AppendMode(ctx context.Context, target, mode string, version uint64, actor string) error
+	// AppendMode는 새 mode 행을 append한다 — version은 호출자가 정하지 않는다.
+	// 「현재 max + 1」을 원자적으로 계산·삽입하는 sp_mode_append를 경유하므로, append된
+	// 행은 항상 최신(= Current)이 되어 단조 version이 강제된다(DO-17 ⑵). 임의 version
+	// 삽입 경로는 없다 — 더 작은 version이 들어가 토글이 Current에 반영되지 않는 fail-open을
+	// 원천 차단한다. actor는 인증된 subject에서 파생되며, 절대 자기 보고가 아니다(DO-12 ⑶).
+	AppendMode(ctx context.Context, target, mode, actor string) error
 }
 
 // HistoryEvent는 배포 이력에 대한 하나의 append다.
@@ -282,15 +285,15 @@ func (s *SQLStore) Current(ctx context.Context, target string) (string, uint64, 
 	}
 }
 
-// AppendMode는 새 mode 행 하나를 INSERT한다(append-only 토글 원장 — DT-12 ⑵). grant는
-// 이 테이블에 SELECT+INSERT만 주므로 이전 행을 덮어쓰거나 지울 수 없다. version은
-// 대상별 단조 증가여야 하며, UNIQUE(target, mode_version)가 같은 version 재사용을 INSERT
-// 시점에 거부한다 — 토글-요청 race를 닫는 version의 단조성이 DB 제약으로 강제된다.
+// AppendMode는 새 mode 행 하나를 append한다(append-only 토글 원장 — DT-12 ⑵). version은
+// 호출자가 정하지 않는다: sp_mode_append가 대상별 「현재 max + 1」을 원자적으로 계산해
+// INSERT하므로, append된 행은 항상 최신(= Current)이 되어 단조 version이 강제된다
+// (DO-17 ⑵). 임의 version을 넘길 자리가 없으니, 더 작은 version이 들어가 토글이 Current에
+// 반영되지 않는 fail-open이 원천 차단된다. 동시 두 호출이 같은 max를 노려도 UNIQUE(target,
+// mode_version)가 한쪽을 거부한다 — 단조성은 프로시저 계산과 DB 제약 두 계층에서 강제된다.
 // actor는 인증된 subject에서 파생되며 절대 자기 보고가 아니다(DO-12 ⑶).
-func (s *SQLStore) AppendMode(ctx context.Context, target, mode string, version uint64, actor string) error {
-	_, err := s.db.ExecContext(ctx,
-		"INSERT INTO `deploy_mode` (`target`, `mode`, `mode_version`, `actor`) VALUES (?, ?, ?, ?)",
-		target, mode, version, actor)
+func (s *SQLStore) AppendMode(ctx context.Context, target, mode, actor string) error {
+	_, err := s.db.ExecContext(ctx, "CALL `sp_mode_append`(?, ?, ?)", target, mode, actor)
 	return err
 }
 
