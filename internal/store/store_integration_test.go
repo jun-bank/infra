@@ -15,6 +15,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -573,6 +575,186 @@ func TestLockHolderKindRejected(t *testing.T) {
 	}
 	if _, err := agent.Release(ctx, HolderKind("BOGUS"), "x", 1); !errors.Is(err, ErrInvalidHolderKind) {
 		t.Fatalf("Go Release(BOGUS): err=%v, ErrInvalidHolderKind 기대", err)
+	}
+}
+
+// procExists는 deploy 스키마에 주어진 이름의 프로시저가 존재하는지 information_schema로 본다.
+func procExists(t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var cnt int
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM information_schema.ROUTINES "+
+			"WHERE ROUTINE_SCHEMA = 'deploy' AND ROUTINE_TYPE = 'PROCEDURE' AND ROUTINE_NAME = ?",
+		name).Scan(&cnt); err != nil {
+		t.Fatalf("ROUTINES 조회(%s) 실패: %v", name, err)
+	}
+	return cnt > 0
+}
+
+// extractOldDrops는 02_procedures.sql에서 구 flat 이름(oldNames)에 대한 정확한
+// `DROP PROCEDURE IF EXISTS` 문만 뽑는다. _impl/_agent/_cutoff 접미사 이름은 백틱 경계가
+// 달라 매치되지 않는다. 파일에 구 이름 DROP이 없으면 빈 슬라이스를 돌려주므로, 재적용
+// 정리 누락(회귀)이 곧 테스트 실패가 된다.
+func extractOldDrops(t *testing.T, path string, oldNames []string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("%s 읽기 실패: %v", path, err)
+	}
+	want := map[string]bool{}
+	for _, n := range oldNames {
+		want["DROP PROCEDURE IF EXISTS `"+n+"`"] = true
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		s := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), "$$"))
+		if want[s] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// TestOldVulnerableProceduresDropped는 S2-1 이전 kind-공유 flat 구판(sp_lock_acquire /
+// renew / release)이 스키마 재적용으로 제거됨을 실 MySQL로 검증한다(재점검 fix ⑴). 이미
+// 프로비저닝된 DB에 그 구판이 남으면 두 계정이 상대 락을 해제·갱신하던 결함1 구멍이
+// 구판을 통해 계속 열려 있다. 레거시 DB를 시뮬레이션한 뒤 02_procedures.sql이 발행하는
+// 구 이름 DROP을 그 파일에서 뽑아 실행해, 구판 부재 + 새 wrapper 불변을 확인한다.
+func TestOldVulnerableProceduresDropped(t *testing.T) {
+	host, port := startMySQL(t)
+	// 전권 test 계정(deploy 스키마)으로 구판 생성·정리 DDL을 실행한다.
+	db := openDB(t, fmt.Sprintf("test:test@tcp(%s:%s)/deploy", host, port))
+	ctx := context.Background()
+
+	oldNames := []string{"sp_lock_acquire", "sp_lock_renew", "sp_lock_release"}
+
+	// ⑴ 신규 스키마는 구 flat 이름을 만들지 않는다(회귀 가드 — 누가 flat 판을 되살리면 잡힌다).
+	for _, n := range oldNames {
+		if procExists(t, db, n) {
+			t.Fatalf("신규 스키마가 구 flat 프로시저 %s 를 만들었다 (없어야 한다)", n)
+		}
+	}
+
+	// ⑵ 레거시 DB 시뮬레이션: S2-1 이전의 취약 flat 구판을 만든다(스텁 바디면 존재 확인에 충분).
+	for _, n := range oldNames {
+		if _, err := db.ExecContext(ctx,
+			fmt.Sprintf("CREATE PROCEDURE `%s`() BEGIN SELECT 1; END", n)); err != nil {
+			t.Fatalf("구판 %s 생성 실패: %v", n, err)
+		}
+		if !procExists(t, db, n) {
+			t.Fatalf("구판 %s 가 생성되지 않았다", n)
+		}
+	}
+
+	// ⑶ 스키마 재적용의 정리 경로: 02_procedures.sql이 구 이름에 발행하는 DROP을 실행한다.
+	//    파일에 그 DROP이 없으면(수정 전 = red) 구판이 남아 아래 부재 확인이 실패한다.
+	drops := extractOldDrops(t, "../../deploy/schema/02_procedures.sql", oldNames)
+	if len(drops) != len(oldNames) {
+		t.Fatalf("02_procedures.sql에서 구 이름 DROP을 %d개만 찾았다(=%v), %d개 기대 (재적용 정리 누락)",
+			len(drops), drops, len(oldNames))
+	}
+	for _, stmt := range drops {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("DROP 실행 실패(%q): %v", stmt, err)
+		}
+	}
+
+	// ⑷ 구 취약 프로시저 부재.
+	for _, n := range oldNames {
+		if procExists(t, db, n) {
+			t.Errorf("재적용 후에도 구 취약 프로시저 %s 가 남아 있다 (정리 실패)", n)
+		}
+	}
+	// ⑸ 새 wrapper는 그대로여야 한다(정상 경로 계약 불변).
+	for _, n := range []string{
+		"sp_lock_acquire_agent", "sp_lock_acquire_cutoff",
+		"sp_lock_release_agent", "sp_lock_release_cutoff",
+	} {
+		if !procExists(t, db, n) {
+			t.Errorf("새 wrapper %s 가 사라졌다 (재적용이 정상 경로를 깼다)", n)
+		}
+	}
+}
+
+// TestLockNullInputRejected는 acquire/renew impl이 NULL holder_kind·NULL lease를 명시적으로
+// fail-closed 거절함을 실 MySQL로 검증한다(재점검 fix ⑵). NULL이면 NOT IN·< 1 비교가 전부
+// UNKNOWN이 돼 IF를 못 타고 ELSE로 빠지면, 빈 락에 holder_kind=NULL·lease_expires_at=NULL인
+// 만료 없는 무보호/유령 락이 ok=1로 만들어지는 fail-open이 열렸다(수정 전 acquire = red).
+// impl은 계정 EXECUTE가 없으므로 전권 test 계정으로 직접 CALL한다.
+func TestLockNullInputRejected(t *testing.T) {
+	host, port := startMySQL(t)
+	rdb := openDB(t, fmt.Sprintf("test:test@tcp(%s:%s)/deploy?parseTime=true", host, port))
+	agent := openStore(t, host, port, "deploy_agent")
+	ctx := context.Background()
+	conn, err := rdb.Conn(ctx)
+	if err != nil {
+		t.Fatalf("root conn 실패: %v", err)
+	}
+	defer conn.Close()
+
+	acquireImpl := func(kindSQL, leaseSQL string) int64 {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf("CALL `sp_lock_acquire_impl`(%s, 'h', %s, @t, @o)", kindSQL, leaseSQL)); err != nil {
+			t.Fatalf("acquire impl CALL(kind=%s,lease=%s) 실패: %v", kindSQL, leaseSQL, err)
+		}
+		var ok int64
+		if err := conn.QueryRowContext(ctx, "SELECT @o").Scan(&ok); err != nil {
+			t.Fatalf("@o 읽기 실패: %v", err)
+		}
+		return ok
+	}
+
+	// NULL holder_kind → ok=0 (유령 락 거절). 수정 전에는 ELSE로 빠져 holder_kind=NULL·ok=1.
+	if got := acquireImpl("NULL", "60"); got != 0 {
+		t.Fatalf("acquire(kind=NULL) → ok=%d, 0 기대(NULL fail-closed)", got)
+	}
+	if ls, _ := agent.Read(ctx); ls.HolderKind != HolderNone {
+		t.Fatalf("NULL kind 시도 후 락 = %+v, 미점유 기대", ls)
+	}
+	// NULL lease → ok=0 (만료 없는 무보호 락 거절). 수정 전에는 lease_expires_at=NULL·ok=1.
+	if got := acquireImpl("'AGENT'", "NULL"); got != 0 {
+		t.Fatalf("acquire(lease=NULL) → ok=%d, 0 기대(NULL fail-closed)", got)
+	}
+	if ls, _ := agent.Read(ctx); ls.HolderKind != HolderNone {
+		t.Fatalf("NULL lease 시도 후 락 = %+v, 미점유 기대", ls)
+	}
+	// sanity: 유효 입력은 통과(정상 경로 계약 불변) — 이후 renew 테스트가 이 락을 재확인한다.
+	if got := acquireImpl("'AGENT'", "60"); got != 1 {
+		t.Fatalf("acquire(AGENT,60) → ok=%d, 1 기대(유효 입력 통과)", got)
+	}
+
+	// renew impl NULL 거절. 방금 잡은 유효 락(AGENT 'h')의 token·만료를 읽어 둔다.
+	ls, err := agent.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read 실패: %v", err)
+	}
+	tok := int64(ls.FencingToken)
+	before := ls.LeaseExpiresAt
+
+	renewImpl := func(kindSQL, leaseSQL string) int64 {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf("CALL `sp_lock_renew_impl`(%s, 'h', %d, %s, @o)", kindSQL, tok, leaseSQL)); err != nil {
+			t.Fatalf("renew impl CALL(kind=%s,lease=%s) 실패: %v", kindSQL, leaseSQL, err)
+		}
+		var ok int64
+		if err := conn.QueryRowContext(ctx, "SELECT @o").Scan(&ok); err != nil {
+			t.Fatalf("@o 읽기 실패: %v", err)
+		}
+		return ok
+	}
+	if got := renewImpl("'AGENT'", "NULL"); got != 0 {
+		t.Fatalf("renew(lease=NULL) → ok=%d, 0 기대(NULL fail-closed)", got)
+	}
+	if got := renewImpl("NULL", "60"); got != 0 {
+		t.Fatalf("renew(kind=NULL) → ok=%d, 0 기대(NULL fail-closed)", got)
+	}
+	// NULL renew가 살아있는 lease를 NULL(무보호)로 훼손하지 않았는지 확인(정상 경로 불변).
+	after, _ := agent.Read(ctx)
+	if !after.LeaseExpiresAt.Equal(before) {
+		t.Fatalf("NULL renew가 lease 만료를 바꿨다: %v → %v (불변 기대)", before, after.LeaseExpiresAt)
+	}
+	if after.HolderKind != HolderAgent {
+		t.Fatalf("NULL renew 후 holder = %v, AGENT 불변 기대", after.HolderKind)
 	}
 }
 

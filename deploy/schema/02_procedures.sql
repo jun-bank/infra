@@ -31,16 +31,34 @@ USE `deploy`;
 
 DELIMITER $$
 
+-- ★ S2-1 재점검(2026-08-07): 구 취약 프로시저 정리(재적용 안전). S2-1 이전의
+-- kind-공유 flat 판 sp_lock_acquire / sp_lock_renew / sp_lock_release(kind 검증도
+-- 역할 wrapper도 없던 버전)가 이미 프로비저닝된 DB에 남아 있을 수 있다 — 두 계정이
+-- 그 구판에 EXECUTE를 가진 채면, 새 wrapper를 배선해도 상대 락을 해제·갱신하던 구멍이
+-- 구판을 통해 계속 열려 있다(결함1 회귀 경로). 그래서 새 정의를 만들기 전에 구 이름을
+-- 무조건 제거한다(없으면 IF EXISTS로 무해). MySQL은 프로시저를 DROP할 때 그 프로시저에
+-- 준 EXECUTE 권한(mysql.procs_priv)도 함께 제거하므로, 구판이 사라지면 남은 grant도
+-- 사라진다 — 03_grants에는 애초에 구 이름 GRANT 라인이 없다(전부 새 wrapper로 대체됨).
+-- 새 이름(sp_lock_*_impl / _agent / _cutoff)은 구 이름과 겹치지 않으므로 정상 경로 계약은
+-- 불변이다.
+DROP PROCEDURE IF EXISTS `sp_lock_acquire` $$
+DROP PROCEDURE IF EXISTS `sp_lock_renew` $$
+DROP PROCEDURE IF EXISTS `sp_lock_release` $$
+
 -- 전이 1 — 획득 (acquire). agent와 cutoff 둘 다(양방향 경합) 자기 역할 wrapper로만
 -- 호출한다. 락이 비어 있거나 lease가 만료된 경우에만 성공하며; fencing token이 증가하므로
 -- 동시 획득자 중 정확히 하나가 승리한다(CD-3).
 --
--- impl은 두 방어선을 함께 강제한다(S2-1):
+-- impl은 세 방어선을 함께 강제한다(S2-1):
 --   ⑴ 결함3(방어심층) — holder_kind ∈ {AGENT, BATCH_CUTOFF}만 허용. 'NONE'·미지 kind는
 --      거절한다(유령 락 금지). wrapper가 kind를 결박하므로 정상 경로에서는 도달하지 않지만,
 --      계약을 impl에 명시해 둔다.
 --   ⑵ 결함2 — lease < 1초(0·음수 포함)는 fail-closed로 거절한다(ok=1 금지). sub-second
 --      lease가 ok=1인 무보호 락으로 만들어지면 Confirm 직후 탈취되는 footgun이 열린다.
+--   ⑶ NULL 명시 거절(재점검 2026-08-07) — holder_kind 또는 lease가 NULL이면 ⑴⑵의 비교가
+--      전부 NULL(UNKNOWN)로 평가돼 IF 분기를 타지 못하고 ELSE로 빠진다: 그러면 빈 락에
+--      holder_kind=NULL·lease_expires_at=NULL(만료 없는 무보호 락)이 ok=1로 만들어지는
+--      fail-open이 열린다. IS NULL을 조건 맨 앞에 붙여 NULL을 먼저 fail-closed로 거절한다.
 DROP PROCEDURE IF EXISTS `sp_lock_acquire_impl` $$
 CREATE PROCEDURE `sp_lock_acquire_impl`(
   IN  p_holder_kind   VARCHAR(16),
@@ -51,8 +69,9 @@ CREATE PROCEDURE `sp_lock_acquire_impl`(
 )
 SQL SECURITY DEFINER
 BEGIN
-  IF p_holder_kind NOT IN ('AGENT', 'BATCH_CUTOFF') OR p_lease_seconds < 1 THEN
-    -- 미지 kind(유령 락) 또는 최소 미만 lease(무보호 락) = fail-closed 거절.
+  IF p_holder_kind IS NULL OR p_lease_seconds IS NULL
+     OR p_holder_kind NOT IN ('AGENT', 'BATCH_CUTOFF') OR p_lease_seconds < 1 THEN
+    -- NULL 입력 · 미지 kind(유령 락) · 최소 미만 lease(무보호 락) = fail-closed 거절.
     SET p_token = NULL;
     SET p_ok = 0;
   ELSE
@@ -107,8 +126,11 @@ END $$
 -- 전이 2 — lease 갱신 (renew / 보유 재확인). 둘 다 자기 역할 wrapper로만. 호출자가 여전히
 -- holder이고 (kind + id + token) lease가 만료되지 않은 동안에만 갱신한다.
 --
--- impl은 두 방어선을 더한다(S2-1 결함2):
---   ⑴ lease < 1초는 거절(무보호 락 금지) — Renew(...,0)이 ok=1을 주면 안 된다.
+-- impl은 세 방어선을 더한다(S2-1 결함2):
+--   ⑴ lease < 1초는 거절(무보호 락 금지) — Renew(...,0)이 ok=1을 주면 안 된다. holder_kind
+--      또는 lease가 NULL이면 먼저 fail-closed로 거절한다(재점검 2026-08-07) — NULL lease는
+--      비교가 UNKNOWN이 돼 IF를 못 타고, UPDATE의 INTERVAL NULL이 lease_expires_at을 NULL로
+--      만들 여지를 남긴다; NULL kind는 WHERE 매치로 어차피 실패하나 계약을 impl에 명시한다.
 --   ⑵ 유효 lease를 줄이지 못한다 — 새 만료가 현재 만료 이상일 때만 갱신한다. 이 가드가
 --      없으면 Renew(...,작은값)이 살아있는 lease를 앞당겨 Confirm 직후 탈취를 연다. 정상
 --      경로는 항상 lease를 연장하므로(NOW + lease > 현재 만료) 이 가드에 걸리지 않는다.
@@ -122,7 +144,7 @@ CREATE PROCEDURE `sp_lock_renew_impl`(
 )
 SQL SECURITY DEFINER
 BEGIN
-  IF p_lease_seconds < 1 THEN
+  IF p_holder_kind IS NULL OR p_lease_seconds IS NULL OR p_lease_seconds < 1 THEN
     SET p_ok = 0;
   ELSE
     UPDATE `deploy_window_lock`
