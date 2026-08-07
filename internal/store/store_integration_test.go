@@ -250,15 +250,163 @@ func TestModeAppendOnlyEnforced(t *testing.T) {
 	}
 }
 
-// TestLockContract는 일곱 개 전이와 그 불변식을 다룬다(DT-12, R6).
-//
-// 케이스(다음 단계에서 SQLStore 락 메서드가 구현될 때 연결한다):
-//   - 비어 있는 락 acquire는 ok·token=N; 동시 두 번째 acquire는 ok=false(양방향 경합).
-//   - fencing token은 release/재획득에 걸쳐 단조 증가하며 리셋되지 않는다.
-//   - renew/release는 현재 holder(kind+id+token)에 대해서만 성공한다.
-//   - deploy_window_lock에 대한 raw UPDATE/DELETE는 두 계정 모두에 거부된다(DT-12).
+// openStore는 주어진 배포 스키마 계정으로 연 SQLStore를 만든다. parseTime=true는
+// lease_expires_at(DATETIME) 스냅샷 읽기에 필요하다. 두 계정(deploy_agent, cutoff_lock)은
+// DDL에서 같은 플레이스홀더 비밀번호를 쓴다.
+func openStore(t *testing.T, host, port, account string) *SQLStore {
+	t.Helper()
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/deploy?parseTime=true", account, agentPassword, host, port)
+	return New(openDB(t, dsn))
+}
+
+// TestLockContract는 정상 경로 락 전이(acquire/renew/release/read)와 그 불변식을 실제
+// MySQL에 대해, 그리고 deploy_agent 계정으로 검증한다(CD-3 · DT-12). deploy_agent를
+// 경유하므로 SQL SECURITY DEFINER + EXECUTE 전용 계약(테이블 raw DML 없이 전이가 도는가 —
+// CDV-19)이 동시에 실증된다. 거절/안전 경로를 우선 밟는다.
 func TestLockContract(t *testing.T) {
-	t.Skip("integration scaffold: SQLStore 락 전이 구현 후 연결한다(다음 단계)")
+	host, port := startMySQL(t)
+	st := openStore(t, host, port, "deploy_agent")
+	ctx := context.Background()
+
+	// ⑴ 초기 상태: 점유 없음, 토큰 0(단일 행 시드).
+	ls, err := st.Read(ctx)
+	if err != nil {
+		t.Fatalf("초기 Read 실패: %v", err)
+	}
+	if ls.HolderKind != HolderNone || ls.FencingToken != 0 {
+		t.Fatalf("초기 락 = %+v, HolderNone·token 0 기대", ls)
+	}
+
+	// ⑵ 빈 락 획득 → ok·새 토큰. deploy_agent가 EXECUTE로 프로시저를 도는 것(DEFINER)이
+	//    여기서 실증된다.
+	tok1, ok, err := st.Acquire(ctx, HolderAgent, "deploy-1", 60*time.Second)
+	if err != nil {
+		t.Fatalf("Acquire 실패(EXECUTE/DEFINER 계약 확인): %v", err)
+	}
+	if !ok || tok1 == 0 {
+		t.Fatalf("빈 락 획득 = (token %d, ok %v), 획득·token>0 기대", tok1, ok)
+	}
+
+	// ⑶ 경합: 유효 lease로 점유 중이면 두 번째 획득은 거절(ok=false) — 오류가 아니다.
+	if _, ok, err := st.Acquire(ctx, HolderAgent, "deploy-2", 60*time.Second); err != nil || ok {
+		t.Fatalf("점유 중 재획득 = (ok %v, err %v), 거절(ok=false) 기대", ok, err)
+	}
+
+	// ⑷ Read는 현재 holder를 비춘다.
+	ls, err = st.Read(ctx)
+	if err != nil {
+		t.Fatalf("점유 중 Read 실패: %v", err)
+	}
+	if ls.HolderKind != HolderAgent || ls.HolderID != "deploy-1" || ls.FencingToken != tok1 {
+		t.Fatalf("점유 중 락 = %+v, (AGENT, deploy-1, %d) 기대", ls, tok1)
+	}
+
+	// ⑸ Renew(보유 재확인/fencing): 틀린 토큰은 거짓, 내 토큰은 참.
+	if ok, _ := st.Renew(ctx, HolderAgent, "deploy-1", tok1+99, 60*time.Second); ok {
+		t.Fatal("틀린 fencing 토큰 Renew가 성공했다 — 거짓 기대(좀비 차단)")
+	}
+	if ok, err := st.Renew(ctx, HolderAgent, "deploy-1", tok1, 60*time.Second); err != nil || !ok {
+		t.Fatalf("현재 holder Renew = (ok %v, err %v), 참 기대", ok, err)
+	}
+
+	// ⑹ Release: 틀린 토큰은 거짓, 내 토큰은 참 → 이후 점유 없음.
+	if ok, _ := st.Release(ctx, HolderAgent, "deploy-1", tok1+99); ok {
+		t.Fatal("틀린 토큰 Release가 성공했다 — 거짓 기대")
+	}
+	if ok, err := st.Release(ctx, HolderAgent, "deploy-1", tok1); err != nil || !ok {
+		t.Fatalf("현재 holder Release = (ok %v, err %v), 참 기대", ok, err)
+	}
+	if ls, _ := st.Read(ctx); ls.HolderKind != HolderNone {
+		t.Fatalf("해제 후 락 = %+v, HolderNone 기대", ls)
+	}
+
+	// ⑺ fencing 단조: 재획득 토큰은 직전보다 크다(해제로 리셋되지 않는다).
+	tok2, ok, err := st.Acquire(ctx, HolderAgent, "deploy-3", 60*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("해제 후 재획득 실패: ok=%v err=%v", ok, err)
+	}
+	if tok2 <= tok1 {
+		t.Fatalf("fencing 토큰이 단조 증가하지 않았다: 재획득 %d ≤ 직전 %d", tok2, tok1)
+	}
+	if ok, _ := st.Release(ctx, HolderAgent, "deploy-3", tok2); !ok {
+		t.Fatal("정리 Release 실패")
+	}
+
+	// ⑻ stale 회수: 짧은 lease로 잡고 만료된 뒤 다른 주체가 회수 획득한다 — 토큰은 계속
+	//    증가한다. lease는 정수 초 정밀도라 1초로 잡고 여유 있게 대기한다.
+	tok3, ok, err := st.Acquire(ctx, HolderAgent, "deploy-4", 1*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("짧은 lease 획득 실패: ok=%v err=%v", ok, err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	tok4, ok, err := st.Acquire(ctx, HolderAgent, "deploy-5", 60*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("만료 lease 회수 획득 실패: ok=%v err=%v (만료가 회수하지 못했다)", ok, err)
+	}
+	if tok4 <= tok3 {
+		t.Fatalf("회수 획득 토큰 %d ≤ 만료 토큰 %d — 단조 위반", tok4, tok3)
+	}
+	if ls, _ := st.Read(ctx); ls.HolderID != "deploy-5" {
+		t.Fatalf("회수 후 holder = %q, deploy-5 기대", ls.HolderID)
+	}
+	if ok, _ := st.Release(ctx, HolderAgent, "deploy-5", tok4); !ok {
+		t.Fatal("정리 Release 실패")
+	}
+}
+
+// TestLockBidirectional은 배포 ↔ 배치 상호 배제를 실제 두 계정(deploy_agent · cutoff_lock)
+// 으로 검증한다(CD-3 양방향). 한 주체가 같은 단일 행을 점유하면 반대 주체의 획득은 거절된다.
+func TestLockBidirectional(t *testing.T) {
+	host, port := startMySQL(t)
+	agent := openStore(t, host, port, "deploy_agent")
+	cutoff := openStore(t, host, port, "cutoff_lock")
+	ctx := context.Background()
+
+	// 배치·커트오프가 점유 → 배포 획득 거절.
+	cTok, ok, err := cutoff.Acquire(ctx, HolderBatchCutoff, "cutoff-1", 60*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("커트오프 획득 실패: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := agent.Acquire(ctx, HolderAgent, "deploy-1", 60*time.Second); err != nil || ok {
+		t.Fatalf("배치 점유 중 배포 획득 = (ok %v, err %v), 거절 기대(양방향)", ok, err)
+	}
+
+	// 커트오프 해제 → 배포 획득 성공.
+	if ok, err := cutoff.Release(ctx, HolderBatchCutoff, "cutoff-1", cTok); err != nil || !ok {
+		t.Fatalf("커트오프 해제 실패: ok=%v err=%v", ok, err)
+	}
+	aTok, ok, err := agent.Acquire(ctx, HolderAgent, "deploy-1", 60*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("해제 후 배포 획득 실패: ok=%v err=%v", ok, err)
+	}
+
+	// 역방향: 배포가 점유 중이면 커트오프 획득 거절.
+	if _, ok, err := cutoff.Acquire(ctx, HolderBatchCutoff, "cutoff-2", 60*time.Second); err != nil || ok {
+		t.Fatalf("배포 점유 중 커트오프 획득 = (ok %v, err %v), 거절 기대(역방향)", ok, err)
+	}
+	if ok, _ := agent.Release(ctx, HolderAgent, "deploy-1", aTok); !ok {
+		t.Fatal("정리 Release 실패")
+	}
+}
+
+// TestLockRawDMLDenied는 두 계정 모두 deploy_window_lock에 raw UPDATE/DELETE를 갖지
+// 않음을 확인한다(DT-12 — 락 행은 전이 프로시저로만 바뀐다). 인메모리 페이크가 증명할
+// 수 없는 grant 계약이며, EXECUTE로 도는 프로시저와 raw DML 금지가 공존함을 못박는다.
+func TestLockRawDMLDenied(t *testing.T) {
+	host, port := startMySQL(t)
+	ctx := context.Background()
+	for _, account := range []string{"deploy_agent", "cutoff_lock"} {
+		dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/deploy", account, agentPassword, host, port)
+		db := openDB(t, dsn)
+		if _, err := db.ExecContext(ctx,
+			"UPDATE `deploy_window_lock` SET `holder_kind` = 'AGENT' WHERE `lock_id` = 1"); err == nil {
+			t.Errorf("%s: 락 행 raw UPDATE가 성공했다 (DT-12 위반 — 거부 기대)", account)
+		}
+		if _, err := db.ExecContext(ctx,
+			"DELETE FROM `deploy_window_lock` WHERE `lock_id` = 1"); err == nil {
+			t.Errorf("%s: 락 행 raw DELETE가 성공했다 (DT-12 위반 — 거부 기대)", account)
+		}
+	}
 }
 
 // TestHandshake는 ADR-024 §2.4 "정지 후 인계" 긴급 롤백 인계를 다룬다(다음 단계).

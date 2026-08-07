@@ -7,9 +7,12 @@
 // DML은 grant에서 금지된 것과 마찬가지로 코드에서도 도달 불가능하다(DT-12) — 동일한
 // 규칙을 두 계층에서 강제한다.
 //
-// 이것은 스캐폴드다: 모든 메서드는 ErrNotImplemented를 반환하는 미구현 스텁이다.
-// 실제 *sql.DB와 MySQL 드라이버로의 연결, 그리고 실제 MySQL에 대해 프로시저 계약을
-// 증명하는 Testcontainers 통합 스위트가 다음 단계다(store_integration_test.go 참조).
+// 구현 상태: 재생 방어 원장 Reserve(DO-10), mode 조회·append(DO-17), 그리고 정상 경로
+// 락 — Acquire·Renew·Release·Read(CD-3) — 가 실제 *sql.DB 위에 구현돼 있다. 핸드셰이크
+// 전이(RecordPreempt·AckSafetyBoundary·OverrideAcquire·ResolveOpenDebt — ADR-024 §2.4
+// 긴급 롤백 인계)는 S3, 배포 이력(AppendEvent·ReadLatest)은 다음 단계라 아직
+// ErrNotImplemented를 반환한다. 실 MySQL에 대해 프로시저 계약을 증명하는 것은
+// Testcontainers 통합 스위트다(store_integration_test.go 참조).
 package store
 
 import (
@@ -167,8 +170,9 @@ type HistoryStore interface {
 // --- 스캐폴드 스텁 ---------------------------------------------------------
 
 // SQLStore는 네 개 store 모두의 SQL 기반 구현이다. *sql.DB(배포 스키마 전용, LAN 전용
-// — ADR-022 DT-10)를 보유한다. 이번 이슈(S1-2)에서 구현된 것은 재생 방어 원장의
-// Reserve(DO-10)뿐이며; 락 전이·mode·history는 다음 단계에서 채워질 때까지
+// — ADR-022 DT-10)를 보유한다. 구현된 것은 재생 방어 원장 Reserve(DO-10), mode
+// 조회·append(DO-17), 정상 경로 락 Acquire·Renew·Release·Read(CD-3)다. 핸드셰이크
+// 전이(preempt·ack·override·debt — ADR-024 §2.4, S3)와 history는 아직
 // ErrNotImplemented를 반환한다.
 type SQLStore struct {
 	db *sql.DB
@@ -187,13 +191,69 @@ var (
 	_ HistoryStore = (*SQLStore)(nil)
 )
 
-func (*SQLStore) Acquire(context.Context, HolderKind, string, time.Duration) (FencingToken, bool, error) {
-	return 0, false, ErrNotImplemented
+// callProc는 OUT 플래그(와 선택적 토큰)를 세션 변수로 돌려주는 락 전이 프로시저를
+// 실행한다. MySQL은 OUT 파라미터를 플레이스홀더로 바인딩하지 않는다 — CALL 텍스트 안에서
+// 세션 변수(@…)로 지정하고, 그 세션 변수를 같은 커넥션에서 다시 SELECT해 읽어야 한다.
+// 그래서 IN 인자만 ?이고 OUT은 리터럴 @var이며, 두 문장(CALL·SELECT)은 반드시 하나의
+// 고정된 커넥션에서 돌아야 한다(세션 변수는 커넥션 로컬이다). 매 호출은 자기 CALL이
+// @var를 먼저 덮어쓰므로 풀에서 재사용된 커넥션의 이전 값에 오염되지 않는다.
+func (s *SQLStore) callProc(ctx context.Context, callSQL string, args []any, selectSQL string, dest ...any) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, callSQL, args...); err != nil {
+		return err
+	}
+	return conn.QueryRowContext(ctx, selectSQL).Scan(dest...)
 }
 
-func (*SQLStore) Renew(context.Context, HolderKind, string, FencingToken, time.Duration) (bool, error) {
-	return false, ErrNotImplemented
+// Acquire는 sp_lock_acquire를 호출한다(전이 1 — 두 호출자 모두). 락이 비어 있거나 lease가
+// 만료된 경우에만 성공한다: stale 회수도 여기서 일어난다(CD-3) — 비정상 종료로 만료된
+// 직전 점유는 이 획득이 회수하며, 호출자는 새 토큰을 받는 것 외에 특별히 할 일이 없다.
+// 성공하면 새 fencing 토큰(프로시저가 단조 증가시킨다)과 ok=true를, 경합(다른 배포·배치가
+// 유효 lease로 점유 중)이면 ok=false를 반환한다 — 경합은 오류가 아니라 거절이다(RL-4).
+// 연결·권한 오류만 err로 올린다. lease 정밀도는 프로시저 계약상 정수 초다.
+func (s *SQLStore) Acquire(ctx context.Context, kind HolderKind, holderID string, lease time.Duration) (FencingToken, bool, error) {
+	var (
+		tok sql.NullInt64
+		ok  int64
+	)
+	err := s.callProc(ctx,
+		"CALL `sp_lock_acquire`(?, ?, ?, @tok, @ok)",
+		[]any{string(kind), holderID, int(lease.Seconds())},
+		"SELECT @tok, @ok", &tok, &ok)
+	if err != nil {
+		return 0, false, err
+	}
+	if ok != 1 {
+		return 0, false, nil
+	}
+	return FencingToken(tok.Int64), true, nil
 }
+
+// Renew는 sp_lock_renew를 호출한다(전이 2 — 두 호출자 모두). 호출자가 여전히 holder이고
+// (kind+id+token) lease가 살아 있는 동안에만 lease를 연장한다. 이것이 곧 불가역 단계
+// 직전의 「보유 재확인(fencing)」 프리미티브다(CD-3): 내 fencing 토큰이 그 행에 그대로일
+// 때만 참을, 만료·인계로 토큰이 어긋났으면 거짓을 반환한다 — 호출자는 거짓이면 그 단계를
+// 시작하지 않는다(좀비 차단). 연결·권한 오류만 err로 올린다.
+func (s *SQLStore) Renew(ctx context.Context, kind HolderKind, holderID string, token FencingToken, lease time.Duration) (bool, error) {
+	var ok int64
+	err := s.callProc(ctx,
+		"CALL `sp_lock_renew`(?, ?, ?, ?, @ok)",
+		[]any{string(kind), holderID, uint64(token), int(lease.Seconds())},
+		"SELECT @ok", &ok)
+	if err != nil {
+		return false, err
+	}
+	return ok == 1, nil
+}
+
+// --- 핸드셰이크 전이(ADR-024 §2.4 긴급 롤백 인계) — S3 -----------------------
+// RecordPreempt·AckSafetyBoundary·OverrideAcquire·ResolveOpenDebt는 override
+// 핸드셰이크(정지 후 인계)의 조각이며 이번 범위(#13 정상 경로 락) 밖이다. 인터페이스는
+// 지금 확정하고 구현은 S3에서 각자의 핸드셰이크 테스트와 함께 채운다.
 
 func (*SQLStore) RecordPreempt(context.Context, string, string, time.Time) (bool, error) {
 	return false, ErrNotImplemented
@@ -211,12 +271,53 @@ func (*SQLStore) ResolveOpenDebt(context.Context) (bool, error) {
 	return false, ErrNotImplemented
 }
 
-func (*SQLStore) Release(context.Context, HolderKind, string, FencingToken) (bool, error) {
-	return false, ErrNotImplemented
+// Release는 sp_lock_release를 호출한다(전이 7 — 두 호출자 모두). 호출자가 현재
+// holder(kind+id+token)인 경우에만 해제하며; 토큰은 리셋되지 않고 open_debt도 지워지지
+// 않는다. 거짓 반환은 이미 보유하지 않음(만료 회수됨·인계됨)을 뜻한다 — 해제 실패는
+// 치명적이지 않다: lease 만료가 어차피 그 행을 회수한다(CD-3). 연결·권한 오류만 err로 올린다.
+func (s *SQLStore) Release(ctx context.Context, kind HolderKind, holderID string, token FencingToken) (bool, error) {
+	var ok int64
+	err := s.callProc(ctx,
+		"CALL `sp_lock_release`(?, ?, ?, @ok)",
+		[]any{string(kind), holderID, uint64(token)},
+		"SELECT @ok", &ok)
+	if err != nil {
+		return false, err
+	}
+	return ok == 1, nil
 }
 
-func (*SQLStore) Read(context.Context) (LockState, error) {
-	return LockState{}, ErrNotImplemented
+// Read는 락 행의 스냅샷을 반환한다(SELECT — 두 계정이 락 테이블에 대해 부여받은 유일한
+// 읽기). stale 판정의 관측 프리미티브다: LeaseExpiresAt가 과거이면 점유가 만료된 것이며
+// 다음 Acquire가 그것을 회수한다. 락 행은 항상 존재하므로(단일 행 시드) 정상 경로에서
+// sql.ErrNoRows는 나지 않는다.
+func (s *SQLStore) Read(ctx context.Context) (LockState, error) {
+	var (
+		ls        LockState
+		kind      string
+		holderID  sql.NullString
+		token     uint64
+		lease     sql.NullTime
+		preempt   bool
+		safetyAck bool
+		openDebt  bool
+	)
+	err := s.db.QueryRowContext(ctx,
+		"SELECT `holder_kind`, `holder_id`, `fencing_token`, `lease_expires_at`, "+
+			"`preempt_requested`, `safety_ack`, `open_debt` "+
+			"FROM `deploy_window_lock` WHERE `lock_id` = 1").
+		Scan(&kind, &holderID, &token, &lease, &preempt, &safetyAck, &openDebt)
+	if err != nil {
+		return LockState{}, err
+	}
+	ls.HolderKind = HolderKind(kind)
+	ls.HolderID = holderID.String
+	ls.FencingToken = FencingToken(token)
+	ls.LeaseExpiresAt = lease.Time
+	ls.PreemptRequested = preempt
+	ls.SafetyAck = safetyAck
+	ls.OpenDebt = openDebt
+	return ls, nil
 }
 
 // Reserve는 append-only 원장에 예약 행 하나를 INSERT한다(DO-10 ⑶). grant는 이
