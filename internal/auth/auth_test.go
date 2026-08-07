@@ -36,7 +36,8 @@ func baseRequest(now time.Time) Request {
 // newTestVerifier는 고정 시각·기본 스큐로 verifier를 만든다.
 func newTestVerifier(t *testing.T, now time.Time) Verifier {
 	t.Helper()
-	v, err := NewVerifier(Config{Key: testKey, Skew: DefaultClockSkew}, fixedClock{now: now})
+	skew := DefaultClockSkew
+	v, err := NewVerifier(Config{Key: testKey, Skew: &skew}, fixedClock{now: now})
 	if err != nil {
 		t.Fatalf("NewVerifier 오류: %v", err)
 	}
@@ -231,6 +232,50 @@ func TestSignDeterministic(t *testing.T) {
 	}
 	if bytes.Equal(Sign(testKey, req), Sign([]byte("other-key"), req)) {
 		t.Error("다른 키가 같은 서명을 냈다")
+	}
+}
+
+// TestExplicitZeroSkewRespected는 운영자가 명시한 무-skew(엄격, 0s)가 기본값(60s)으로
+// 조용히 완화되지 않는지 확인한다(codex·Opus medium). 만료를 1초 지난 요청은 스큐 0이면
+// 거절돼야 한다 — 기본 60s 스큐였다면 통과했을 경계 요청이다.
+func TestExplicitZeroSkewRespected(t *testing.T) {
+	signedAt := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	req := baseRequest(signedAt) // expiresAt = signedAt+5m
+
+	zero := time.Duration(0)
+	now := signedAt.Add(5*time.Minute + time.Second) // 만료를 1초 지남 (60s 스큐 안, 0s 스큐 밖)
+	v, err := NewVerifier(Config{Key: testKey, Skew: &zero}, fixedClock{now: now})
+	if err != nil {
+		t.Fatalf("NewVerifier 오류: %v", err)
+	}
+
+	dec, err := v.Verify(req)
+	if err != nil {
+		t.Fatalf("Verify 오류: %v", err)
+	}
+	if dec.Accepted {
+		t.Fatal("명시적 0 스큐인데 만료 요청이 수락됐다 (60s로 완화됨 — 거절 기대)")
+	}
+}
+
+// TestUnsetSkewDefaults는 Skew가 nil(미설정)이면 DefaultClockSkew로 채워지는지
+// 확인한다 — 직접 조립 시의 안전한 기본값(명시적 0과 구분된다).
+func TestUnsetSkewDefaults(t *testing.T) {
+	signedAt := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	req := baseRequest(signedAt)
+
+	now := signedAt.Add(5*time.Minute + DefaultClockSkew/2) // 만료 직후지만 기본 스큐 안
+	v, err := NewVerifier(Config{Key: testKey}, fixedClock{now: now})
+	if err != nil {
+		t.Fatalf("NewVerifier 오류: %v", err)
+	}
+
+	dec, err := v.Verify(req)
+	if err != nil {
+		t.Fatalf("Verify 오류: %v", err)
+	}
+	if !dec.Accepted {
+		t.Fatalf("미설정 스큐(기본 60s 기대) 안 요청이 거절됐다: %s", dec.Reason)
 	}
 }
 

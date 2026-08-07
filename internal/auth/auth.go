@@ -94,7 +94,10 @@ type Config struct {
 	// Key는 HMAC 서명 키다(DO-2 · IV-14 ⑶ 발급·교체). 시크릿 — 코드에 값이 없다.
 	Key []byte
 	// Skew는 issuedAt/expiresAt 판정에 쓰는 허용 시계 편차다(DO-10 ⑵ · [구현 검증]).
-	Skew time.Duration
+	// 포인터로 두어 "미설정(nil)"과 "명시적 0s(엄격)"를 구분한다 — 값 타입이면 둘 다
+	// 0이라, 운영자가 명시한 무-skew(엄격)가 기본값(60s)으로 조용히 완화된다. nil이면
+	// DefaultClockSkew로 채우고, non-nil이면 명시적 0을 포함해 받은 값을 그대로 존중한다.
+	Skew *time.Duration
 }
 
 // LoadConfig는 환경에서 검증 설정을 읽는다. 키가 없으면 오류를 반환해 게이트를 열지
@@ -105,6 +108,8 @@ func LoadConfig() (Config, error) {
 		return Config{}, ErrNoKey
 	}
 
+	// 기본값 채움은 여기(미설정일 때)만 한다. AGENT_CLOCK_SKEW가 명시적 "0s"면 0을
+	// 그대로 실어 보낸다(무-skew=엄격) — 이 아래 계층은 받은 값을 되돌리지 않는다.
 	skew := DefaultClockSkew
 	if raw := os.Getenv("AGENT_CLOCK_SKEW"); raw != "" {
 		d, err := time.ParseDuration(raw)
@@ -114,7 +119,7 @@ func LoadConfig() (Config, error) {
 		skew = d
 	}
 
-	return Config{Key: []byte(key), Skew: skew}, nil
+	return Config{Key: []byte(key), Skew: &skew}, nil
 }
 
 // hmacVerifier는 HMAC-SHA256 + 신선도 판정을 하는 Verifier다.
@@ -133,9 +138,12 @@ func NewVerifier(cfg Config, clock Clock) (Verifier, error) {
 	if clock == nil {
 		clock = SystemClock{}
 	}
-	skew := cfg.Skew
-	if skew == 0 {
-		skew = DefaultClockSkew
+	// 받은 값을 신뢰한다: 명시된 스큐(명시적 0=엄격 포함)를 조용히 되돌리지 않는다.
+	// nil(미설정)일 때만 기본값을 채운다 — 직접 조립 시의 안전한 기본값이며, env
+	// 미설정 경로의 기본값 채움은 LoadConfig가 소유한다.
+	skew := DefaultClockSkew
+	if cfg.Skew != nil {
+		skew = *cfg.Skew
 	}
 	return &hmacVerifier{key: cfg.Key, skew: skew, clock: clock}, nil
 }
