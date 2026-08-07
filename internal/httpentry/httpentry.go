@@ -16,11 +16,18 @@
 package httpentry
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
+
+	"github.com/jun-bank/infra/internal/auth"
+	"github.com/jun-bank/infra/internal/store"
 )
 
 // DefaultMaxBodyBytes는 AGENT_MAX_BODY_BYTES가 없을 때 쓰는 배포 요청 본문 상한이다.
@@ -58,6 +65,41 @@ func LoadConfig() (Config, error) {
 	return Config{ListenAddr: addr, MaxBodyBytes: maxBody}, nil
 }
 
+// 서명 대상 필드를 나르는 요청 헤더 이름(DO-10 ⑴). 본문은 digest로만 서명 범위에
+// 들어가고, 나머지 서명 필드(requestId·issuedAt·expiresAt)와 서명 자체는 헤더로 온다.
+// ⚠️ 이 헤더 이름·서명 인코딩(hex)·digest 형식("sha256:"+hex)은 [구현 검증]이다 —
+// CI 서명 워크플로와 짝을 맞춘 실제 계약이며 한쪽만 바꾸면 모든 서명이 불일치한다.
+const (
+	headerRequestID = "X-Deploy-Request-Id"
+	headerIssuedAt  = "X-Deploy-Issued-At"
+	headerExpiresAt = "X-Deploy-Expires-At"
+	headerSignature = "X-Deploy-Signature" // hex 인코딩된 HMAC
+)
+
+// Deps는 진입 층이 판정을 위임하는 협력자들이다. 전부 인터페이스이며(auth.Verifier ·
+// store 인터페이스), 이 층은 그것들을 구성하지 않는다 — main이 실제 verifier·DB store를
+// 조립해 주입한다(DO-14 ⑸ 프로세스 경계: 진입 층은 키·자격을 직접 보유하지 않는다).
+type Deps struct {
+	// Verifier는 게이트 1(HMAC + 신선도)이다. nil이면 NewHandler가 기동을 거부한다.
+	Verifier auth.Verifier
+	// Ledger는 requestId 멱등 선점 원장이다(DO-10 ⑶⑷).
+	Ledger store.LedgerStore
+	// History는 거절·예약 이력을 기록하고(RL-8) 재생 시 현재 상태를 읽는다(DO-10 ⑷).
+	History store.HistoryStore
+}
+
+// ctxKey는 미들웨어 사이에서 검증된 요청을 나르는 컨텍스트 키의 사설 타입이다.
+type ctxKey int
+
+const verifiedRequestKey ctxKey = 0
+
+// verifiedRequest는 withAuth가 검증을 통과시킨 요청을 담아 하류(withIdempotency)로
+// 넘긴다. 하류는 이 값을 재파싱·재검증하지 않는다 — 게이트 1의 판정을 신뢰한다.
+type verifiedRequest struct {
+	req auth.Request
+	jti string // OIDC jti(S1-3에서 검증된 토큰에서 온다) — 지금은 항상 빈 값
+}
+
 // middleware는 하나의 http.Handler를 감싸 다음 핸들러로 잇는 함수다. 체인의 각 고리가
 // 이 형태이며, 순서 자체가 계약이다(전송 제한 → 인증 → 검증 → 멱등 → 수신).
 type middleware func(http.Handler) http.Handler
@@ -74,14 +116,21 @@ func chain(h http.Handler, mws ...middleware) http.Handler {
 // NewHandler는 진입 층의 라우터를 만든다. 배포 요청 수신 엔드포인트 하나만 등록하며
 // (DO-1: CI 수신 전용), method 패턴 "POST /deploy"로 그 외 method는 ServeMux가
 // 405 + Allow 헤더로 자동 거절한다(Go 1.22+ 메서드 라우팅 — DO-15 ⑴).
-func NewHandler(cfg Config) http.Handler {
+//
+// deps는 게이트 1(Verifier)과 멱등 원장·이력(store)을 주입한다. Verifier가 nil이면
+// panic한다 — 검증자 없이 진입 층을 세우는 것은 fail-open이며, 조립 시점의 프로그래밍
+// 오류이므로 요란하게 실패한다(요청 시점에 조용히 통과시키지 않는다).
+func NewHandler(cfg Config, deps Deps) http.Handler {
+	if deps.Verifier == nil {
+		panic("httpentry: Verifier가 nil이다 (검증자 없이 진입 층을 세울 수 없다 — fail-closed)")
+	}
 	mux := http.NewServeMux()
 	mux.Handle("POST /deploy", chain(
 		deployReceiver(),
 		withBodyLimit(cfg.MaxBodyBytes), // 전송 제한(DO-15 ⑵) — 바깥에서 body를 캡
-		withAuth,                        // 게이트 1 슬롯(통과 스텁) — DO-2·DO-10·DO-11
+		withAuth(deps),                  // 게이트 1 — HMAC + 신선도(DO-2·DO-10 ⑴⑵)
 		withValidate,                    // 요청 형태 검증 슬롯(통과 스텁)
-		withIdempotency,                 // requestId 멱등 슬롯(통과 스텁) — DO-10 ⑶⑷
+		withIdempotency(deps),           // requestId 멱등 선점·3분기(DO-10 ⑶⑷)
 	))
 	return mux
 }
@@ -97,14 +146,84 @@ func withBodyLimit(max int64) middleware {
 	}
 }
 
-// withAuth는 게이트 1(HMAC 서명·신선도·OIDC 클레임 매트릭스)이 들어갈 자리다.
-// 지금은 아무 판정도 하지 않고 통과시키는 스텁이다.
+// withAuth는 게이트 1이다: 본문을 상한 안에서 읽어 digest를 계산하고, 서명 필드를
+// 헤더에서 파싱해 auth.Verifier로 HMAC + 신선도를 판정한다(DO-2·DO-10 ⑴⑵). 실패하면
+// 거절 사유를 이력에 기록(RL-8)한 뒤 차단한다 — 절대 통과시키지 않는다(fail-closed).
+// 통과한 요청은 검증된 형태로 컨텍스트에 실어 하류로 넘기고, 본문은 다시 읽을 수 있게
+// 되돌린다.
 //
-// TODO(DO-2·DO-10·DO-11, S1-2/S1-3): internal/auth.Verifier를 여기서 호출하고,
-// 실패하면 거절 사유를 기록(RL-8)한 뒤 차단한다 — 통과시키지 않는다(fail-closed).
-func withAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
+// OIDC 클레임 매트릭스(DO-11)는 아직 이 게이트에 합류하지 않았다(S1-3). 따라서 jti는
+// 신뢰된 토큰에서 오지 않으며, 여기서는 빈 값으로 둔다 — 스푸핑 가능한 클라이언트
+// 헤더를 jti로 신뢰하지 않는다.
+func withAuth(d Deps) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					http.Error(w, "요청 본문이 상한을 초과했다", http.StatusRequestEntityTooLarge)
+					return
+				}
+				http.Error(w, "요청 본문을 읽지 못했다", http.StatusBadRequest)
+				return
+			}
+
+			sig, err := hex.DecodeString(r.Header.Get(headerSignature))
+			if err != nil || len(sig) == 0 {
+				// 서명이 없거나 hex가 깨졌다 = 검증 불가 = 거절(RL-8).
+				d.rejectUnverified(r.Context(), r.Header.Get(headerRequestID), "서명 헤더 부재·형식 오류")
+				http.Error(w, "서명 검증 실패", http.StatusUnauthorized)
+				return
+			}
+
+			areq := auth.Request{
+				Method:     r.Method,
+				Path:       r.URL.Path,
+				BodyDigest: bodyDigest(body),
+				RequestID:  r.Header.Get(headerRequestID),
+				IssuedAt:   r.Header.Get(headerIssuedAt),
+				ExpiresAt:  r.Header.Get(headerExpiresAt),
+				Signature:  sig,
+			}
+
+			dec, err := d.Verifier.Verify(areq)
+			if err != nil {
+				// 검증 자체가 오류(내부 오류)면 fail-closed로 막는다(통과 금지).
+				http.Error(w, "서명 검증 중 오류", http.StatusInternalServerError)
+				return
+			}
+			if !dec.Accepted {
+				d.rejectUnverified(r.Context(), areq.RequestID, dec.Reason)
+				http.Error(w, "서명 검증 실패", http.StatusUnauthorized)
+				return
+			}
+
+			// 통과 — 검증된 요청을 컨텍스트에 싣고 본문을 되돌린다. jti는 S1-3까지 빈 값.
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			ctx := context.WithValue(r.Context(), verifiedRequestKey, verifiedRequest{req: areq, jti: ""})
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// bodyDigest는 raw body의 서명용 digest를 만든다("sha256:"+hex — [구현 검증] 형식).
+func bodyDigest(body []byte) string {
+	sum := sha256.Sum256(body)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// rejectUnverified는 거절을 이력에 기록한다(RL-8). requestId는 검증 전이라 신뢰할 수
+// 없는 값이지만, 감사 목적의 거절 행에는 있는 그대로 남긴다. 기록 실패는 삼키되 —
+// 거절 자체는 이미 확정이므로 통과로 뒤집지 않는다(fail-closed).
+func (d Deps) rejectUnverified(ctx context.Context, requestID, reason string) {
+	if d.History == nil {
+		return
+	}
+	_ = d.History.AppendEvent(ctx, store.HistoryEvent{
+		RequestID:    requestID,
+		EventType:    "REJECTED",
+		RejectReason: reason,
 	})
 }
 
@@ -117,15 +236,70 @@ func withValidate(next http.Handler) http.Handler {
 	})
 }
 
-// withIdempotency는 requestId 멱등 단락이 들어갈 자리다. 지금은 통과 스텁.
-//
-// TODO(DO-10 ⑶⑷): requestId/jti 예약은 internal/store가 소유하는 지속 부작용으로,
-// 락 획득과 같은 트랜잭션에서 일어난다(IA-4 ⑵). 이 슬롯은 그 예약 결과를 읽어 재생을
-// 조기 단락하는 자리이며, 예약 자체를 여기서 하지 않는다.
-func withIdempotency(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-	})
+// withIdempotency는 requestId를 부작용 전에 선점하고 재생을 3분기한다(DO-10 ⑶⑷).
+// 검증된 요청(withAuth가 컨텍스트에 실은 것)만 여기 도달한다 — 인증되지 않은 요청은
+// 이미 게이트 1에서 막혔다. 선점은 store가 소유하는 지속 부작용이며(append-only 원장),
+// 이 슬롯은 그 결과로 흐름을 가른다:
+//   - 신규            → 예약을 이력에 남기고 하류(수신)로 진행.
+//   - 동일 id·동일 digest(또는 jti 재사용) → 재실행하지 않고 현재 상태를 반환.
+//   - 동일 id·다른 digest → 거절·기록(409).
+func withIdempotency(d Deps) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			v, ok := r.Context().Value(verifiedRequestKey).(verifiedRequest)
+			if !ok {
+				// 게이트 1을 거치지 않고 도달 = 조립 오류. 통과시키지 않는다(fail-closed).
+				http.Error(w, "검증되지 않은 요청 (내부 순서 오류)", http.StatusInternalServerError)
+				return
+			}
+			if d.Ledger == nil {
+				http.Error(w, "멱등 원장 미구성", http.StatusInternalServerError)
+				return
+			}
+
+			err := d.Ledger.Reserve(r.Context(), v.req.RequestID, v.jti, v.req.BodyDigest)
+			switch {
+			case err == nil:
+				// 신규 예약 — 이력에 RESERVED를 남기고 하류로 진행한다.
+				if d.History != nil {
+					_ = d.History.AppendEvent(r.Context(), store.HistoryEvent{
+						RequestID:      v.req.RequestID,
+						EventType:      "RESERVED",
+						ManifestDigest: v.req.BodyDigest,
+					})
+				}
+				next.ServeHTTP(w, r)
+
+			case errors.Is(err, store.ErrReplay):
+				// 재전송 — 재실행 금지. 그 요청의 현재 상태를 반환한다(DO-10 ⑷).
+				d.replayCurrentState(w, r, v.req.RequestID)
+
+			case errors.Is(err, store.ErrDigestConflict):
+				// 같은 멱등 키로 다른 내용 — 거절·기록(RL-8).
+				d.rejectUnverified(r.Context(), v.req.RequestID, "동일 requestId + 다른 body digest")
+				http.Error(w, "requestId 충돌 (다른 본문)", http.StatusConflict)
+
+			default:
+				// 원장 쓰기 실패 = 부작용을 열 수 없다 = fail-closed(DO-17 ⑷).
+				http.Error(w, "멱등 선점 실패", http.StatusInternalServerError)
+			}
+		})
+	}
+}
+
+// replayCurrentState는 재전송된 요청에 대해 재실행 없이 현재 상태를 반환한다. 이력이
+// 있으면 마지막 event_type을, 없으면 예약만 된 상태로 응답한다. 어느 쪽이든 하류(수신)를
+// 호출하지 않는다 — 재전송이 두 번째 배포를 일으키지 않는 것이 이 경로의 핵심이다.
+func (d Deps) replayCurrentState(w http.ResponseWriter, r *http.Request, requestID string) {
+	status := "RESERVED"
+	if d.History != nil {
+		if ev, err := d.History.ReadLatest(r.Context(), requestID); err == nil && ev.EventType != "" {
+			status = ev.EventType
+		}
+	}
+	w.Header().Set("X-Deploy-Idempotent-Replay", "true")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "이미 수신된 요청 (재실행 없음) 상태="+status+"\n")
 }
 
 // deployReceiver는 체인의 종단 핸들러다. 미들웨어를 모두 통과한 요청의 본문을 상한
