@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,6 +151,37 @@ func TestNotBeforeRejected(t *testing.T) {
 	}
 }
 
+// TestMultiAudRejected는 우리 audience에 다른 audience가 섞인 다중 aud 토큰을 거절하는지
+// 확인한다(정확 일치 — 포함 검사면 이런 토큰이 통과한다). DO-11 "전용" = 단일값 기대.
+func TestMultiAudRejected(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	claims := baseClaims(now)
+	claims.Audience = []string{"https://deploy.jun-bank.example", "https://evil.example"}
+	v := newOIDCVerifier(t, claims, now)
+
+	dec := v.Verify(context.Background(), "raw-token")
+	if dec.Accepted {
+		t.Fatal("우리값이 섞인 다중 aud 토큰이 수락됐다 (정확히 하나 일치 기대 — DO-11)")
+	}
+	if dec.Reason == "" {
+		t.Error("거절인데 Reason이 비었다 (RL-8)")
+	}
+}
+
+// TestExactAudAccepted는 정확히 우리 audience 하나면 통과하는지 못박는다(정확 일치가
+// 정상 토큰을 막지 않는지 — 거절 경로만 있으면 과잉 거절을 못 잡는다).
+func TestExactAudAccepted(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	claims := baseClaims(now)
+	claims.Audience = []string{"https://deploy.jun-bank.example"} // 정확히 우리값 하나
+	v := newOIDCVerifier(t, claims, now)
+
+	dec := v.Verify(context.Background(), "raw-token")
+	if !dec.Accepted {
+		t.Fatalf("정확한 단일 aud 토큰이 거절됐다: %s", dec.Reason)
+	}
+}
+
 // TestSignatureFailureRejected는 서명 검증이 실패하면(TokenVerifier 오류) claim을
 // 보기도 전에 거절하는지 확인한다 — payload는 서명이 선 뒤에만 신뢰된다.
 func TestSignatureFailureRejected(t *testing.T) {
@@ -273,6 +305,61 @@ func TestJWKSVerifyRealSignature(t *testing.T) {
 	tvBad := NewJWKSTokenVerifier(fakeKeySet{key: &other.PublicKey})
 	if _, err := tvBad.VerifyToken(context.Background(), raw); err == nil {
 		t.Error("다른 키로 서명 검증이 통과했다 (거절 기대)")
+	}
+}
+
+// validMapClaims는 basePolicy와 정확히 맞는 수치 시간 claim 세트다(실제 서명 경로 테스트용).
+// 각 테스트는 한 칸만 형식이 깨지게 변형한다.
+func validMapClaims(now time.Time) jwt.MapClaims {
+	return jwt.MapClaims{
+		"iss":                 "https://token.actions.githubusercontent.com",
+		"aud":                 "https://deploy.jun-bank.example",
+		"sub":                 "repo:jun-bank/infra:ref:refs/heads/main",
+		"repository":          "jun-bank/infra",
+		"repository_id":       "123456",
+		"repository_owner_id": "654321",
+		"ref":                 "refs/heads/main",
+		"job_workflow_ref":    "jun-bank/infra/.github/workflows/deploy.yml@refs/heads/main",
+		"environment":         "production",
+		"jti":                 "jti-time",
+		"iat":                 now.Add(-30 * time.Second).Unix(),
+		"nbf":                 now.Add(-30 * time.Second).Unix(),
+		"exp":                 now.Add(5 * time.Minute).Unix(),
+	}
+}
+
+// TestMalformedNbfRejected는 서명은 유효하지만 nbf가 존재하는데 수치가 아닌(형식 오류)
+// 토큰을 무음 스킵하지 않고 거절하는지 실제 서명 경로로 확인한다 — 이전엔 0으로 무음
+// 치환돼 nbf 검증을 통째로 건너뛰었다(반-silent-failure). 대조군(정상 nbf)은 통과해야
+// 나머지가 유효함이 증명돼 거절이 nbf 형식 오류로 격리된다.
+func TestMalformedNbfRejected(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("RSA 키 생성 실패: %v", err)
+	}
+	tv := NewJWKSTokenVerifier(fakeKeySet{key: &key.PublicKey})
+	v, err := NewOIDCVerifier(tv, basePolicy(), fixedClock{now: now})
+	if err != nil {
+		t.Fatalf("NewOIDCVerifier 오류: %v", err)
+	}
+
+	// 대조군 — nbf가 정상 수치면 통과(나머지 전 칸 유효 확인).
+	good := signTestToken(t, key, validMapClaims(now))
+	if dec := v.Verify(context.Background(), good); !dec.Accepted {
+		t.Fatalf("정상 nbf 토큰이 거절됐다: %s (거절이 nbf 형식 오류로 격리되지 않는다)", dec.Reason)
+	}
+
+	// nbf가 존재하나 문자열(형식 오류) → 거절.
+	mc := validMapClaims(now)
+	mc["nbf"] = "invalid"
+	bad := signTestToken(t, key, mc)
+	dec := v.Verify(context.Background(), bad)
+	if dec.Accepted {
+		t.Fatal("형식이 깨진 nbf 토큰이 수락됐다 (무음 스킵 — 거절 기대)")
+	}
+	if !strings.Contains(dec.Reason, "형식 오류") {
+		t.Errorf("nbf 형식 오류 거절 사유가 아니다: %q", dec.Reason)
 	}
 }
 
