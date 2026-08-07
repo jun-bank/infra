@@ -814,7 +814,74 @@ func TestLockConcurrentAcquire(t *testing.T) {
 	}
 }
 
+// TestHistoryAppendReadContract는 배포 이력 append·최신 조회를 실제 MySQL에 대해
+// 검증한다(DO-16 상태 기록·조회). 인메모리 페이크가 확인할 수 없는 것들을 우선 밟는다 —
+// 이력 부재 시 빈 이벤트(오류 아님), 최신 행 선택(event_at·id DESC), NULL 허용 칸의 빈 값
+// 접기(특히 target ENUM에 빈 문자열이 들어가지 않는지).
+func TestHistoryAppendReadContract(t *testing.T) {
+	host, port := startMySQL(t)
+	st := openStore(t, host, port, "deploy_agent")
+	ctx := context.Background()
+
+	// ⑴ 이력이 없으면 빈 이벤트 + nil(재개 대상 기본값). 조용한 오류가 아니다.
+	ev, err := st.ReadLatest(ctx, "req-h")
+	if err != nil {
+		t.Fatalf("이력 부재 ReadLatest 오류: %v", err)
+	}
+	if ev.EventType != "" {
+		t.Fatalf("이력 부재인데 이벤트 반환: %+v", ev)
+	}
+
+	// ⑵ 예약 후 dispatch 상태를 append한다. target 등 일부 칸은 비워(NULL로 접힘) 넣는다.
+	if err := st.AppendEvent(ctx, HistoryEvent{RequestID: "req-h", EventType: "RESERVED", ManifestDigest: "sha256:x"}); err != nil {
+		t.Fatalf("RESERVED append 실패(빈 target NULL 접기 확인): %v", err)
+	}
+	if err := st.AppendEvent(ctx, HistoryEvent{
+		RequestID: "req-h", EventType: "STEP_RESULT", Target: "core", CommitSHA: "c1",
+		ManifestDigest: "sha256:x", Step: "dispatch", Result: "UNEXECUTED", FencingToken: 7,
+	}); err != nil {
+		t.Fatalf("STEP_RESULT append 실패: %v", err)
+	}
+
+	// ⑶ ReadLatest는 최신 행(STEP_RESULT)을 준다 — 최신 상태 선택.
+	got, err := st.ReadLatest(ctx, "req-h")
+	if err != nil {
+		t.Fatalf("ReadLatest 오류: %v", err)
+	}
+	if got.EventType != "STEP_RESULT" || got.Result != "UNEXECUTED" || got.Target != "core" || got.FencingToken != 7 {
+		t.Fatalf("최신 이력 = %+v, STEP_RESULT·UNEXECUTED·core·token 7 기대", got)
+	}
+
+	// ⑷ 대상 격리: 다른 requestId는 이 이력에 영향받지 않는다.
+	if other, _ := st.ReadLatest(ctx, "req-other"); other.EventType != "" {
+		t.Fatalf("무관 requestId 이력 = %+v, 빈 이벤트 기대", other)
+	}
+}
+
+// TestHistoryAppendOnlyEnforced는 deploy_agent 계정에게 이력 행의 UPDATE/DELETE가 grant
+// 수준에서 거부됨을 확인한다(DT-12 — "배포 이력이 곧 사실"을 writer가 되돌릴 수 없다).
+func TestHistoryAppendOnlyEnforced(t *testing.T) {
+	host, port := startMySQL(t)
+	agentDSN := fmt.Sprintf("deploy_agent:%s@tcp(%s:%s)/deploy", agentPassword, host, port)
+	db := openDB(t, agentDSN)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO `deploy_history` (`request_id`, `event_type`) VALUES (?, ?)",
+		"req-append", "RESERVED"); err != nil {
+		t.Fatalf("deploy_agent 이력 INSERT가 거부됐다(허용되어야 한다): %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"UPDATE `deploy_history` SET `event_type` = ? WHERE `request_id` = ?", "TAMPERED", "req-append"); err == nil {
+		t.Error("deploy_agent 이력 UPDATE가 성공했다 (append-only 위반 — 거부 기대)")
+	}
+	if _, err := db.ExecContext(ctx,
+		"DELETE FROM `deploy_history` WHERE `request_id` = ?", "req-append"); err == nil {
+		t.Error("deploy_agent 이력 DELETE가 성공했다 (append-only 위반 — 거부 기대)")
+	}
+}
+
 // TestHandshake는 ADR-024 §2.4 "정지 후 인계" 긴급 롤백 인계를 다룬다(다음 단계).
 func TestHandshake(t *testing.T) {
-	t.Skip("integration scaffold: SQLStore 락 전이 구현 후 연결한다(다음 단계)")
+	t.Skip("integration scaffold: 핸드셰이크 전이(preempt·ack·override·debt)는 S3에서 연결한다")
 }
