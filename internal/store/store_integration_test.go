@@ -15,6 +15,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -406,6 +408,227 @@ func TestLockRawDMLDenied(t *testing.T) {
 			"DELETE FROM `deploy_window_lock` WHERE `lock_id` = 1"); err == nil {
 			t.Errorf("%s: 락 행 raw DELETE가 성공했다 (DT-12 위반 — 거부 기대)", account)
 		}
+	}
+}
+
+// --- S2-1 보안 회귀 + 동시성 -------------------------------------------------
+
+// TestLockCrossAccountReleaseDenied는 반대 계정이 남의 락을 해제할 수 없음을 실 MySQL로
+// 검증한다(S2-1 결함1 · DT-12 §153 ⑵ "남의 token으로 해제 거부"). 실증된 구멍이다:
+// 두 계정이 공유 프로시저에 EXECUTE를 갖고 락 행 SELECT로 상대 token을 읽으면 상대 락을
+// 해제할 수 있었다. 역할별 wrapper(kind 결박) + impl 무권한으로 그 경로를 닫는다.
+func TestLockCrossAccountReleaseDenied(t *testing.T) {
+	host, port := startMySQL(t)
+	agent := openStore(t, host, port, "deploy_agent")
+	cutoff := openStore(t, host, port, "cutoff_lock")
+	ctx := context.Background()
+
+	// agent가 락을 잡는다.
+	aTok, ok, err := agent.Acquire(ctx, HolderAgent, "deploy-1", 60*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("agent 획득 실패: ok=%v err=%v", ok, err)
+	}
+
+	// cutoff가 락 행 SELECT로 agent의 holder_id·token을 읽는다(두 계정 다 SELECT 보유).
+	ls, err := cutoff.Read(ctx)
+	if err != nil {
+		t.Fatalf("cutoff Read 실패: %v", err)
+	}
+	if ls.HolderKind != HolderAgent || ls.FencingToken != aTok {
+		t.Fatalf("cutoff가 본 락 = %+v, agent 보유(token %d) 기대", ls, aTok)
+	}
+
+	// 공격 ⑴: 상대 kind(AGENT) wrapper로 해제 시도 → cutoff에는 sp_lock_release_agent
+	// EXECUTE가 없어 권한 오류(해제되지 않는다).
+	if released, err := cutoff.Release(ctx, HolderAgent, ls.HolderID, ls.FencingToken); released {
+		t.Fatal("cutoff가 AGENT wrapper로 agent 락 해제에 성공했다 (권한 경계 위반)")
+	} else if err == nil {
+		t.Fatal("cutoff의 상대 kind 해제가 오류 없이 통과했다 — 권한 거부(err) 기대")
+	}
+
+	// 공격 ⑵: 자기 kind(BATCH_CUTOFF) wrapper로 시도 → 프로시저가 kind='BATCH_CUTOFF'로
+	// 결박돼 AGENT 보유 행에 매치되지 않는다(ok=false, 오류는 아니다).
+	if released, _ := cutoff.Release(ctx, HolderBatchCutoff, ls.HolderID, ls.FencingToken); released {
+		t.Fatal("cutoff가 BATCH_CUTOFF wrapper로 AGENT 락 해제에 성공했다 — 거부 기대")
+	}
+
+	// agent 락은 그대로여야 한다.
+	ls2, err := agent.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read 실패: %v", err)
+	}
+	if ls2.HolderKind != HolderAgent || ls2.HolderID != "deploy-1" || ls2.FencingToken != aTok {
+		t.Fatalf("공격 후 락 = %+v, agent(deploy-1, token %d) 불변 기대", ls2, aTok)
+	}
+
+	// 대칭 확인: agent 자신은 여전히 정상 해제할 수 있다(잡은 주체만 해제).
+	if released, err := agent.Release(ctx, HolderAgent, "deploy-1", aTok); err != nil || !released {
+		t.Fatalf("잡은 주체(agent) 해제 실패: released=%v err=%v", released, err)
+	}
+}
+
+// TestLockLeaseFloorEnforced는 최소 1초 lease가 Go 경계와 프로시저 양쪽에서 강제됨을
+// 검증한다(S2-1 결함2). sub-second/0/음수 lease는 ok=true인 무보호 락을 만들면 안 되고,
+// Renew(...,0)은 살아있는 lease를 줄이면 안 된다.
+func TestLockLeaseFloorEnforced(t *testing.T) {
+	host, port := startMySQL(t)
+	agent := openStore(t, host, port, "deploy_agent")
+	ctx := context.Background()
+
+	// ⑴ Go 경계: sub-second/0/음수 lease 획득은 ErrLeaseTooShort + 락 미생성.
+	for _, d := range []time.Duration{0, 500 * time.Millisecond, -1 * time.Second} {
+		if _, ok, err := agent.Acquire(ctx, HolderAgent, "deploy-1", d); !errors.Is(err, ErrLeaseTooShort) || ok {
+			t.Fatalf("lease %v 획득 = (ok %v, err %v), ErrLeaseTooShort·미획득 기대(fail-closed)", d, ok, err)
+		}
+	}
+	if ls, _ := agent.Read(ctx); ls.HolderKind != HolderNone {
+		t.Fatalf("짧은 lease 시도 후 락 = %+v, 미점유 기대", ls)
+	}
+
+	// ⑵ 프로시저 계층(Go 우회): test 계정으로 wrapper를 직접 CALL해 lease=0을 넣어도 ok=0.
+	//    이것이 없으면 Go만 뚫으면 무보호 락이 열린다(계층 이중 강제 실증).
+	rdb := openDB(t, fmt.Sprintf("test:test@tcp(%s:%s)/deploy?parseTime=true", host, port))
+	conn, err := rdb.Conn(ctx)
+	if err != nil {
+		t.Fatalf("root conn 실패: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "CALL `sp_lock_acquire_agent`('ghost', 0, @t, @o)"); err != nil {
+		t.Fatalf("직접 CALL 실패: %v", err)
+	}
+	var procOK int64
+	if err := conn.QueryRowContext(ctx, "SELECT @o").Scan(&procOK); err != nil {
+		t.Fatalf("@o 읽기 실패: %v", err)
+	}
+	if procOK != 0 {
+		t.Fatal("프로시저가 lease=0 획득을 ok=1로 허용했다 (proc 계층 floor 미작동)")
+	}
+	if ls, _ := agent.Read(ctx); ls.HolderKind != HolderNone {
+		t.Fatalf("proc 우회 시도 후 락 = %+v, 미점유 기대", ls)
+	}
+
+	// ⑶ Renew(...,0)은 살아있는 lease를 줄이지 못한다(Go에서 ErrLeaseTooShort로 거절).
+	aTok, ok, err := agent.Acquire(ctx, HolderAgent, "deploy-1", 60*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("정상 획득 실패: ok=%v err=%v", ok, err)
+	}
+	before, _ := agent.Read(ctx)
+	if _, err := agent.Renew(ctx, HolderAgent, "deploy-1", aTok, 0); !errors.Is(err, ErrLeaseTooShort) {
+		t.Fatalf("Renew(...,0): err=%v, ErrLeaseTooShort 기대", err)
+	}
+	after, _ := agent.Read(ctx)
+	if !after.LeaseExpiresAt.Equal(before.LeaseExpiresAt) {
+		t.Fatalf("Renew(...,0)이 lease 만료를 바꿨다: %v → %v (줄이면 안 됨)", before.LeaseExpiresAt, after.LeaseExpiresAt)
+	}
+
+	// 정상 Renew(연장)는 통과해야 한다(정상 경로 계약 불변).
+	if ok, err := agent.Renew(ctx, HolderAgent, "deploy-1", aTok, 120*time.Second); err != nil || !ok {
+		t.Fatalf("정상 Renew(연장) = (ok %v, err %v), 참 기대", ok, err)
+	}
+	if _, err := agent.Release(ctx, HolderAgent, "deploy-1", aTok); err != nil {
+		t.Fatalf("정리 Release 오류: %v", err)
+	}
+}
+
+// TestLockHolderKindRejected는 holder_kind ∈ {AGENT, BATCH_CUTOFF}만 허용됨을 검증한다
+// (S2-1 결함3 — 유령 락 방지). impl은 계정에 EXECUTE가 없으므로 전권 test 계정으로 직접
+// CALL해 proc 계층의 명시 검증을 실증한다.
+func TestLockHolderKindRejected(t *testing.T) {
+	host, port := startMySQL(t)
+	rdb := openDB(t, fmt.Sprintf("test:test@tcp(%s:%s)/deploy?parseTime=true", host, port))
+	ctx := context.Background()
+	conn, err := rdb.Conn(ctx)
+	if err != nil {
+		t.Fatalf("root conn 실패: %v", err)
+	}
+	defer conn.Close()
+
+	acquireImpl := func(kind string) int64 {
+		if _, err := conn.ExecContext(ctx,
+			"CALL `sp_lock_acquire_impl`(?, 'h', 60, @t, @o)", kind); err != nil {
+			t.Fatalf("impl CALL(%s) 실패: %v", kind, err)
+		}
+		var ok int64
+		if err := conn.QueryRowContext(ctx, "SELECT @o").Scan(&ok); err != nil {
+			t.Fatalf("@o 읽기(%s) 실패: %v", kind, err)
+		}
+		return ok
+	}
+
+	if got := acquireImpl("NONE"); got != 0 {
+		t.Fatalf("holder_kind='NONE' → ok=%d, 0 기대(유령 락 거절)", got)
+	}
+	if got := acquireImpl("BOGUS"); got != 0 {
+		t.Fatalf("holder_kind='BOGUS' → ok=%d, 0 기대(미지 kind 거절)", got)
+	}
+	// sanity: 유효 kind는 통과(그리고 Go 디스패치도 미지 kind를 거절하는지 확인).
+	if got := acquireImpl("AGENT"); got != 1 {
+		t.Fatalf("holder_kind='AGENT' → ok=%d, 1 기대(유효 kind 통과)", got)
+	}
+
+	// Go 계층: 미지 kind는 ErrInvalidHolderKind로 거절(프로시저에 도달하지 않는다).
+	agent := openStore(t, host, port, "deploy_agent")
+	if _, _, err := agent.Acquire(ctx, HolderNone, "x", 60*time.Second); !errors.Is(err, ErrInvalidHolderKind) {
+		t.Fatalf("Go Acquire(NONE): err=%v, ErrInvalidHolderKind 기대", err)
+	}
+	if _, err := agent.Release(ctx, HolderKind("BOGUS"), "x", 1); !errors.Is(err, ErrInvalidHolderKind) {
+		t.Fatalf("Go Release(BOGUS): err=%v, ErrInvalidHolderKind 기대", err)
+	}
+}
+
+// TestLockConcurrentAcquire는 N개 goroutine이 동시에 빈 락을 획득하면 정확히 하나만 성공함을
+// 실 MySQL로 검증한다(CD-3 원자 획득). 세션변수(@tok/@ok) 오염 회귀도 함께 밟는다: 여러
+// 커넥션을 강제(MaxOpenConns)해 풀 재사용 하에서도 승자 token이 락 행과 일치하는지 본다
+// — callProc가 CALL과 SELECT를 하나의 고정 커넥션에서 돌리므로 오염이 없어야 한다.
+func TestLockConcurrentAcquire(t *testing.T) {
+	host, port := startMySQL(t)
+	st := openStore(t, host, port, "deploy_agent")
+	st.db.SetMaxOpenConns(8) // 풀 재사용·세션변수 오염 회귀를 유도한다
+	ctx := context.Background()
+
+	const N = 24
+	var (
+		wg        sync.WaitGroup
+		start     = make(chan struct{})
+		winners   int64
+		winnerTok int64
+	)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // 모두를 같은 순간에 풀어 실제 경합을 만든다
+			tok, ok, err := st.Acquire(ctx, HolderAgent, fmt.Sprintf("deploy-%d", i), 60*time.Second)
+			if err != nil {
+				t.Errorf("goroutine %d Acquire 오류: %v", i, err)
+				return
+			}
+			if ok {
+				atomic.AddInt64(&winners, 1)
+				atomic.StoreInt64(&winnerTok, int64(tok))
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if winners != 1 {
+		t.Fatalf("동시 Acquire 승자 = %d, 정확히 1 기대(CD-3 원자 획득)", winners)
+	}
+	// 승자 token이 실제 락 행에 반영됐는지 교차 확인(세션변수 오염이었다면 어긋난다).
+	ls, err := st.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read 실패: %v", err)
+	}
+	if int64(ls.FencingToken) != atomic.LoadInt64(&winnerTok) {
+		t.Fatalf("승자 token %d ≠ 락 행 token %d (세션변수 오염 의심)", atomic.LoadInt64(&winnerTok), ls.FencingToken)
+	}
+	if ls.HolderKind != HolderAgent {
+		t.Fatalf("동시 획득 후 holder = %v, AGENT 기대", ls.HolderKind)
+	}
+	// 정리.
+	if _, err := st.Release(ctx, HolderAgent, ls.HolderID, ls.FencingToken); err != nil {
+		t.Fatalf("정리 Release 오류: %v", err)
 	}
 }
 

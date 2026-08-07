@@ -85,6 +85,24 @@ func TestAcquireWindow_Error(t *testing.T) {
 	}
 }
 
+// S2-1 결함2: sub-second/0/음수 lease는 획득을 시도하지 않고 ErrLeaseTooShort로 거절한다
+// (무보호 락 금지 — fail-closed). store.Acquire를 아예 호출하지 않아야 한다(경계에서 차단).
+func TestAcquireWindow_LeaseTooShort(t *testing.T) {
+	for _, d := range []time.Duration{0, 500 * time.Millisecond, -1 * time.Second} {
+		l := &fakeLock{acquireTok: 1, acquireOK: true} // 호출되면 held=true가 되어 테스트가 잡는다
+		h, held, err := AcquireWindow(context.Background(), l, "deploy-1", d)
+		if !errors.Is(err, store.ErrLeaseTooShort) {
+			t.Fatalf("lease %v: err=%v, ErrLeaseTooShort 기대(fail-closed)", d, err)
+		}
+		if held || h != nil {
+			t.Fatalf("lease %v: held=%v hold=%v, 거절 기대", d, held, h)
+		}
+		if l.gotID != "" { // fakeLock.Acquire가 불렸다면 gotID가 채워진다
+			t.Fatalf("lease %v: store.Acquire가 호출됐다(gotID=%q) — 경계에서 차단해야 한다", d, l.gotID)
+		}
+	}
+}
+
 // Confirm 성공: 내 토큰이 그 행에 그대로 → 재확인이 통과(불가역 단계 진행 허용). 포착된
 // 인자가 Hold의 (agent, id, token, lease)와 일치해야 한다 — fencing이 실려야 한다.
 func TestHold_Confirm_StillHeld(t *testing.T) {
