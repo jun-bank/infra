@@ -171,7 +171,18 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 		return Result{Outcome: OutcomeManifestInvalid, Detail: err.Error()}
 	}
 
-	// 6. 실행 지점(dispatch — #15). 스텁은 UNEXECUTED(부작용 0)를 낸다. 실행 상태를
+	// 6. 실행 지점 직전 fencing 재확인(CD-3 「불가역 단계 직전 보유 재확인」). lease가 만료돼
+	//    다른 점유자가 진입했거나(held=false) 판정 불가(err)면 dispatch를 시작하지 않는다 —
+	//    만료·탈취된 락으로 특권 실행을 여는 것을 막는다(좀비 차단). 시작 전이므로 부작용 0.
+	if held2, cerr := hold.Confirm(ctx); cerr != nil {
+		c.reject(ctx, req.RequestID, target, m.CommitSHA, hold.Token(), "dispatch 직전 fencing 재확인 오류(fail-closed): "+cerr.Error())
+		return Result{Outcome: OutcomeFailClosed, State: StateUnexecuted, Detail: "fencing 재확인 오류 — dispatch 미시작"}
+	} else if !held2 {
+		c.reject(ctx, req.RequestID, target, m.CommitSHA, hold.Token(), "dispatch 직전 fencing 상실(lease 만료·탈취) — dispatch 미시작")
+		return Result{Outcome: OutcomeFailClosed, State: StateUnexecuted, Detail: "fencing 상실(lease 만료·탈취) — dispatch 미시작"}
+	}
+
+	// 7. 실행 지점(dispatch — #15). 스텁은 UNEXECUTED(부작용 0)를 낸다. 실행 상태를
 	//    이력에 남긴다(DO-16 3상태 기록·조회 골격).
 	state, derr := c.d.Dispatcher.Dispatch(ctx, m, hold.Token())
 

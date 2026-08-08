@@ -40,14 +40,17 @@ func (r *seqModeReader) Current(context.Context, string) (string, uint64, error)
 	return resp.mode, resp.version, resp.err
 }
 
-// orchLock은 고정 결과를 돌려주며 획득·해제 호출을 센다.
+// orchLock은 고정 결과를 돌려주며 획득·재확인·해제 호출을 센다.
 type orchLock struct {
-	acquireTok store.FencingToken
-	acquireOK  bool
-	acquireErr error
-	releaseOK  bool
-	acquired   int
-	released   int
+	acquireTok    store.FencingToken
+	acquireOK     bool
+	acquireErr    error
+	renewOK       bool  // Confirm(재확인)이 볼 결과. baseDeps는 true(정상 보유).
+	renewErr      error // 설정 시 Renew(재확인)가 이 오류를 낸다(판정 불가).
+	releaseOK     bool
+	acquired      int
+	released      int
+	releaseCtxErr error // 마지막 Release에 넘어온 context의 Err()(취소된 ctx 재사용 감시).
 }
 
 func (l *orchLock) Acquire(context.Context, store.HolderKind, string, time.Duration) (store.FencingToken, bool, error) {
@@ -55,10 +58,14 @@ func (l *orchLock) Acquire(context.Context, store.HolderKind, string, time.Durat
 	return l.acquireTok, l.acquireOK, l.acquireErr
 }
 func (l *orchLock) Renew(context.Context, store.HolderKind, string, store.FencingToken, time.Duration) (bool, error) {
-	return true, nil
+	if l.renewErr != nil {
+		return false, l.renewErr
+	}
+	return l.renewOK, nil
 }
-func (l *orchLock) Release(context.Context, store.HolderKind, string, store.FencingToken) (bool, error) {
+func (l *orchLock) Release(ctx context.Context, _ store.HolderKind, _ string, _ store.FencingToken) (bool, error) {
 	l.released++
+	l.releaseCtxErr = ctx.Err()
 	return l.releaseOK, nil
 }
 
@@ -100,6 +107,17 @@ func (d fakeDispatcher) Dispatch(context.Context, Manifest, store.FencingToken) 
 	return d.state, d.err
 }
 
+// recDispatcher는 고정 상태를 내며 호출 횟수를 센다(dispatch 미시작 검증용).
+type recDispatcher struct {
+	state RemoteState
+	calls int
+}
+
+func (d *recDispatcher) Dispatch(context.Context, Manifest, store.FencingToken) (RemoteState, error) {
+	d.calls++
+	return d.state, nil
+}
+
 // --- 하네스 -------------------------------------------------------------------
 
 func validManifest(requestID string) []byte {
@@ -109,7 +127,7 @@ func validManifest(requestID string) []byte {
 // baseDeps는 정상 경로(dev·락 획득·UNEXECUTED dispatch)를 조립한다. 개별 테스트가 필요한
 // 조각만 덮어쓴다.
 func baseDeps() (Deps, *orchLock, *recHistory) {
-	l := &orchLock{acquireTok: 7, acquireOK: true, releaseOK: true}
+	l := &orchLock{acquireTok: 7, acquireOK: true, renewOK: true, releaseOK: true}
 	h := &recHistory{}
 	return Deps{
 		Mode:       &seqModeReader{resp: []modeResp{{mode: "dev", version: 3}}},
@@ -316,6 +334,41 @@ func TestOrchestrate_UnknownKeepsLock(t *testing.T) {
 	}
 	if h.last().EventType != string(OutcomeUnknown) {
 		t.Fatalf("UNKNOWN 이력 event_type=%q, UNKNOWN 기대", h.last().EventType)
+	}
+}
+
+// dispatch 직전 fencing 재확인(Confirm)이 held=false(lease 만료·탈취)면 그 단계를 시작하지
+// 않는다 — 만료·탈취된 락으로 특권 실행을 시작하는 것을 막는다(CD-3 보유 재확인). dispatch가
+// 호출돼서는 안 되고 fail-closed로 닫는다.
+func TestOrchestrate_FencingLostBeforeDispatch_NoDispatch(t *testing.T) {
+	d, l, h := baseDeps()
+	l.renewOK = false // 재확인 시 이미 보유하지 않음(만료·탈취)
+	disp := &recDispatcher{state: StateUnexecuted}
+	d.Dispatcher = disp
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeFailClosed {
+		t.Fatalf("fencing 상실: outcome=%v, FAIL_CLOSED 기대(dispatch 미시작)", res.Outcome)
+	}
+	if disp.calls != 0 {
+		t.Fatalf("fencing 상실인데 dispatch가 호출됐다(calls=%d) — 만료·탈취 락으로 실행 금지", disp.calls)
+	}
+	if h.last().EventType != "REJECTED" {
+		t.Fatalf("fencing 상실 거절이 이력에 남지 않았다: %+v", h.last())
+	}
+}
+
+// dispatch 직전 재확인이 오류(판정 불가)면 시작하지 않는다(fail-closed).
+func TestOrchestrate_FencingConfirmError_NoDispatch(t *testing.T) {
+	d, l, _ := baseDeps()
+	l.renewErr = errors.New("db 접근 불가")
+	disp := &recDispatcher{state: StateUnexecuted}
+	d.Dispatcher = disp
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeFailClosed {
+		t.Fatalf("재확인 오류: outcome=%v, FAIL_CLOSED 기대", res.Outcome)
+	}
+	if disp.calls != 0 {
+		t.Fatalf("재확인 오류인데 dispatch가 호출됐다(calls=%d)", disp.calls)
 	}
 }
 
