@@ -246,6 +246,14 @@ const (
 //   - 그 외(이력 없음 포함)              → REPORT — 이 requestId가 예약된 적 없다는 뜻이다.
 //     특히 jti 재사용(새 requestId·재사용 토큰)은 새 requestId가 미예약이므로, 재개하면
 //     예약 없이 부작용을 여는 셈이 된다 — 재개하지 않고 상태만 반환한다(예약-우선 불변식).
+//
+// [#9 한계 — 이 PR이 닫지 않는다] default 분기의 "이력 없음=미예약"(→REPORT)은 호출 문맥인
+// handleReplay의 "ErrReplay=예약 확정"과 어긋난다. 예약(reserve)과 RESERVED 이력 append가
+// 별개 쓰기라, 예약은 됐는데 RESERVED 이력이 유실되면 재전송이 REEXECUTE 대신 REPORT로 빠져
+// 미완 배포가 stranded되고, post-reserve 거절은 그 requestId를 오염시킨다(liveness trap).
+// 이 갭은 reserve+락+mode version+이력을 하나의 트랜잭션으로 묶고 실행 상태를 durable하게
+// 원자 기록해야 닫히며(DO-17 §2.2 — [구현 검증] 이연), 그 원자 기록은 실제 dispatch를
+// 소유하는 S2-3의 몫이다. #14/이 PR은 그 원자성을 성립시키지 못하므로 #9를 닫지 않는다.
 func ClassifyReplay(latest store.HistoryEvent) ResumeAction {
 	switch {
 	case latest.EventType == string(OutcomeUnknown) || latest.Result == string(StateUnknown):
