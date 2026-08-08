@@ -210,7 +210,7 @@ func testDepsWith(t *testing.T, oidc OIDCGate, dispatcher deploy.Dispatcher) (De
 // manifestBody는 대상·requestID로 완전한(DO-18 6칸) manifest JSON을 만든다. manifest의
 // requestId는 서명될 envelope requestId와 같아야 오케스트레이션 검증을 통과한다.
 func manifestBody(target, requestID string) string {
-	return `{"target":"` + target + `","commitSha":"c1","imageDigest":"sha256:abc",` +
+	return `{"target":"` + target + `","commitSha":"c1","imageDigest":"sha256:` + strings.Repeat("a", 64) + `",` +
 		`"composeRevision":"rev1","configVersion":"v1","requestId":"` + requestID + `"}`
 }
 
