@@ -118,9 +118,6 @@ type verifiedRequest struct {
 	// selfReport는 운영 승인이 자기 신고임을 나타낸다(게이트 2 · 잔여-5). 신규 예약을
 	// 이력에 남길 때 이 사실을 함께 적는다.
 	selfReport bool
-	// resume은 이미 예약된 요청의 재전송 재개인지다(#9 · DO-16 ⑵). 멱등 슬롯이 재생을
-	// 재개로 분류했을 때 참이 되어, 오케스트레이션이 미완 배포를 완주시키게 한다.
-	resume bool
 }
 
 // middleware는 하나의 http.Handler를 감싸 다음 핸들러로 잇는 함수다. 체인의 각 고리가
@@ -388,9 +385,9 @@ func (d Deps) handleReplay(w http.ResponseWriter, r *http.Request, v verifiedReq
 	}
 	switch deploy.ClassifyReplay(latest) {
 	case deploy.ResumeReexecute:
-		v.resume = true
-		ctx := context.WithValue(r.Context(), verifiedRequestKey, v)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		// 미완 배포를 완주시킨다 — 종단 수신 핸들러(next)를 다시 태워 같은 requestId로
+		// 오케스트레이션을 재진입한다. 검증된 요청(v)은 이미 컨텍스트에 있으므로 그대로 태운다.
+		next.ServeHTTP(w, r)
 	case deploy.ResumeReport:
 		d.replayCurrentState(w, latest)
 	default: // ResumeEscalate
@@ -429,7 +426,6 @@ func deployReceiver(d Deps) http.Handler {
 		res := d.Deploy.Orchestrate(r.Context(), deploy.Request{
 			RequestID: v.req.RequestID,
 			Body:      v.body,
-			Resume:    v.resume,
 		})
 		writeOutcome(w, res)
 	})
