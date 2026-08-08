@@ -36,6 +36,27 @@ var (
 // digestPrefix는 이미지 참조가 태그가 아니라 내용 주소(digest)임을 강제하는 접두사다.
 const digestPrefix = "sha256:"
 
+// digestHexLen은 sha256 digest의 hex 부분 길이다(256비트 = 64자 hex).
+const digestHexLen = 64
+
+// validSHA256Digest는 image 참조가 sha256: 접두 + 정확히 64자 hex인지 본다(DO-18 ⑵ —
+// 내용 주소 고정). 접두만 보고 통과시키면 sha256:abc·sha256:latest 같은 위조·오타가
+// digest로 위장해 실행 대상 고정이 무너지므로, 길이와 hex 문자 집합을 함께 강제한다.
+func validSHA256Digest(d string) bool {
+	hex, ok := strings.CutPrefix(d, digestPrefix)
+	if !ok || len(hex) != digestHexLen {
+		return false
+	}
+	for _, c := range hex {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // valid는 대상이 닫힌 배포 집합에 속하는지 본다(DO-20 — 정확히 셋).
 func (t Target) valid() bool {
 	switch t {
@@ -71,7 +92,7 @@ func VerifyManifest(m Manifest, signedRequestID string) error {
 	if m.CommitSHA == "" || m.ImageDigest == "" || m.ComposeRevision == "" || m.ConfigVersion == "" || m.RequestID == "" {
 		return ErrManifestIncomplete
 	}
-	if !strings.HasPrefix(m.ImageDigest, digestPrefix) || len(m.ImageDigest) <= len(digestPrefix) {
+	if !validSHA256Digest(m.ImageDigest) {
 		return ErrManifestDigest
 	}
 	if m.RequestID != signedRequestID {

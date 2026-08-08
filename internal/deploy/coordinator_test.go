@@ -7,11 +7,15 @@ package deploy
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jun-bank/infra/internal/store"
 )
+
+// validDigest는 DO-18 ⑵ 형식(sha256: + 64자 hex)을 만족하는 테스트용 고정 digest다.
+var validDigest = "sha256:" + strings.Repeat("a", 64)
 
 // --- 페이크 -------------------------------------------------------------------
 
@@ -95,7 +99,7 @@ func (d fakeDispatcher) Dispatch(context.Context, Manifest, store.FencingToken) 
 // --- 하네스 -------------------------------------------------------------------
 
 func validManifest(requestID string) []byte {
-	return []byte(`{"target":"core","commitSha":"c1","imageDigest":"sha256:abc","composeRevision":"rev1","configVersion":"v1","requestId":"` + requestID + `"}`)
+	return []byte(`{"target":"core","commitSha":"c1","imageDigest":"` + validDigest + `","composeRevision":"rev1","configVersion":"v1","requestId":"` + requestID + `"}`)
 }
 
 // baseDeps는 정상 경로(dev·락 획득·UNEXECUTED dispatch)를 조립한다. 개별 테스트가 필요한
@@ -128,7 +132,7 @@ func TestParseManifest_TargetGate(t *testing.T) {
 }
 
 func TestVerifyManifest(t *testing.T) {
-	full := Manifest{Target: TargetCore, CommitSHA: "c1", ImageDigest: "sha256:abc", ComposeRevision: "r1", ConfigVersion: "v1", RequestID: "req-1"}
+	full := Manifest{Target: TargetCore, CommitSHA: "c1", ImageDigest: validDigest, ComposeRevision: "r1", ConfigVersion: "v1", RequestID: "req-1"}
 	if err := VerifyManifest(full, "req-1"); err != nil {
 		t.Fatalf("완전·일치 manifest가 거절됐다: %v", err)
 	}
@@ -143,6 +147,18 @@ func TestVerifyManifest(t *testing.T) {
 	tag.ImageDigest = "latest"
 	if err := VerifyManifest(tag, "req-1"); !errors.Is(err, ErrManifestDigest) {
 		t.Fatalf("가변 태그: err=%v, ErrManifestDigest 기대", err)
+	}
+	// sha256: 접두는 있으나 64자 hex가 아님(길이 미달) — 거절.
+	short := full
+	short.ImageDigest = "sha256:abc"
+	if err := VerifyManifest(short, "req-1"); !errors.Is(err, ErrManifestDigest) {
+		t.Fatalf("짧은 digest(sha256:abc): err=%v, ErrManifestDigest 기대", err)
+	}
+	// 길이는 64지만 hex가 아님 — 거절.
+	nothex := full
+	nothex.ImageDigest = "sha256:" + strings.Repeat("g", 64)
+	if err := VerifyManifest(nothex, "req-1"); !errors.Is(err, ErrManifestDigest) {
+		t.Fatalf("비-hex digest: err=%v, ErrManifestDigest 기대", err)
 	}
 	// requestId 불일치(서명된 것과 다름).
 	if err := VerifyManifest(full, "req-OTHER"); !errors.Is(err, ErrManifestRequestID) {
