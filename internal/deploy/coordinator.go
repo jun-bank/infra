@@ -2,10 +2,15 @@ package deploy
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/jun-bank/infra/internal/store"
 )
+
+// releaseTimeout은 전환 전 락 해제에 쓰는 별도 context의 상한이다(요청 ctx와 분리 — 요청이
+// 취소돼도 해제는 완주해야 한다). 짧게 둔다 — 해제 실패는 lease 만료가 어차피 회수한다.
+const releaseTimeout = 5 * time.Second
 
 // 오케스트레이션 시퀀스 — 게이트·멱등을 통과한 검증된 배포 요청을 받아 실행 직전까지
 // 엮는다(IA-4 ⑵: 오케스트레이터는 상태를 가진 층). HTTP 진입 층(httpentry)이 이 층을
@@ -148,8 +153,16 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	// 단 UNKNOWN(전환 이후 상태 불명)만 락을 유지한다 — 아래에서 releaseLock을 끈다.
 	releaseLock := true
 	defer func() {
-		if releaseLock {
-			_, _ = hold.Release(ctx)
+		if !releaseLock {
+			return
+		}
+		// 해제는 요청 ctx와 분리한다 — 요청이 취소됐어도 락은 반드시 놓아야 한다. 취소된
+		// 요청 ctx를 재사용하면 해제가 즉시 실패해 락이 lease 만료까지 누수된다. 결과를
+		// 확인해 실패는 남긴다(치명적이진 않다 — lease 만료가 그 행을 회수한다. CD-3 stale 회수).
+		rctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+		defer cancel()
+		if released, rerr := hold.Release(rctx); rerr != nil || !released {
+			log.Printf("deploy: 배포 창 락 해제 실패(target=%s released=%v err=%v) — lease 만료가 회수한다(CD-3)", target, released, rerr)
 		}
 	}()
 
