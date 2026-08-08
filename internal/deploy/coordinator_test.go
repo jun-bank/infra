@@ -315,6 +315,24 @@ func TestOrchestrate_UnknownKeepsLock(t *testing.T) {
 	}
 }
 
+// dispatch가 (UNKNOWN, err)를 내면 err 유무와 무관하게 UNKNOWN으로 사상하고 락을 유지한다.
+// UNKNOWN(전환 이후 상태 불명)은 오류로 접어서는 안 된다 — 오류로 접으면 락이 풀려 멈춘
+// 대상을 살아 있다고 오인하거나 재시도로 이중 부작용을 낸다(DO-16 ⑵ · CD-4).
+func TestOrchestrate_UnknownWithError_KeepsLock(t *testing.T) {
+	d, l, h := baseDeps()
+	d.Dispatcher = fakeDispatcher{state: StateUnknown, err: errors.New("응답 유실")}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeUnknown {
+		t.Fatalf("(UNKNOWN,err): outcome=%v, UNKNOWN 기대(err보다 UNKNOWN 우선·락 유지)", res.Outcome)
+	}
+	if l.released != 0 {
+		t.Fatalf("(UNKNOWN,err)은 err가 있어도 락을 유지해야 한다: released=%d", l.released)
+	}
+	if h.last().EventType != string(OutcomeUnknown) {
+		t.Fatalf("UNKNOWN 이력 event_type=%q, UNKNOWN 기대", h.last().EventType)
+	}
+}
+
 // --- 재전송 분류(#9) ---------------------------------------------------------
 
 func TestClassifyReplay(t *testing.T) {
