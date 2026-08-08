@@ -413,6 +413,24 @@ func TestOrchestrate_HistoryWriteFailure_FoldsToUnknown(t *testing.T) {
 	}
 }
 
+// 전환 전 락 해제는 요청 ctx와 분리한다 — 요청 ctx가 취소됐어도 락은 반드시 놓아야 한다.
+// 취소된 ctx를 재사용하면 해제가 즉시 실패해 락이 lease 만료까지 누수된다.
+func TestOrchestrate_ReleaseUsesFreshContext(t *testing.T) {
+	d, l, _ := baseDeps()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 요청 ctx가 이미 취소된 상황
+	res := NewCoordinator(d).Orchestrate(ctx, Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome != OutcomeReachedDispatch {
+		t.Fatalf("outcome=%v, REACHED_DISPATCH 기대", res.Outcome)
+	}
+	if l.released != 1 {
+		t.Fatalf("취소된 요청이라도 락은 해제돼야 한다: released=%d", l.released)
+	}
+	if l.releaseCtxErr != nil {
+		t.Fatalf("락 해제에 취소된 요청 ctx가 재사용됐다: %v — 별도 context(background+timeout) 기대", l.releaseCtxErr)
+	}
+}
+
 // --- 재전송 분류(#9) ---------------------------------------------------------
 
 func TestClassifyReplay(t *testing.T) {
