@@ -32,12 +32,12 @@ const (
 // digest로 고정되고, compose revision은 불변 식별자이므로, 롤백은 이미지와 부팅
 // 정의를 둘 다 이전 지점으로 되돌린다.
 type Manifest struct {
-	Target          Target
-	CommitSHA       string
-	ImageDigest     string // sha256:... — 고정됨(DO-18 ⑵), 절대 가변 태그가 아님
-	ComposeRevision string // 부팅 정의의 불변 식별자(DO-18 ⑷)
-	ConfigVersion   string // 애플리케이션 설정 스키마/버전(DO-18 ⑸)
-	RequestID       string // DO-10; 시퀀스 전체를 통해 운반됨
+	Target          Target `json:"target"`
+	CommitSHA       string `json:"commitSha"`
+	ImageDigest     string `json:"imageDigest"`     // sha256:... — 고정됨(DO-18 ⑵), 절대 가변 태그가 아님
+	ComposeRevision string `json:"composeRevision"` // 부팅 정의의 불변 식별자(DO-18 ⑷)
+	ConfigVersion   string `json:"configVersion"`   // 애플리케이션 설정 스키마/버전(DO-18 ⑸)
+	RequestID       string `json:"requestId"`       // DO-10; 시퀀스 전체를 통해 운반됨
 }
 
 // Orchestrator는 하나의 manifest에 대해 CD-4 적용 시퀀스를 실행한다. 순서가 곧
