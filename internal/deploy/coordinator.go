@@ -174,7 +174,14 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	// 6. 실행 지점(dispatch — #15). 스텁은 UNEXECUTED(부작용 0)를 낸다. 실행 상태를
 	//    이력에 남긴다(DO-16 3상태 기록·조회 골격).
 	state, derr := c.d.Dispatcher.Dispatch(ctx, m, hold.Token())
-	c.recordDispatch(ctx, req, m, hold.Token(), state)
+
+	// 실행 상태를 이력에 남긴다(DO-16). 이 이력은 재전송 재개 분류(ClassifyReplay)의 유일한
+	// durable 근거다 — 쓰기가 실패하면 COMPLETED/미실행을 durable하게 증명할 수 없으므로,
+	// 완료로 보고해서는 안 된다. UNKNOWN으로 접어 락을 유지하고 사람에게 올린다(fail-closed).
+	// 근거가 남지 않았으니 재전송은 재실행하지 않는다(이력 없음 → REPORT).
+	if herr := c.recordDispatch(ctx, req, m, hold.Token(), state); herr != nil {
+		state = StateUnknown
+	}
 
 	// state==UNKNOWN을 err 유무보다 먼저 판정한다 — dispatch가 (UNKNOWN, err)를 낼 수 있고,
 	// 그때 err 분기가 앞서면 UNKNOWN이 FAIL_CLOSED로 접혀 락이 풀린다. UNKNOWN(전환 이후 상태
@@ -251,10 +258,11 @@ func (c coordinator) reject(ctx context.Context, requestID, target, commit strin
 }
 
 // recordDispatch는 실행 지점의 상태를 이력에 남긴다(DO-16 3상태 기록). event_type은 상태에
-// 따라 갈라 재전송 분류(ClassifyReplay)가 최신 이력만으로 판정 가능하게 한다.
-func (c coordinator) recordDispatch(ctx context.Context, req Request, m Manifest, token store.FencingToken, state RemoteState) {
+// 따라 갈라 재전송 분류(ClassifyReplay)가 최신 이력만으로 판정 가능하게 한다. 쓰기 오류를
+// 반환하며(무음 삼킴 금지), 호출자는 그 실패를 COMPLETED로 보고하지 않고 UNKNOWN으로 접는다.
+func (c coordinator) recordDispatch(ctx context.Context, req Request, m Manifest, token store.FencingToken, state RemoteState) error {
 	if c.d.History == nil {
-		return
+		return nil
 	}
 	ev := store.HistoryEvent{
 		RequestID:      req.RequestID,
@@ -273,5 +281,5 @@ func (c coordinator) recordDispatch(ctx context.Context, req Request, m Manifest
 	default:
 		ev.EventType = "STEP_RESULT"
 	}
-	_ = c.d.History.AppendEvent(ctx, ev)
+	return c.d.History.AppendEvent(ctx, ev)
 }

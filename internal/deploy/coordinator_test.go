@@ -64,10 +64,14 @@ func (l *orchLock) Release(context.Context, store.HolderKind, string, store.Fenc
 
 // recHistory는 append를 순서대로 담고 최신 조회를 지원하는 인메모리 이력이다.
 type recHistory struct {
-	events []store.HistoryEvent
+	events    []store.HistoryEvent
+	appendErr error // 설정 시 AppendEvent가 이 오류를 반환한다(이력 쓰기 실패 흉내).
 }
 
 func (h *recHistory) AppendEvent(_ context.Context, ev store.HistoryEvent) error {
+	if h.appendErr != nil {
+		return h.appendErr
+	}
 	h.events = append(h.events, ev)
 	return nil
 }
@@ -330,6 +334,29 @@ func TestOrchestrate_UnknownWithError_KeepsLock(t *testing.T) {
 	}
 	if h.last().EventType != string(OutcomeUnknown) {
 		t.Fatalf("UNKNOWN 이력 event_type=%q, UNKNOWN 기대", h.last().EventType)
+	}
+}
+
+// dispatch 이력 쓰기가 실패하면 COMPLETED를 반환하지 않는다 — 이력은 재개 분류의 유일한
+// durable 근거이므로, durable하게 남기지 못한 완료는 UNKNOWN(락 유지·사람에게)으로 접는다
+// (fail-closed). 근거가 없으니 재전송은 재실행하지 않는다(ClassifyReplay: 이력 없음→REPORT).
+func TestOrchestrate_HistoryWriteFailure_FoldsToUnknown(t *testing.T) {
+	d, l, h := baseDeps()
+	d.Dispatcher = fakeDispatcher{state: StateCompleted} // dispatch는 완료를 보고하나
+	h.appendErr = errors.New("이력 쓰기 실패")                 // 그 완료를 durable하게 남기지 못한다
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome == OutcomeCompleted {
+		t.Fatalf("이력 쓰기 실패인데 COMPLETED 반환 — durable 아님(재전송이 재실행할 수 있다)")
+	}
+	if res.Outcome != OutcomeUnknown {
+		t.Fatalf("이력 쓰기 실패: outcome=%v, UNKNOWN 기대(fail-closed·락 유지)", res.Outcome)
+	}
+	if l.released != 0 {
+		t.Fatalf("이력 쓰기 실패 시 락을 유지해야 한다: released=%d", l.released)
+	}
+	// 근거가 남지 않았으니 재전송은 재실행하지 않는다(이력 없음 → REPORT).
+	if a := ClassifyReplay(h.last()); a == ResumeReexecute {
+		t.Fatalf("이력 없음인데 재전송이 재실행(REEXECUTE)으로 분류됐다: %v", a)
 	}
 }
 
