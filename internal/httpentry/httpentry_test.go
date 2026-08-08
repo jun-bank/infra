@@ -14,6 +14,7 @@ package httpentry
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -93,8 +94,9 @@ func (f *fakeOIDC) Verify(_ context.Context, rawToken string) auth.OIDCDecision 
 
 // fakeHistory는 인메모리 이력이다. append와 최신 읽기만 지원한다(append-only).
 type fakeHistory struct {
-	mu     sync.Mutex
-	events map[string][]store.HistoryEvent
+	mu      sync.Mutex
+	events  map[string][]store.HistoryEvent
+	readErr error // 설정 시 ReadLatest가 이 오류를 반환한다(이력 조회 실패 흉내).
 }
 
 func newFakeHistory() *fakeHistory {
@@ -111,6 +113,9 @@ func (f *fakeHistory) AppendEvent(_ context.Context, ev store.HistoryEvent) erro
 func (f *fakeHistory) ReadLatest(_ context.Context, requestID string) (store.HistoryEvent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return store.HistoryEvent{}, f.readErr
+	}
 	evs := f.events[requestID]
 	if len(evs) == 0 {
 		return store.HistoryEvent{}, nil
@@ -459,6 +464,32 @@ func TestReplayCompletedReturnsState(t *testing.T) {
 	}
 	if rec2.Header().Get("X-Deploy-Idempotent-Replay") != "true" {
 		t.Error("완료 재전송 응답에 멱등 재생 표식이 없다")
+	}
+}
+
+// TestReplayReadErrorFailsClosed는 재전송 분류의 근거 이력 조회가 실패하면 200이 아니라
+// 500(fail-closed)으로 닫는지 확인한다. 읽기 오류를 empty와 동일 취급해 200을 내면 완료된
+// 배포를 미예약으로 오판할 수 있으므로, 재개/보고 판정이 불가하면 재시도하지 않고 닫는다.
+func TestReplayReadErrorFailsClosed(t *testing.T) {
+	deps, hist := testDeps(t)
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+	iat, exp := freshWindow()
+
+	// 1차 — 신규 예약·실행 지점 도달(501).
+	first := signedRequest("core", "req-readerr", iat, exp)
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, first)
+	if rec1.Code != http.StatusNotImplemented {
+		t.Fatalf("1차 요청: 코드 = %d, 기대 = 501", rec1.Code)
+	}
+
+	// 2차 — 재전송인데 이력 조회가 실패한다 → 500(fail-closed), 200 아님.
+	hist.readErr = errors.New("이력 조회 실패")
+	second := signedRequest("core", "req-readerr", iat, exp)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, second)
+	if rec2.Code != http.StatusInternalServerError {
+		t.Fatalf("재전송 이력 조회 실패: 코드 = %d, 기대 = 500(fail-closed) — 200이면 미예약 오판", rec2.Code)
 	}
 }
 

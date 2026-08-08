@@ -376,9 +376,15 @@ func withIdempotency(d Deps) middleware {
 func (d Deps) handleReplay(w http.ResponseWriter, r *http.Request, v verifiedRequest, next http.Handler) {
 	var latest store.HistoryEvent
 	if d.History != nil {
-		if ev, err := d.History.ReadLatest(r.Context(), v.req.RequestID); err == nil {
-			latest = ev
+		ev, err := d.History.ReadLatest(r.Context(), v.req.RequestID)
+		if err != nil {
+			// 재전송 분류의 근거 이력을 읽지 못했다 = 재개/보고/에스컬레이션 판정 불가.
+			// empty로 간주해 200을 내면 완료된 배포를 미예약으로 오판하므로, 읽기 오류는
+			// fail-closed(500 · 재시도 금지 판정 불가)로 닫는다.
+			http.Error(w, "재전송 이력 조회 실패 — 판정 불가(fail-closed)", http.StatusInternalServerError)
+			return
 		}
+		latest = ev
 	}
 	switch deploy.ClassifyReplay(latest) {
 	case deploy.ResumeReexecute:
@@ -386,7 +392,7 @@ func (d Deps) handleReplay(w http.ResponseWriter, r *http.Request, v verifiedReq
 		ctx := context.WithValue(r.Context(), verifiedRequestKey, v)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	case deploy.ResumeReport:
-		d.replayCurrentState(w, r, v.req.RequestID)
+		d.replayCurrentState(w, latest)
 	default: // ResumeEscalate
 		w.Header().Set("X-Deploy-Idempotent-Replay", "true")
 		http.Error(w, "직전 시도가 UNKNOWN 상태 — 자동 재시도 금지, 사람 개입 필요(DO-16 ⑵)", http.StatusConflict)
@@ -394,14 +400,13 @@ func (d Deps) handleReplay(w http.ResponseWriter, r *http.Request, v verifiedReq
 }
 
 // replayCurrentState는 재전송된 요청에 대해 재실행 없이 현재 상태를 반환한다(완료 경로).
-// 이력이 있으면 마지막 event_type을, 없으면 예약만 된 상태로 응답한다. 하류(수신)를
-// 호출하지 않는다 — 완료된 배포를 재전송이 두 번 일으키지 않는 것이 이 경로의 핵심이다.
-func (d Deps) replayCurrentState(w http.ResponseWriter, r *http.Request, requestID string) {
+// handleReplay가 이미 읽은 latest를 그대로 받는다 — 여기서 다시 읽지 않는다(중복 조회·같은
+// 읽기 오류 무음 삼킴 방지). event_type이 있으면 그것을, 없으면 예약만 된 상태로 응답한다.
+// 하류(수신)를 호출하지 않는다 — 완료된 배포를 재전송이 두 번 일으키지 않는 것이 핵심이다.
+func (d Deps) replayCurrentState(w http.ResponseWriter, latest store.HistoryEvent) {
 	status := "RESERVED"
-	if d.History != nil {
-		if ev, err := d.History.ReadLatest(r.Context(), requestID); err == nil && ev.EventType != "" {
-			status = ev.EventType
-		}
+	if latest.EventType != "" {
+		status = latest.EventType
 	}
 	w.Header().Set("X-Deploy-Idempotent-Replay", "true")
 	w.WriteHeader(http.StatusOK)
