@@ -175,16 +175,20 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	//    이력에 남긴다(DO-16 3상태 기록·조회 골격).
 	state, derr := c.d.Dispatcher.Dispatch(ctx, m, hold.Token())
 	c.recordDispatch(ctx, req, m, hold.Token(), state)
+
+	// state==UNKNOWN을 err 유무보다 먼저 판정한다 — dispatch가 (UNKNOWN, err)를 낼 수 있고,
+	// 그때 err 분기가 앞서면 UNKNOWN이 FAIL_CLOSED로 접혀 락이 풀린다. UNKNOWN(전환 이후 상태
+	// 불명)은 err가 있어도 오류로 접지 않고 락을 유지한 채 사람에게 올린다(DO-16 ⑵ · CD-4).
+	if state == StateUnknown {
+		releaseLock = false
+		return Result{Outcome: OutcomeUnknown, State: state, Detail: "원격 실행 UNKNOWN — 사람 개입·락 유지"}
+	}
 	if derr != nil {
 		return Result{Outcome: OutcomeFailClosed, State: state, Detail: "dispatch 오류: " + derr.Error()}
 	}
 	switch state {
 	case StateCompleted:
 		return Result{Outcome: OutcomeCompleted, State: state}
-	case StateUnknown:
-		// 전환 이후 상태 불명 — 락을 유지한 채 사람에게 올린다(DO-16 ⑵ · CD-4 부분 실패).
-		releaseLock = false
-		return Result{Outcome: OutcomeUnknown, State: state, Detail: "원격 실행 UNKNOWN — 사람 개입·락 유지"}
 	default:
 		// UNEXECUTED — 실행 지점 도달·실행 미구현(#15). 부작용 0이므로 락은 해제한다.
 		return Result{Outcome: OutcomeReachedDispatch, State: state, Detail: "실행 지점 도달·dispatch 미구현(#15)"}
