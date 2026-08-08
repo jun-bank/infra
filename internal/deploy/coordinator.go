@@ -92,9 +92,6 @@ type Request struct {
 	RequestID string
 	// Body는 서명·인증된 manifest JSON이다(gate 1이 digest로 이미 인증).
 	Body []byte
-	// Resume은 이미 예약된 요청의 재전송 재개인지다(#9 · DO-16 ⑵). 시퀀스 자체는 동일하며
-	// 이력에 재개 사실을 남기는 데 쓴다.
-	Resume bool
 }
 
 // Deps는 오케스트레이션이 소비하는 협력자다. 전부 소비 지점 인터페이스이며 store
