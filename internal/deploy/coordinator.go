@@ -99,7 +99,7 @@ type Request struct {
 type Deps struct {
 	Mode       ModeReader         // 대상별 mode·version 조회(DO-5·DO-17)
 	Lock       WindowLock         // 배포 창 락(CD-3)
-	History    store.HistoryStore // 배포 이력 append·조회(DO-16 상태 기록)
+	History    store.HistoryStore // 배포 이력 append·조회(DO-16 상태 기록) — 필수(nil이면 NewCoordinator 거부)
 	Dispatcher Dispatcher         // 실행 지점(#15)
 	HolderID   string             // 이 agent의 락 holder 식별자(CD-3)
 	Lease      time.Duration      // 배포 창 락 lease(≥ store.MinLease)
@@ -112,8 +112,16 @@ type Coordinator interface {
 
 type coordinator struct{ d Deps }
 
-// NewCoordinator는 오케스트레이터를 만든다.
-func NewCoordinator(d Deps) Coordinator { return coordinator{d: d} }
+// NewCoordinator는 오케스트레이터를 만든다. History는 실행 상태를 durable하게 남기는 필수
+// 의존이다 — 이력이 없으면 재개 판정(ClassifyReplay)의 근거가 사라지고 완료를 durable하게
+// 증명할 수 없다. nil이면 그런 오케스트레이터가 조립되지 못하게 구성 시점에 panic한다
+// (fail-closed 기동 — 배선 오류를 런타임 fail-open으로 흘리지 않는다).
+func NewCoordinator(d Deps) Coordinator {
+	if d.History == nil {
+		panic("deploy: NewCoordinator에 History가 필요하다(nil 금지) — 실행 상태를 durable하게 남길 수 없으면 재개 판정 근거가 없다(fail-closed 기동)")
+	}
+	return coordinator{d: d}
+}
 
 // Orchestrate는 시퀀스를 실행한다. 각 거절·상태 전이는 이력에 남고(RL-8·DO-16), 어느
 // 단계든 실패는 fail-closed로 막는다. 전환 전 실패(모드·락·검증)는 락을 해제하고 끝나며,
@@ -196,6 +204,16 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	//    이력에 남긴다(DO-16 3상태 기록·조회 골격).
 	state, derr := c.d.Dispatcher.Dispatch(ctx, m, hold.Token())
 
+	// dispatch가 정의된 세 상태(UNEXECUTED·COMPLETED·UNKNOWN) 밖의 값(빈 문자열·미지)을 내면
+	// 실행 결과를 신뢰할 수 없다 — UNEXECUTED로 오인해 락을 풀면 fail-open이다. UNKNOWN으로
+	// 접어(락 유지·사람에게) 이력·재개 분류까지 일관되게 만든다(DO-16 fail-closed).
+	switch state {
+	case StateUnexecuted, StateCompleted, StateUnknown:
+		// 정의된 상태 — 그대로 둔다.
+	default:
+		state = StateUnknown
+	}
+
 	// 실행 상태를 이력에 남긴다(DO-16). 이 이력은 재전송 재개 분류(ClassifyReplay)의 유일한
 	// durable 근거다 — 쓰기가 실패하면 COMPLETED/미실행을 durable하게 증명할 수 없으므로,
 	// 완료로 보고해서는 안 된다. UNKNOWN으로 접어 락을 유지하고 사람에게 올린다(fail-closed).
@@ -217,9 +235,14 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	switch state {
 	case StateCompleted:
 		return Result{Outcome: OutcomeCompleted, State: state}
-	default:
+	case StateUnexecuted:
 		// UNEXECUTED — 실행 지점 도달·실행 미구현(#15). 부작용 0이므로 락은 해제한다.
 		return Result{Outcome: OutcomeReachedDispatch, State: state, Detail: "실행 지점 도달·dispatch 미구현(#15)"}
+	default:
+		// 위에서 정의 밖 상태를 UNKNOWN으로 접었고 UNKNOWN은 이미 반환했으므로 여기에 닿지
+		// 않는다 — 도달 불가 경로도 UNEXECUTED로 오인해 락을 풀지 않는다(방어적 fail-closed).
+		releaseLock = false
+		return Result{Outcome: OutcomeUnknown, State: StateUnknown, Detail: "원격 실행 상태 정의 밖 — 사람 개입·락 유지"}
 	}
 }
 
@@ -270,9 +293,6 @@ func ClassifyReplay(latest store.HistoryEvent) ResumeAction {
 // reject는 거절을 이력에 남긴다(RL-8). append 실패는 삼키되 — 거절 자체는 확정이므로
 // 통과로 뒤집지 않는다(fail-closed).
 func (c coordinator) reject(ctx context.Context, requestID, target, commit string, token store.FencingToken, reason string) {
-	if c.d.History == nil {
-		return
-	}
 	ev := store.HistoryEvent{
 		RequestID:    requestID,
 		EventType:    "REJECTED",
@@ -290,9 +310,6 @@ func (c coordinator) reject(ctx context.Context, requestID, target, commit strin
 // 따라 갈라 재전송 분류(ClassifyReplay)가 최신 이력만으로 판정 가능하게 한다. 쓰기 오류를
 // 반환하며(무음 삼킴 금지), 호출자는 그 실패를 COMPLETED로 보고하지 않고 UNKNOWN으로 접는다.
 func (c coordinator) recordDispatch(ctx context.Context, req Request, m Manifest, token store.FencingToken, state RemoteState) error {
-	if c.d.History == nil {
-		return nil
-	}
 	ev := store.HistoryEvent{
 		RequestID:      req.RequestID,
 		Target:         string(m.Target),
