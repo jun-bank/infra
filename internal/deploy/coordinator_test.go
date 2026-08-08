@@ -413,6 +413,43 @@ func TestOrchestrate_HistoryWriteFailure_FoldsToUnknown(t *testing.T) {
 	}
 }
 
+// dispatch가 정의된 세 상태(UNEXECUTED·COMPLETED·UNKNOWN) 밖의 값(빈 문자열·미지)을 내면
+// UNEXECUTED로 오인해 락을 풀어서는 안 된다 — 실행 결과를 신뢰할 수 없으므로 UNKNOWN으로
+// 접어 락을 유지하고 사람에게 올린다(DO-16 fail-closed). COMPLETED로도 사상하지 않는다.
+func TestOrchestrate_OutOfDefinitionState_FoldsToUnknown(t *testing.T) {
+	for _, st := range []RemoteState{"", "WEIRD"} {
+		d, l, h := baseDeps()
+		d.Dispatcher = fakeDispatcher{state: st}
+		res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+		if res.Outcome == OutcomeCompleted {
+			t.Fatalf("정의 밖 상태(%q)를 COMPLETED로 사상 — fail-open", st)
+		}
+		if res.Outcome != OutcomeUnknown {
+			t.Fatalf("정의 밖 상태(%q): outcome=%v, UNKNOWN 기대(fail-closed·락 유지)", st, res.Outcome)
+		}
+		if l.released != 0 {
+			t.Fatalf("정의 밖 상태(%q)는 락을 유지해야 한다: released=%d", st, l.released)
+		}
+		if h.last().EventType != string(OutcomeUnknown) {
+			t.Fatalf("정의 밖 상태(%q) 이력 event_type=%q, UNKNOWN 기대(에스컬레이션 근거)", st, h.last().EventType)
+		}
+	}
+}
+
+// History가 nil이면 실행 상태를 durable하게 남길 수 없어 재개 판정의 근거가 사라진다 —
+// 그런 오케스트레이터는 애초에 조립되지 못하게 막는다(fail-closed 기동). 필수 의존이
+// 비어 있는 것은 배선 오류(프로그래머 오류)이므로 구성 시점에 panic한다.
+func TestNewCoordinator_NilHistory_Panics(t *testing.T) {
+	d, _, _ := baseDeps()
+	d.History = nil
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("nil History인데 panic하지 않았다 — 기록 불가면 durable 근거 없음(fail-closed 기동)")
+		}
+	}()
+	NewCoordinator(d)
+}
+
 // 전환 전 락 해제는 요청 ctx와 분리한다 — 요청 ctx가 취소됐어도 락은 반드시 놓아야 한다.
 // 취소된 ctx를 재사용하면 해제가 즉시 실패해 락이 lease 만료까지 누수된다.
 func TestOrchestrate_ReleaseUsesFreshContext(t *testing.T) {
