@@ -43,6 +43,15 @@ func TestLeaseCoversDispatch(t *testing.T) {
 	}
 }
 
+// 기본 설정끼리 자기정합해야 한다 — 기본 lease가 기본 phaseBudget+D+cleanup+slack를 덮지
+// 못하면, 아무 env도 안 준 운영자의 agent가 leaseCoversDispatch에서 fail-closed로 기동하지
+// 못한다. 기본값을 바꿀 때 이 정합성이 깨지지 않게 막는다.
+func TestDefaultConfigLeaseCoversDispatch(t *testing.T) {
+	if err := leaseCoversDispatch(defaultDeployLease, defaultDispatchPhaseBudget, defaultHealthDeadline); err != nil {
+		t.Fatalf("기본 설정이 자기정합하지 않다(기본값으로 기동 불가): %v", err)
+	}
+}
+
 // P8: 헬스·phaseBudget env가 설정됐으나 파싱 불가·범위 위반이면 boot에서 거부해야 한다
 // (fail-fast) — 조용히 기본값으로 삼켜 잘못된 튜닝이 런타임까지 숨는 것을 막는다.
 func setRequiredDispatchEnv(t *testing.T) {
