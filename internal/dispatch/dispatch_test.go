@@ -124,7 +124,7 @@ func TestUpArgvAndImageEnv(t *testing.T) {
 	if err := e.Up(context.Background(), ref); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"docker", "compose", "-f", "/etc/deploy/green.yml", "-p", "core-green", "up", "-d", "--no-build"}
+	want := []string{"docker", "compose", "-f", "/etc/deploy/green.yml", "-p", "core-green", "up", "-d", "--no-build", "--remove-orphans"}
 	if !eq(r.argv, want) {
 		t.Fatalf("up argv = %v, 기대 %v", r.argv, want)
 	}
@@ -132,6 +132,10 @@ func TestUpArgvAndImageEnv(t *testing.T) {
 	// --no-build 존재
 	if !contains(r.argv, "--no-build") {
 		t.Fatal("up argv에 --no-build 없음(빌드 도구 없음 — DO-4/P1)")
+	}
+	// --remove-orphans 존재(H2 임시 완화 — orphan 마스킹 차단)
+	if !contains(r.argv, "--remove-orphans") {
+		t.Fatal("up argv에 --remove-orphans 없음(orphan 마스킹 완화 — H2)")
 	}
 	// 이미지 참조는 argv가 아니라 env 치환으로 주입한다.
 	if contains(r.argv, ref) {
