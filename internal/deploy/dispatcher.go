@@ -3,9 +3,16 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jun-bank/infra/internal/store"
 )
+
+// cleanupTimeout은 실패 후 정리(down)에 쓰는 detached context의 상한이다. 정리 down은
+// 요청 ctx가 취소·타임아웃됐어도 완주해야 net-0 복원(미전환)이 성립하므로, 요청 ctx와
+// 분리한 context.WithoutCancel + 이 상한으로 실행한다(coordinator 락 해제와 같은 패턴).
+// ⚠️ [구현 검증]: 실제 compose down 소요와 함께 튜닝한다.
+const cleanupTimeout = 30 * time.Second
 
 // 실행 지점(#15 S2-3) — 검증되고 락을 보유한 manifest를 자기 호스트에서 실제로 실행한다.
 // 순서: 이미지 pull(digest 고정) → compose up(green) → CD-1 헬스 → RemoteState. 블루-그린
@@ -26,6 +33,9 @@ type HostExecutor interface {
 	Pull(ctx context.Context, imageRef string) error
 	// Up은 green 프로젝트를 compose up한다(digest 고정 참조 주입).
 	Up(ctx context.Context, imageRef string) error
+	// VerifyImageDigest는 up으로 실제 뜬 컨테이너들의 이미지가 pinned digest 참조와
+	// 일치하는지 증명한다(DO-16 ⑶). 불일치·조회 불가·컨테이너 없음이면 오류.
+	VerifyImageDigest(ctx context.Context, imageRef string) error
 	// Down은 green 프로젝트만 compose down한다(이미지는 남긴다 — RL-5).
 	Down(ctx context.Context) error
 }
@@ -80,21 +90,36 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, _ store.Fenci
 	// 2. green 기동(compose up · CD-4 ③). 실패 시 부분 기동이 남을 수 있으므로 down으로
 	//    net-0 복원을 시도한다 — down 성공=미전환(UNEXECUTED), down 실패=green 잔존 가능(UNKNOWN).
 	if err := d.Exec.Up(ctx, imageRef); err != nil {
-		if derr := d.Exec.Down(ctx); derr != nil {
-			return StateUnknown, fmt.Errorf("compose up 실패 후 정리(down)도 실패 — green 잔존 가능(UNKNOWN): up=%v · down=%v", err, derr)
-		}
-		return StateUnexecuted, fmt.Errorf("compose up 실패·green 정리 완료(미전환·부작용 0): %w", err)
+		return d.cleanupAfterFailure(ctx, "compose up 실패", err)
 	}
 
-	// 3. CD-1 헬스(CD-4 ④). 실패 → green 종료·blue 유지 = 미전환(롤백 아님). down 성공=
+	// 3. 이미지 무결성 대조(DO-16 ⑶ 사후조건). up이 env 주입 없이 :latest·오타 이미지를
+	//    띄웠는데 헬스만 통과하면 엉뚱한 이미지가 COMPLETED로 위장한다 — 헬스 전에 실제 뜬
+	//    이미지가 pinned digest인지 증명한다. 불일치·조회 불가면 green을 정리하고 미전환.
+	if err := d.Exec.VerifyImageDigest(ctx, imageRef); err != nil {
+		return d.cleanupAfterFailure(ctx, "이미지 무결성 대조 실패", err)
+	}
+
+	// 4. CD-1 헬스(CD-4 ④). 실패 → green 종료·blue 유지 = 미전환(롤백 아님). down 성공=
 	//    UNEXECUTED(net-0), down 실패=green 잔존 가능(UNKNOWN).
 	if err := d.Health.Check(ctx); err != nil {
-		if derr := d.Exec.Down(ctx); derr != nil {
-			return StateUnknown, fmt.Errorf("CD-1 헬스 실패 후 green down 실패 — green 잔존 가능(UNKNOWN): health=%v · down=%v", err, derr)
-		}
-		return StateUnexecuted, fmt.Errorf("CD-1 헬스 실패·green 종료(미전환·롤백 아님): %w", err)
+		return d.cleanupAfterFailure(ctx, "CD-1 헬스 실패", err)
 	}
 
-	// 4. green up + 헬스 통과 = 종단 성공. 전환(⑤~⑨)은 범위 밖이다.
+	// 5. green up + 이미지 대조 + 헬스 통과 = 종단 성공. 전환(⑤~⑨)은 범위 밖이다.
 	return StateCompleted, nil
+}
+
+// cleanupAfterFailure는 up 이후 실패(up 부분 기동·이미지 불일치·헬스 실패) 후 green을
+// down으로 정리해 net-0(미전환)으로 되돌린다. 정리 down은 요청 ctx가 취소·타임아웃됐어도
+// 완주해야 하므로 context.WithoutCancel + 짧은 상한으로 실행한다(요청 취소와 무관하게
+// 복원 성립 — coordinator 락 해제와 같은 detached 패턴). down 성공=UNEXECUTED(net-0),
+// down 실패=green 잔존 가능(UNKNOWN).
+func (d LocalDispatcher) cleanupAfterFailure(ctx context.Context, stage string, cause error) (RemoteState, error) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if derr := d.Exec.Down(cctx); derr != nil {
+		return StateUnknown, fmt.Errorf("%s 후 정리(down)도 실패 — green 잔존 가능(UNKNOWN): 원인=%v · down=%v", stage, cause, derr)
+	}
+	return StateUnexecuted, fmt.Errorf("%s·green 정리 완료(미전환·net-0): %w", stage, cause)
 }

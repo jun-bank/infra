@@ -126,9 +126,65 @@ type Executor struct {
 	run runnerFunc
 }
 
-// NewExecutor는 기본(실제 exec) 러너로 Executor를 만든다.
-func NewExecutor(cfg Config) *Executor {
-	return &Executor{cfg: cfg, run: osExec}
+// NewExecutor는 기본(실제 exec) 러너로 Executor를 만든다. sudo 프리픽스가 열거된 안전
+// 형태(첫 토큰 정확히 "sudo" + 나머지는 플래그만)가 아니면 오류를 반환한다 — 잘못된
+// 프리픽스가 raw root shell을 여는 것을 조립 시점에 막는다(DO-23 ⑴ raw shell 금지).
+func NewExecutor(cfg Config) (*Executor, error) {
+	if err := ValidateSudoPrefix(cfg.SudoPrefix); err != nil {
+		return nil, err
+	}
+	return &Executor{cfg: cfg, run: osExec}, nil
+}
+
+// ValidateSudoPrefix는 sudo 프리픽스가 안전한 열거 형태인지 검증한다(DO-23 ⑴). 프리픽스는
+// 각 특권 명령 앞에 argv로 그대로 붙으므로, 여기서 자유도를 닫지 않으면 설정 값이
+// raw root shell을 열 수 있다(예: "sudo -S sh -c ..."). 규칙:
+//   - 비어 있으면 통과한다(프리픽스 없음 = docker 그룹 소속 직접 실행).
+//   - 첫 토큰은 정확히 "sudo" 여야 한다(다른 실행 파일 금지 — 임의 wrapper·셸 차단).
+//   - 나머지 토큰은 모두 "-" 로 시작하는 sudo 플래그여야 한다(예: -S·-k·-n). 명령·경로·
+//     셸·리다이렉트가 프리픽스에 끼어들 자리를 주지 않는다.
+//   - 어떤 토큰도 셸 메타문자·제어문자를 포함하지 않는다(sh·bash·-c·;·|·&·$·백틱·>·
+//     공백외 제어문자). sudo가 셸을 띄우는 형태(-c/-s/-i 포함)를 명시적으로 거부한다.
+func ValidateSudoPrefix(prefix []string) error {
+	if len(prefix) == 0 {
+		return nil
+	}
+	if prefix[0] != "sudo" {
+		return fmt.Errorf("dispatch: sudo 프리픽스의 첫 토큰은 정확히 %q 여야 한다(raw shell·임의 wrapper 금지 — DO-23 ⑴): %q", "sudo", prefix[0])
+	}
+	for _, tok := range prefix {
+		if err := validSudoToken(tok); err != nil {
+			return err
+		}
+	}
+	for _, tok := range prefix[1:] {
+		if !strings.HasPrefix(tok, "-") {
+			return fmt.Errorf("dispatch: sudo 프리픽스의 뒤 토큰은 플래그(- 로 시작)만 허용한다(명령·경로·셸 금지 — DO-23 ⑴): %q", tok)
+		}
+		// 셸을 여는 sudo 플래그(-c 명령 실행 · -s/-i 셸)를 명시 거부한다.
+		switch tok {
+		case "-c", "--command", "-s", "--shell", "-i", "--login":
+			return fmt.Errorf("dispatch: sudo 프리픽스에 셸을 여는 플래그 금지(%q — DO-23 ⑴ raw shell)", tok)
+		}
+	}
+	return nil
+}
+
+// validSudoToken은 한 프리픽스 토큰에 셸 평가·제어문자 흔적이 없는지 본다.
+func validSudoToken(tok string) error {
+	switch tok {
+	case "sh", "bash", "zsh", "/bin/sh", "/bin/bash":
+		return fmt.Errorf("dispatch: sudo 프리픽스에 셸 실행 파일 금지(%q — DO-23 ⑴ raw shell)", tok)
+	}
+	if strings.ContainsAny(tok, ";|&$`><\\\"'*(){}[]") {
+		return fmt.Errorf("dispatch: sudo 프리픽스 토큰에 셸 메타문자 금지(%q — DO-23 ⑴)", tok)
+	}
+	for _, r := range tok {
+		if r != ' ' && r < 0x20 || r == 0x7f {
+			return fmt.Errorf("dispatch: sudo 프리픽스 토큰에 제어문자 금지(%q — DO-23 ⑴)", tok)
+		}
+	}
+	return nil
 }
 
 // stdin은 child에 흘릴 stdin 내용을 정한다(Q3). 프리픽스가 비어있지 않고 AND
@@ -197,6 +253,67 @@ func (e *Executor) RestartCount(ctx context.Context, name string) (int, error) {
 		return 0, fmt.Errorf("dispatch: 재시작 횟수 파싱 불가 %q: %w", out, perr)
 	}
 	return n, nil
+}
+
+// GreenContainers는 green 프로젝트에 현재 뜬 컨테이너 ID 목록을 준다(docker compose ps -q
+// — 부작용 없는 조회). 컨테이너명을 설정에 하드코딩하지 않고 compose 프로젝트에서 파생해,
+// 이미지 대조(C2)·재시작 검사(CD-1 그린 위장 방어)가 항상 실제 뜬 컨테이너를 대상으로
+// 하게 한다. 빈 목록은 오류가 아니라 빈 슬라이스로 준다 — 판정은 호출자가 한다.
+func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
+	argv := e.cfg.commandLine("docker", "compose", "-f", e.cfg.ComposeFile, "-p", e.cfg.Project, "ps", "-q")
+	out, err := e.run(ctx, argv, nil, e.stdin())
+	if err != nil {
+		return nil, fmt.Errorf("dispatch: green 컨테이너 조회 실패(compose ps -q): %w", err)
+	}
+	var ids []string
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			ids = append(ids, s)
+		}
+	}
+	return ids, nil
+}
+
+// containerImageRef는 한 컨테이너가 실제로 뜬 이미지 참조를 읽는다(docker inspect
+// {{.Config.Image}} — 부작용 없는 조회). {{.Config.Image}}는 컨테이너 생성에 쓰인 이미지
+// 참조(우리가 준 참조)를 준다 — green 프로젝트는 compose 파일이 image: ${env} 로 pinned
+// digest 참조를 읽어 뜨므로, 정상이면 <repo>@sha256:... 와 같아야 한다. ⚠️ [구현 검증]:
+// docker가 이 필드로 digest 참조를 그대로 돌려주는지(vs 정규화·image ID)는 리허설에서
+// 재확인한다 — 불일치 시 실제 값이 error에 담기므로 어떤 값이 오는지 즉시 드러난다.
+// {{.Image}}(config ID)는 manifest digest와 다른 해시라 직접 대조에 쓸 수 없다.
+func (e *Executor) containerImageRef(ctx context.Context, id string) (string, error) {
+	argv := e.cfg.commandLine("docker", "inspect", "-f", "{{.Config.Image}}", id)
+	out, err := e.run(ctx, argv, nil, e.stdin())
+	if err != nil {
+		return "", fmt.Errorf("dispatch: 컨테이너 이미지 조회 실패(inspect %s): %w", id, err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// VerifyImageDigest는 green 프로젝트에 실제로 뜬 컨테이너들의 이미지가 pinned digest 참조
+// (imageRef = <repo>@sha256:...)와 일치하는지 inspect로 증명한다(DO-16 ⑶ 사후조건 —
+// "기대 digest의 컨테이너가 돌고 있다"). compose 파일이 image: :latest 거나 env 변수명
+// 오타면 엉뚱한 이미지가 떠도 헬스만으로는 잡지 못한다 — up 성공 직후·헬스 전에 실제 뜬
+// 이미지를 대조한다. 뜬 컨테이너가 없거나(증명 불가)·조회 실패·불일치면 오류이며, 불일치
+// 시 정확히 어떤 값이 왔는지(기대 vs 실제)를 error에 담는다.
+func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error {
+	ids, err := e.GreenContainers(ctx)
+	if err != nil {
+		return fmt.Errorf("dispatch: 이미지 대조 불가(컨테이너 조회 실패): %w", err)
+	}
+	if len(ids) == 0 {
+		return fmt.Errorf("dispatch: green 컨테이너가 없다 — 이미지 대조로 pinned digest(%s) 실행을 증명할 수 없다", imageRef)
+	}
+	for _, id := range ids {
+		got, gerr := e.containerImageRef(ctx, id)
+		if gerr != nil {
+			return fmt.Errorf("dispatch: 이미지 대조 불가: %w", gerr)
+		}
+		if got != imageRef {
+			return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치(컨테이너 %s) — 기대=%q 실제=%q", id, imageRef, got)
+		}
+	}
+	return nil
 }
 
 // osExec는 기본 러너다. argv[0]를 실행 파일로, 나머지를 인자 슬라이스로 넘겨 셸 해석을

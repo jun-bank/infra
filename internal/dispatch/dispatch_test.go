@@ -228,6 +228,117 @@ func TestRestartCountParseError(t *testing.T) {
 	}
 }
 
+// --- C1: sudo 프리픽스 검증 ----------------------------------------------------
+
+// 악성·잘못된 프리픽스는 조립에서 거부되어야 한다(raw root shell 차단 — DO-23 ⑴).
+func TestValidateSudoPrefixRejectsMalicious(t *testing.T) {
+	bad := [][]string{
+		{"sudo", "-S", "sh", "-c", "rm -rf /"}, // raw shell
+		{"sudo", "sh"},                         // 셸 실행 파일
+		{"sudo", "bash", "-c"},                 // 셸 + -c
+		{"sudo", "-c", "whoami"},               // -c(명령 실행)
+		{"sudo", "-s"},                         // -s(셸)
+		{"sudo", "-i"},                         // -i(로그인 셸)
+		{"sudo", "docker"},                     // 뒤 토큰이 명령(플래그 아님)
+		{"sudo", "-S", ";", "id"},              // 셸 메타문자
+		{"sudo", "-S", "&&", "id"},             // 셸 메타문자
+		{"sudo", "-S", "$(id)"},                // 명령 치환
+		{"doas", "-S"},                         // 첫 토큰이 sudo 아님
+		{"/bin/sh", "-c"},                      // 셸 직접
+		{"sudo", "/etc/x"},                     // 경로(플래그 아님)
+	}
+	for _, p := range bad {
+		if err := ValidateSudoPrefix(p); err == nil {
+			t.Errorf("악성/잘못된 프리픽스가 통과됨(거부되어야 한다): %v", p)
+		}
+		if _, err := NewExecutor(Config{SudoPrefix: p, ComposeFile: "/x", Project: "p"}); err == nil {
+			t.Errorf("NewExecutor가 악성 프리픽스를 받아들임: %v", p)
+		}
+	}
+}
+
+// 정상 프리픽스(빈 값·sudo·sudo+플래그)는 통과해야 한다.
+func TestValidateSudoPrefixAcceptsSafe(t *testing.T) {
+	good := [][]string{
+		nil,
+		{},
+		{"sudo"},
+		{"sudo", "-S"},
+		{"sudo", "-S", "-k"},
+		{"sudo", "-n"},
+	}
+	for _, p := range good {
+		if err := ValidateSudoPrefix(p); err != nil {
+			t.Errorf("정상 프리픽스가 거부됨 %v: %v", p, err)
+		}
+		if _, err := NewExecutor(Config{SudoPrefix: p, ComposeFile: "/x", Project: "p"}); err != nil {
+			t.Errorf("NewExecutor가 정상 프리픽스를 거부함 %v: %v", p, err)
+		}
+	}
+}
+
+// --- C2: 이미지 무결성 대조 ----------------------------------------------------
+
+// scriptRunner는 argv에 특정 부분문자열이 있으면 그에 매핑된 출력을 돌려주는 페이크다.
+// GreenContainers(ps -q)와 containerImageRef(inspect)가 서로 다른 명령이라 last-call만
+// 잡는 captureRunner로는 검증할 수 없어, 명령별 응답을 스크립트한다(부작용 0).
+type scriptRunner struct {
+	psOut      string            // compose ps -q 출력(줄바꿈 구분 컨테이너 ID)
+	psErr      error             // ps 오류
+	inspectOut map[string]string // 컨테이너 ID → {{.Config.Image}} 출력
+	inspectErr error
+}
+
+func (s *scriptRunner) fn() runnerFunc {
+	return func(_ context.Context, argv []string, _ []string, _ string) (string, error) {
+		if contains(argv, "ps") && contains(argv, "-q") {
+			return s.psOut, s.psErr
+		}
+		if contains(argv, "inspect") {
+			if s.inspectErr != nil {
+				return "", s.inspectErr
+			}
+			id := argv[len(argv)-1] // inspect ... <id>
+			return s.inspectOut[id], nil
+		}
+		return "", nil
+	}
+}
+
+func TestVerifyImageDigestMatch(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "c1\nc2\n", inspectOut: map[string]string{"c1": ref, "c2": ref}}
+	e := &Executor{cfg: baseCfg, run: s.fn()}
+	if err := e.VerifyImageDigest(context.Background(), ref); err != nil {
+		t.Fatalf("일치인데 대조 실패: %v", err)
+	}
+}
+
+func TestVerifyImageDigestMismatchNamesValue(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	wrong := "registry.example/core:latest"
+	s := &scriptRunner{psOut: "c1\n", inspectOut: map[string]string{"c1": wrong}}
+	e := &Executor{cfg: baseCfg, run: s.fn()}
+	err := e.VerifyImageDigest(context.Background(), ref)
+	if err == nil {
+		t.Fatal("이미지 불일치인데 오류 없음(silent COMPLETED 위험)")
+	}
+	// 정확히 어떤 값이 왔는지 error에 담아야 한다(기대·실제 둘 다).
+	if !strings.Contains(err.Error(), wrong) || !strings.Contains(err.Error(), ref) {
+		t.Fatalf("오류에 기대·실제 값이 없음: %v", err)
+	}
+}
+
+// 뜬 컨테이너가 없으면 pinned digest 실행을 증명할 수 없다 → 오류(fail-closed).
+func TestVerifyImageDigestNoContainers(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "\n", inspectOut: map[string]string{}}
+	e := &Executor{cfg: baseCfg, run: s.fn()}
+	if err := e.VerifyImageDigest(context.Background(), ref); err == nil {
+		t.Fatal("컨테이너 0개인데 대조 통과(증명 불가 = 오류여야 한다)")
+	}
+}
+
 func contains(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {
