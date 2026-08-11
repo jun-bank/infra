@@ -1,0 +1,19 @@
+# 리허설용 compose 파일(무해 대상) — #15 S2-3 실행 층(pull → up → CD-1 헬스 → down)을
+# 자기 호스트에서 1회 완주해 보기 위한 것이다. 블루-그린 전환(⑤~⑨)은 범위 밖이라
+# blue가 없다 — green 하나만 전용 프로젝트명으로 green 포트에 뜬다.
+#
+# 이미지 참조는 digest로 고정한다(DO-18 ⑵). agent의 Executor.Up과 동일하게, 이미지
+# 참조를 env 치환(${REHEARSAL_IMAGE})으로 주입한다 — 리허설을 돌리는 사람이 실제 digest를
+# 확정해 REHEARSAL_IMAGE 로 넘긴다(README 참조). 태그로 띄우지 않는다.
+#
+# traefik/whoami는 임의 GET에 200을 돌려주는 무해 이미지라 CD-1 준비성 프로브의 대상으로
+# 알맞다(자금 경로·특권과 무관).
+
+services:
+  app:
+    image: ${REHEARSAL_IMAGE}
+    # green 포트로 HTTP 준비성 엔드포인트를 연다. 호스트 포트는 필요 시 바꾼다.
+    ports:
+      - "${REHEARSAL_GREEN_PORT:-18080}:80"
+    # 재시작 정책이 있으면 CD-1 재시작 횟수 안정 검사가 의미를 갖는다(그린 위장 방어).
+    restart: unless-stopped
