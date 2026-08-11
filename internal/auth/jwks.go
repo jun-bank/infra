@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -53,8 +54,9 @@ const (
 	// 방지). 무작위 kid 홍수가 매 요청마다 발급자를 두드리지 못하게 한다. [구현 검증].
 	defaultMinRefetchInterval = 30 * time.Second
 	// maxExponentBytes는 JWK 지수(e)의 바이트 상한이다. RSA 공개 지수는 보통 65537
-	// (AQAB · 3바이트)이라 8바이트면 충분하다 — 비정상적으로 큰 e를 파싱 전에 거절한다.
-	maxExponentBytes = 8
+	// (AQAB · 3바이트)이라 4바이트면 충분하다 — 비정상적으로 큰 e를 파싱 전에 거절한다.
+	// 4로 좁혀 uint64 조립·범위 검사와 합쳐 32비트에서도 int 오버플로 없이 안전 거절한다.
+	maxExponentBytes = 4
 )
 
 // ErrJWKSKeyNotFound는 재페치 후에도 kid에 해당하는 키가 없음을 나타낸다(미지 kid).
@@ -340,15 +342,17 @@ func parseRSAPublicKey(nB64, eB64 string) (*rsa.PublicKey, error) {
 	if len(eBytes) == 0 || len(eBytes) > maxExponentBytes {
 		return nil, fmt.Errorf("exponent(e) 길이 비정상: %d바이트", len(eBytes))
 	}
-	// e는 빅엔디언 정수다. 상한(8바이트)을 걸어 int 오버플로 없이 조립한다.
-	var e int
+	// e는 빅엔디언 정수다. uint64로 조립해 조립 중 wrap을 없애고(플랫폼 int 폭 무관), int
+	// 변환 전에 MaxInt32 상한을 걸어 32비트에서도 거대 e가 정상 양수로 wrap돼 통과하는 것을
+	// 막는다. RSA 공개 지수는 작으므로(65537) 이 상한은 정상 키를 자르지 않는다.
+	var e uint64
 	for _, b := range eBytes {
-		e = e<<8 | int(b)
+		e = e<<8 | uint64(b)
 	}
-	if e < 2 {
+	if e < 2 || e > math.MaxInt32 {
 		return nil, fmt.Errorf("exponent(e) 값 비정상: %d", e)
 	}
-	return &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: e}, nil
+	return &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: int(e)}, nil
 }
 
 // requireHTTPS는 rawURL이 https scheme인지 강제한다(평문 거절 — MITM 방어). 파싱 불가·

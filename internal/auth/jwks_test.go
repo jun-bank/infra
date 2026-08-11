@@ -444,6 +444,44 @@ func TestJWKSRejectsHTTPSDowngradeRedirect(t *testing.T) {
 	}
 }
 
+// TestParseRSAPublicKeyExponent는 지수(e) 조립이 플랫폼 무관하게 안전한지 못박는다.
+// 32비트에서 int 오버플로로 거대 e가 정상 양수로 wrap되지 않도록 길이·범위를 제한한다.
+func TestParseRSAPublicKeyExponent(t *testing.T) {
+	b64 := func(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+	validN := b64(big.NewInt(0).SetBytes([]byte{0x01, 0x02, 0x03}).Bytes())
+
+	for _, tc := range []struct {
+		name    string
+		n, e    string
+		wantErr bool
+	}{
+		{"AQAB(65537) 통과", validN, "AQAB", false},
+		{"e=3 통과", validN, b64([]byte{0x03}), false},
+		{"5바이트 e 거절", validN, b64([]byte{0x01, 0x00, 0x00, 0x00, 0x01}), true},
+		{"거대 4바이트 e 거절", validN, b64([]byte{0xFF, 0xFF, 0xFF, 0xFF}), true},
+		{"e=1 거절", validN, b64([]byte{0x01}), true},
+		{"e=0 거절", validN, b64([]byte{0x00}), true},
+		{"빈 e 거절", validN, "", true},
+		{"빈 n 거절", "", "AQAB", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pub, err := parseRSAPublicKey(tc.n, tc.e)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("%s: 오류 기대인데 통과했다 (E=%d)", tc.name, pub.E)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s: 정상 e인데 거절됐다: %v", tc.name, err)
+			}
+			if pub.E <= 1 {
+				t.Fatalf("%s: 조립된 E가 비정상: %d", tc.name, pub.E)
+			}
+		})
+	}
+}
+
 // TestNewHTTPKeySetValidation은 생성 시 https·TTL 불변식을 못박는다(fail-closed 뿌리).
 func TestNewHTTPKeySetValidation(t *testing.T) {
 	for _, tc := range []struct {
