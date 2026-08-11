@@ -50,6 +50,12 @@ const defaultDeployLease = 4 * time.Minute
 // 보다 오래 걸리면 배포가 실패한다(운영자가 이미지 크기에 맞게 조정 · CD-3 무갱신 하한 입력).
 const defaultDispatchPhaseBudget = 120 * time.Second
 
+// defaultJWKSCacheTTL은 발급자 JWKS 공개키 캐시의 기본 TTL이다(OIDC_JWKS_CACHE_TTL로
+// 덮어쓴다). ⚠️ [구현 검증]: 발급자 키 회전 주기와 함께 sizing한다 — 너무 길면 회전 후
+// 폐기된 키를 오래 신뢰하고, 너무 짧으면 발급자를 자주 두드린다. 미지 kid는 TTL과 무관하게
+// 재페치하므로(회전 계약) 이 값은 known kid의 재검증 주기다(기본 10분은 합리 가정).
+const defaultJWKSCacheTTL = 10 * time.Minute
+
 // dispatchLeaseSlack은 lease 하한식의 여유 상수다 — 락 획득~dispatch 진입 사이(모드·manifest
 // 검증·fencing 재확인)와 단계 경계 오버헤드(context 전환·조회 왕복)를 흡수한다. ⚠️ [구현 검증]:
 // 실측으로 조정한다(기본 10s는 합리 가정 — 이 창을 넘는 지연이 관측되면 늘린다).
@@ -191,12 +197,22 @@ func buildDeps() (httpentry.Deps, error) {
 	}
 
 	// 게이트 2(OIDC claim 행렬 — DO-11). 정책(기대 claim 값)은 환경에서 오고, 서명
-	// 검증은 발급자 JWKS 공개키로 한다. 실제 JWKS 페치는 스캐폴드 뒤에 있다(아래).
+	// 검증은 발급자 JWKS 공개키로 한다. JWKS는 OIDC_ISSUER를 discovery base로 HTTPS
+	// 페치·캐시하며 키 회전을 따라간다(auth.NewHTTPKeySet — fail-closed). OIDC_ISSUER는
+	// LoadOIDCPolicy가 이미 필수로 강제한다(미설정이면 여기서 오류로 기동 거부).
 	oidcPolicy, err := auth.LoadOIDCPolicy()
 	if err != nil {
 		return httpentry.Deps{}, fmt.Errorf("게이트 2 정책: %w", err)
 	}
-	oidcGate, err := auth.NewOIDCVerifier(auth.NewJWKSTokenVerifier(jwksScaffold{}), oidcPolicy, nil)
+	jwksTTL, err := envDuration("OIDC_JWKS_CACHE_TTL", defaultJWKSCacheTTL)
+	if err != nil {
+		return httpentry.Deps{}, err
+	}
+	keySet, err := auth.NewHTTPKeySet(oidcPolicy.Issuer, jwksTTL)
+	if err != nil {
+		return httpentry.Deps{}, fmt.Errorf("게이트 2 JWKS 페치기(https·TTL 검증 — fail-closed): %w", err)
+	}
+	oidcGate, err := auth.NewOIDCVerifier(auth.NewJWKSTokenVerifier(keySet), oidcPolicy, nil)
 	if err != nil {
 		return httpentry.Deps{}, fmt.Errorf("게이트 2 verifier: %w", err)
 	}
@@ -373,17 +389,6 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s 값이 Go duration이 아니다(fail-closed): %q", key, raw)
 	}
 	return d, nil
-}
-
-// jwksScaffold는 게이트 2의 JWKS 공개키 페치 자리를 잡는 스캐폴드다(store 스캐폴드와
-// 같은 방식). 실제 구현은 발급자 JWKS 엔드포인트를 HTTPS로 페치·캐시하며 키 회전을
-// 따라간다 — ⚠️ 발급자 URL·회전·캐시는 [구현 검증]이다. 다음 마일스톤에서 채워질
-// 때까지 오류를 반환한다: 공개키를 얻지 못하면 게이트 2가 서명을 검증할 수 없어
-// fail-closed로 거절한다(검증 못 하는 경계를 열지 않는다).
-type jwksScaffold struct{}
-
-func (jwksScaffold) VerificationKey(context.Context, string) (any, error) {
-	return nil, errors.New("JWKS 공개키 페치 미구현 (다음 마일스톤 — 발급자 JWKS HTTPS 페치)")
 }
 
 // runAgent는 ROLE=agent의 실행자 역할이다. 아직 미구현이므로 기동을 거부한다
