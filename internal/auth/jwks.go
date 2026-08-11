@@ -61,6 +61,12 @@ const (
 // 빈 kid·페치 실패와 구분해 거절 사유를 정확히 남긴다(fail-closed).
 var ErrJWKSKeyNotFound = errors.New("auth: JWKS에 해당 kid의 공개키가 없다 (미지 kid — fail-closed)")
 
+// ErrJWKSStale은 캐시가 TTL을 넘겨 만료됐고 재페치가 갱신에 실패(storm throttle 창 안 또는
+// 페치 실패)해 최신 키를 확보하지 못했음을 나타낸다. 이때 만료된 캐시의 키를 반환하면
+// 회전으로 철회됐을 수 있는 키로 무기한 검증하는 fail-open이 되므로, TTL을 staleness
+// 상한으로 삼아 거절한다(fail-closed).
+var ErrJWKSStale = errors.New("auth: JWKS 캐시가 만료됐고 재페치가 갱신하지 못했다 (stale 키 거절 · fail-closed)")
+
 // httpKeySet은 발급자 JWKS를 HTTPS로 페치·캐시하는 KeySet 구현이다. kid → RSA 공개키
 // 맵을 캐시하고, 미지 kid나 TTL 만료 시 재페치해 키 회전을 따라간다. 동시 호출에
 // 안전하며(mu), 재페치는 한 번에 하나만 나가고(fetchMu — single-flight) 최소 간격으로
@@ -144,11 +150,18 @@ func (ks *httpKeySet) VerificationKey(ctx context.Context, kid string) (any, err
 		return nil, err
 	}
 
-	// 재페치 후 다시 조회한다. 만료 여부와 무관하게 방금 페치했으므로 존재만 본다 —
-	// 그래도 없으면 진짜 미지 kid다(fail-closed).
+	// 재페치가 nil을 냈다고 해서 "방금 신선히 페치했다"는 보장은 없다 — storm throttle
+	// 창 안이면 refetch는 갱신 없이 nil을 낸다. 따라서 keys[kid]를 반환하기 전에 freshness를
+	// 재확인한다: 캐시가 여전히 만료 상태면 그 키는 stale(회전으로 철회됐을 수 있다)이므로
+	// 거절한다(TTL = staleness 상한 · fail-closed). fresh면 존재 여부로 판정한다 — 있으면
+	// 반환, 없으면 진짜 미지 kid다.
 	ks.mu.Lock()
+	fresh := ks.clock.Now().Sub(ks.fetchedAt) < ks.ttl
 	key, ok := ks.keys[kid]
 	ks.mu.Unlock()
+	if !fresh {
+		return nil, ErrJWKSStale
+	}
 	if !ok {
 		return nil, ErrJWKSKeyNotFound
 	}
