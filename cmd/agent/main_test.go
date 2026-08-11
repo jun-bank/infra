@@ -3,7 +3,41 @@
 // (ADR-027 DO-21).
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// C5/C6: 배포 창 락 lease가 dispatch 소요(헬스 deadline D + pull/up 마진)를 덮지 못하면
+// 시동을 거부해야 한다(fail-closed) — lease=1s+D=60s 같은 footgun을 기동 시 차단한다.
+// dispatch 중 lease 갱신이 없으므로(CD-3 무갱신 모델), lease가 짧으면 실행 중 락이 만료돼
+// 다른 주체가 stale 락을 회수한다.
+func TestLeaseCoversDispatch(t *testing.T) {
+	d := 60 * time.Second // 헬스 deadline D
+	min := d + dispatchLeaseMargin
+
+	// 미달 — 거부.
+	for _, lease := range []time.Duration{
+		time.Second, // footgun: lease=1s, D=60s
+		d,           // 마진 없이 D와 같음
+		min - time.Nanosecond,
+	} {
+		if err := leaseCoversDispatch(lease, d); err == nil {
+			t.Errorf("lease=%s < min=%s 인데 통과(fail-closed 위반)", lease, min)
+		}
+	}
+
+	// 충분 — 통과.
+	for _, lease := range []time.Duration{
+		min,
+		min + time.Second,
+		2 * time.Minute,
+	} {
+		if err := leaseCoversDispatch(lease, d); err != nil {
+			t.Errorf("lease=%s >= min=%s 인데 거부: %v", lease, min, err)
+		}
+	}
+}
 
 // TestResolveRole은 역할 해석의 fail-closed 계약을 다룬다: 유효 값은 통과하고,
 // 빈 값·미지원 값은 오류가 되어 기동을 막는다.
