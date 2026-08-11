@@ -24,6 +24,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 
 	"github.com/jun-bank/infra/internal/auth"
 	"github.com/jun-bank/infra/internal/deploy"
+	"github.com/jun-bank/infra/internal/dispatch"
 	"github.com/jun-bank/infra/internal/httpentry"
 	"github.com/jun-bank/infra/internal/store"
 )
@@ -191,14 +194,94 @@ func buildCoordinator(st *store.SQLStore) (deploy.Coordinator, error) {
 		lease = d
 	}
 
+	disp, err := buildDispatcher()
+	if err != nil {
+		return nil, fmt.Errorf("실행 지점(dispatcher) 조립: %w", err)
+	}
+
 	return deploy.NewCoordinator(deploy.Deps{
 		Mode:       st,
 		Lock:       st,
 		History:    st,
-		Dispatcher: deploy.StubDispatcher{}, // 실행 지점은 #15 — 지금은 UNEXECUTED(부작용 0)
+		Dispatcher: disp, // 실행 지점(#15) — pull → up → CD-1 헬스 → RemoteState
 		HolderID:   holderID,
 		Lease:      lease,
 	}), nil
+}
+
+// defaultHealth*는 CD-1 준비성 프로브의 기본값이다(모두 [구현 검증] CDV-1 — 실측으로
+// 정해진다). env로 덮어쓴다. N·T·Timeout·D는 배포 시간과 함께 튜닝된다.
+const (
+	defaultHealthThreshold = 3
+	defaultHealthInterval  = 2 * time.Second
+	defaultHealthTimeout   = 3 * time.Second
+	defaultHealthDeadline  = 60 * time.Second
+)
+
+// buildDispatcher는 특권 실행 지점을 환경에서 조립한다(DO-23 · DO-18 · CD-1). 배포에
+// 필수인 설정(compose 파일·프로젝트·준비성 URL·이미지 repo 최소 1개)이 없으면 오류를
+// 반환해 기동을 막는다(fail-closed — 배포를 수행할 수 없는 채로 수신을 열지 않는다,
+// DO-17 ⑷와 같은 축). sudo 프리픽스·비번은 선택이다(개발 머신은 비운다 — 직접 실행).
+func buildDispatcher() (deploy.Dispatcher, error) {
+	composeFile := os.Getenv("DEPLOY_COMPOSE_FILE")
+	project := os.Getenv("DEPLOY_COMPOSE_PROJECT")
+	healthURL := os.Getenv("DEPLOY_HEALTH_URL")
+	if composeFile == "" || project == "" || healthURL == "" {
+		return nil, errors.New("DEPLOY_COMPOSE_FILE·DEPLOY_COMPOSE_PROJECT·DEPLOY_HEALTH_URL 미설정 (배포 실행에 필수 — fail-closed)")
+	}
+
+	repos := map[deploy.Target]string{}
+	for target, env := range map[deploy.Target]string{
+		deploy.TargetCore:       "IMAGE_CORE",
+		deploy.TargetSettlement: "IMAGE_SETTLEMENT",
+		deploy.TargetLedger:     "IMAGE_LEDGER",
+	} {
+		if v := os.Getenv(env); v != "" {
+			repos[target] = v
+		}
+	}
+	if len(repos) == 0 {
+		return nil, errors.New("IMAGE_CORE·IMAGE_SETTLEMENT·IMAGE_LEDGER 중 최소 하나가 필요하다 (배포 대상 이미지 repo — fail-closed)")
+	}
+
+	execr := dispatch.NewExecutor(dispatch.Config{
+		SudoPrefix:   strings.Fields(os.Getenv("DEPLOY_SUDO_PREFIX")), // 공백 split · 비면 직접 실행
+		SudoPassword: os.Getenv("DEPLOY_SUDO_PASSWORD"),
+		ComposeFile:  composeFile,
+		Project:      project,
+		ImageEnvVar:  os.Getenv("DEPLOY_IMAGE_ENV"), // 비면 dispatch 기본(DEPLOY_IMAGE_REF)
+	})
+
+	prober := dispatch.NewProber(dispatch.HealthConfig{
+		URL:              healthURL,
+		SuccessThreshold: envInt("DEPLOY_HEALTH_SUCCESS_THRESHOLD", defaultHealthThreshold),
+		Interval:         envDuration("DEPLOY_HEALTH_INTERVAL", defaultHealthInterval),
+		Timeout:          envDuration("DEPLOY_HEALTH_TIMEOUT", defaultHealthTimeout),
+		Deadline:         envDuration("DEPLOY_HEALTH_DEADLINE", defaultHealthDeadline),
+		ContainerName:    os.Getenv("DEPLOY_HEALTH_CONTAINER"), // 비면 재시작 검사 생략(권장: 설정)
+	}, execr)
+
+	return deploy.LocalDispatcher{Exec: execr, Health: prober, Repos: repos}, nil
+}
+
+// envInt는 env를 정수로 읽는다(부재·파싱 실패 시 def).
+func envInt(key string, def int) int {
+	if raw := os.Getenv(key); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// envDuration은 env를 Go duration으로 읽는다(부재·파싱 실패 시 def).
+func envDuration(key string, def time.Duration) time.Duration {
+	if raw := os.Getenv(key); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			return d
+		}
+	}
+	return def
 }
 
 // jwksScaffold는 게이트 2의 JWKS 공개키 페치 자리를 잡는 스캐폴드다(store 스캐폴드와
