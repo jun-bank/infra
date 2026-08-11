@@ -50,9 +50,15 @@ const defaultDeployLease = 4 * time.Minute
 // 보다 오래 걸리면 배포가 실패한다(운영자가 이미지 크기에 맞게 조정 · CD-3 무갱신 하한 입력).
 const defaultDispatchPhaseBudget = 120 * time.Second
 
-// dispatchLeaseSlack은 lease 하한식의 여유 상수다 — 단계 경계 오버헤드(context 전환·조회
-// 왕복)를 흡수한다. ⚠️ [구현 검증]: 실측으로 조정한다(기본 10s는 합리 가정).
+// dispatchLeaseSlack은 lease 하한식의 여유 상수다 — 락 획득~dispatch 진입 사이(모드·manifest
+// 검증·fencing 재확인)와 단계 경계 오버헤드(context 전환·조회 왕복)를 흡수한다. ⚠️ [구현 검증]:
+// 실측으로 조정한다(기본 10s는 합리 가정 — 이 창을 넘는 지연이 관측되면 늘린다).
 const dispatchLeaseSlack = 10 * time.Second
+
+// maxDispatchDuration은 phaseBudget·healthDeadline 각각의 상한이다 — 이보다 큰 값을 설정으로
+// 받으면 하한식 덧셈이 int64 overflow로 음수가 되어 lease 검증이 fail-open이 될 수 있다(H3).
+// 실제 배포 단계가 이 값을 넘는 일은 없으므로, 넘으면 오설정으로 보고 fail-closed로 거부한다.
+const maxDispatchDuration = time.Hour
 
 // leaseCoversDispatch는 배포 창 락 lease가 dispatch 전체 소요를 덮는지 본다(CD-3 하한식).
 // dispatch가 실시간이 되면서 dispatch 중 lease 갱신이 없으므로(CD-3 무갱신 모델을 채택 —
@@ -62,12 +68,17 @@ const dispatchLeaseSlack = 10 * time.Second
 //
 //	lease ≥ phaseBudget(pull+up 상한) + healthDeadline D(헬스) + CleanupTimeout(실패 시 정리) + slack
 //
-// 으로 강화한다 — 이러면 전체 dispatch(pull+up ≤ phaseBudget, health ≤ D, 실패 시 cleanup ≤
-// CleanupTimeout)가 lease 안에 보증돼, cleanup이 락 상실 후 실행되는 일이 구조적으로 불가능
-// 하다(P4 닫힘). 미달이면 오류(fail-closed). ⚠️ UNKNOWN(전환 이후 상태 불명)이 lease 만료
-// 까지만 유지되는 잔여는 남는다(CD-3 "만료 ≠ 상태 복구" — 사람이 만료 전 개입한다). lease는
-// 그 개입 창을 벌 뿐, 만료 자체를 상태 복구로 삼지 않는다.
+// 으로 강화한다 — phaseBudget은 pull+up+무결성대조(H1)를, D는 헬스를, CleanupTimeout은 실패 시
+// 정리를 각각 상한하므로, 그 합 + slack이 lease를 넘지 않는 한 전체 dispatch가 lease 안에서 끝나
+// cleanup이 락 상실 뒤 실행되지 않는다(P4). ⚠️ 이 보증은 slack이 락 획득~dispatch 진입 + 단계
+// 경계 오버헤드를 덮는다는 전제 위에 선다(무한 보증이 아니라 예산 기반 — slack은 [구현 검증]).
+// 미달이면 오류(fail-closed). ⚠️ UNKNOWN(전환 이후 상태 불명)이 lease 만료까지만 유지되는 잔여는
+// 남는다(CD-3 "만료 ≠ 상태 복구" — 사람이 만료 전 개입한다).
 func leaseCoversDispatch(lease, phaseBudget, healthDeadline time.Duration) error {
+	// overflow 가드(H3) — 거대 duration이 덧셈을 음수로 뒤집어 검증을 우회하는 것을 막는다.
+	if phaseBudget <= 0 || phaseBudget > maxDispatchDuration || healthDeadline <= 0 || healthDeadline > maxDispatchDuration {
+		return fmt.Errorf("phaseBudget·healthDeadline은 (0, %s] 범위여야 한다(fail-closed · overflow 방지): phaseBudget=%s healthDeadline=%s", maxDispatchDuration, phaseBudget, healthDeadline)
+	}
 	min := phaseBudget + healthDeadline + deploy.CleanupTimeout + dispatchLeaseSlack
 	if lease < min {
 		return fmt.Errorf("배포 창 락 lease가 dispatch 소요를 덮지 못한다(fail-closed): lease=%s < phaseBudget(%s) + 헬스 deadline D(%s) + cleanup(%s) + slack(%s) = %s — lease를 늘리거나 phaseBudget·D를 줄여라(CD-3 하한식)", lease, phaseBudget, healthDeadline, deploy.CleanupTimeout, dispatchLeaseSlack, min)
