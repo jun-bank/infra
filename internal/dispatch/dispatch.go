@@ -102,7 +102,10 @@ func (c Config) argv(act Action, ref string) ([]string, error) {
 	case ActionUp:
 		// up은 green 프로젝트를 --no-build로 띄운다(호스트에 빌드 도구 없음 — DO-4/P1).
 		// 이미지 참조는 argv가 아니라 env 치환으로 주입한다(compose 파일이 ${env}를 읽는다).
-		return c.commandLine("docker", "compose", "-f", c.ComposeFile, "-p", c.Project, "up", "-d", "--no-build"), nil
+		// --remove-orphans: 이전 revision의 orphan을 제거한다(H2 임시 완화) — orphan이 pinned
+		// digest를 실행 중이면 app이 틀린 이미지여도 사후조건 ≥1-match를 가려 silent COMPLETED가
+		// 될 수 있다. 완전한 방어(배포 대상 app 서비스를 identity로 결박)는 후속 이슈다.
+		return c.commandLine("docker", "compose", "-f", c.ComposeFile, "-p", c.Project, "up", "-d", "--no-build", "--remove-orphans"), nil
 	case ActionDown:
 		// down은 green 프로젝트만 종료한다(-p 항상 포함 — Q2). --rmi 없음: 이미지를
 		// 지우지 않는다(RL-5 — 호스트 로컬 되돌림이 성립해야 한다).
@@ -313,6 +316,14 @@ func (e *Executor) inspectState(ctx context.Context, id string) (containerState,
 //     env 오타) 실패하며, 기대 참조를 error에 담는다.
 //
 // 뜬 컨테이너가 없거나(증명 불가)·조회 실패·부분기동·불일치면 오류다.
+//
+// ⚠️ [구현 검증]/후속 — H2·M1 잔여: 이 검사는 raw 프로젝트 컨테이너 집합을 보지 "이 배포의
+// 대상 app 서비스"를 identity로 결박하지 않는다. 그래서 ⑴ orphan/사이드카가 pinned digest를
+// 실행 중이면 app이 틀린 이미지여도 ≥1-match가 가려 silent COMPLETED가 될 수 있고(H2 — up의
+// --remove-orphans로 현실적 orphan 벡터는 완화했으나 완전 방어 아님), ⑵ 정상 종료하는 one-shot
+// init·정지 orphan을 부분기동으로 오탐할 수 있다(M1 — fail-closed). 완전 방어 = 배포 대상 app
+// 서비스를 명시(예: DEPLOY_APP_SERVICE)해 그 서비스만 digest 대조·상태 판정. 이는 호스트
+// compose 서비스 매핑(잔여-6/#19)과 얽혀 후속 이슈로 분리한다.
 func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error {
 	ids, err := e.projectContainerIDs(ctx)
 	if err != nil {
