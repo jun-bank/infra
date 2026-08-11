@@ -372,6 +372,42 @@ func TestJWKSConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
+// TestJWKSExpiredThrottledRejectsStale는 캐시가 TTL을 넘겨 만료됐는데 재페치가 storm
+// throttle 창 안이라 갱신되지 못할 때, known kid를 stale 키로 반환하지 않고 거절하는지
+// 못박는다(fail-open 방어 — TTL이 staleness 상한). 회전으로 철회됐을 수 있는 만료 키가
+// outage 동안 무기한 검증되면 인증 뿌리가 fail-open이다.
+func TestJWKSExpiredThrottledRejectsStale(t *testing.T) {
+	ts := newJWKSTestServer()
+	defer ts.close()
+	key := genKey(t)
+	ts.setKey("kid-1", &key.PublicKey)
+	clock := &advClock{t: time.Now()}
+	// TTL(1분) < minRefetch(1시간) — 만료됐지만 throttle 창 안인 상태를 만든다.
+	ks, err := NewHTTPKeySet(ts.srv.URL, time.Minute,
+		WithHTTPClient(ts.client()), WithClock(clock), WithMinRefetchInterval(time.Hour))
+	if err != nil {
+		t.Fatalf("NewHTTPKeySet 오류: %v", err)
+	}
+
+	// ⑴ 성공 경로 — 캐시 fresh면 known kid 통과.
+	if _, err := ks.VerificationKey(context.Background(), "kid-1"); err != nil {
+		t.Fatalf("fresh 캐시에서 kid-1 조회 실패: %v", err)
+	}
+
+	// ⑵ TTL 너머로 전진(만료) — 단 minRefetch 창 안(재페치 throttle).
+	clock.advance(2 * time.Minute)
+	_, err = ks.VerificationKey(context.Background(), "kid-1")
+	if !errors.Is(err, ErrJWKSStale) {
+		t.Fatalf("만료+throttle에서 stale 키를 거절하지 않았다: %v (ErrJWKSStale 기대)", err)
+	}
+
+	// ⑶ outage 회복 — minRefetch 창 밖으로 전진하면 재페치가 서고 다시 통과.
+	clock.advance(2 * time.Hour)
+	if _, err := ks.VerificationKey(context.Background(), "kid-1"); err != nil {
+		t.Fatalf("회복 후 재페치가 서지 않았다: %v", err)
+	}
+}
+
 // TestNewHTTPKeySetValidation은 생성 시 https·TTL 불변식을 못박는다(fail-closed 뿌리).
 func TestNewHTTPKeySetValidation(t *testing.T) {
 	for _, tc := range []struct {
