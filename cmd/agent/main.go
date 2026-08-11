@@ -295,37 +295,71 @@ func buildDispatcher() (deploy.Dispatcher, time.Duration, time.Duration, error) 
 		return nil, 0, 0, fmt.Errorf("특권 실행기 조립(sudo 프리픽스 검증 — fail-closed): %w", err)
 	}
 
-	healthDeadline := envDuration("DEPLOY_HEALTH_DEADLINE", defaultHealthDeadline)
-	phaseBudget := envDuration("DEPLOY_DISPATCH_PHASE_BUDGET", defaultDispatchPhaseBudget)
+	// P8: 헬스·phaseBudget 튜닝 env를 boot에서 파싱·검증한다(fail-fast). 설정됐으나 파싱
+	//     불가면 조용히 기본값으로 삼키지 않고 오류를 낸다 — 잘못된 튜닝이 런타임(Prober.Check)
+	//     까지 숨는 것을 막는다. Prober.Check의 런타임 검증은 그대로 두어(선행 방어선 이중화).
+	threshold, err := envInt("DEPLOY_HEALTH_SUCCESS_THRESHOLD", defaultHealthThreshold)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	interval, err := envDuration("DEPLOY_HEALTH_INTERVAL", defaultHealthInterval)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	timeout, err := envDuration("DEPLOY_HEALTH_TIMEOUT", defaultHealthTimeout)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	healthDeadline, err := envDuration("DEPLOY_HEALTH_DEADLINE", defaultHealthDeadline)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	phaseBudget, err := envDuration("DEPLOY_DISPATCH_PHASE_BUDGET", defaultDispatchPhaseBudget)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if threshold < 1 {
+		return nil, 0, 0, fmt.Errorf("DEPLOY_HEALTH_SUCCESS_THRESHOLD(N)는 1 이상이어야 한다(fail-closed): %d", threshold)
+	}
+	if interval <= 0 || timeout <= 0 || healthDeadline <= 0 || phaseBudget <= 0 {
+		return nil, 0, 0, fmt.Errorf("헬스 간격·타임아웃·deadline과 phaseBudget은 모두 >0 이어야 한다(fail-closed): interval=%s timeout=%s deadline=%s phaseBudget=%s", interval, timeout, healthDeadline, phaseBudget)
+	}
+
 	prober := dispatch.NewProber(dispatch.HealthConfig{
 		URL:              healthURL,
-		SuccessThreshold: envInt("DEPLOY_HEALTH_SUCCESS_THRESHOLD", defaultHealthThreshold),
-		Interval:         envDuration("DEPLOY_HEALTH_INTERVAL", defaultHealthInterval),
-		Timeout:          envDuration("DEPLOY_HEALTH_TIMEOUT", defaultHealthTimeout),
+		SuccessThreshold: threshold,
+		Interval:         interval,
+		Timeout:          timeout,
 		Deadline:         healthDeadline,
 	}, execr) // 재시작 검사 대상 컨테이너는 compose 프로젝트에서 파생한다(항상 켠다 — CD-1)
 
 	return deploy.LocalDispatcher{Exec: execr, Health: prober, Repos: repos, PhaseBudget: phaseBudget}, healthDeadline, phaseBudget, nil
 }
 
-// envInt는 env를 정수로 읽는다(부재·파싱 실패 시 def).
-func envInt(key string, def int) int {
-	if raw := os.Getenv(key); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			return n
-		}
+// envInt는 env를 정수로 읽는다. 부재 시 def, 설정됐으나 정수가 아니면 오류(무음 삼킴 금지 — P8).
+func envInt(key string, def int) (int, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def, nil
 	}
-	return def
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s 값이 정수가 아니다(fail-closed): %q", key, raw)
+	}
+	return n, nil
 }
 
-// envDuration은 env를 Go duration으로 읽는다(부재·파싱 실패 시 def).
-func envDuration(key string, def time.Duration) time.Duration {
-	if raw := os.Getenv(key); raw != "" {
-		if d, err := time.ParseDuration(raw); err == nil {
-			return d
-		}
+// envDuration은 env를 Go duration으로 읽는다. 부재 시 def, 설정됐으나 파싱 불가면 오류(P8).
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def, nil
 	}
-	return def
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s 값이 Go duration이 아니다(fail-closed): %q", key, raw)
+	}
+	return d, nil
 }
 
 // jwksScaffold는 게이트 2의 JWKS 공개키 페치 자리를 잡는 스캐폴드다(store 스캐폴드와

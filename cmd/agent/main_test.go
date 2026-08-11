@@ -43,6 +43,47 @@ func TestLeaseCoversDispatch(t *testing.T) {
 	}
 }
 
+// P8: 헬스·phaseBudget env가 설정됐으나 파싱 불가·범위 위반이면 boot에서 거부해야 한다
+// (fail-fast) — 조용히 기본값으로 삼켜 잘못된 튜닝이 런타임까지 숨는 것을 막는다.
+func setRequiredDispatchEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DEPLOY_COMPOSE_FILE", "/x/compose.yml")
+	t.Setenv("DEPLOY_COMPOSE_PROJECT", "core-green")
+	t.Setenv("DEPLOY_HEALTH_URL", "http://127.0.0.1:8080/ready")
+	t.Setenv("IMAGE_CORE", "registry.example/core")
+}
+
+func TestBuildDispatcherRejectsInvalidHealthEnv(t *testing.T) {
+	cases := []struct{ name, key, val string }{
+		{"비정수 N", "DEPLOY_HEALTH_SUCCESS_THRESHOLD", "abc"},
+		{"N<1", "DEPLOY_HEALTH_SUCCESS_THRESHOLD", "0"},
+		{"비duration interval", "DEPLOY_HEALTH_INTERVAL", "3x"},
+		{"음수 deadline", "DEPLOY_HEALTH_DEADLINE", "-1s"},
+		{"0 timeout", "DEPLOY_HEALTH_TIMEOUT", "0s"},
+		{"비duration phaseBudget", "DEPLOY_DISPATCH_PHASE_BUDGET", "nope"},
+		{"음수 phaseBudget", "DEPLOY_DISPATCH_PHASE_BUDGET", "-5s"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setRequiredDispatchEnv(t)
+			t.Setenv(c.key, c.val)
+			if _, _, _, err := buildDispatcher(); err == nil {
+				t.Fatalf("%s(%s=%q)인데 buildDispatcher 통과(boot fail-fast 위반)", c.name, c.key, c.val)
+			}
+		})
+	}
+}
+
+func TestBuildDispatcherAcceptsValidEnv(t *testing.T) {
+	setRequiredDispatchEnv(t)
+	t.Setenv("DEPLOY_HEALTH_SUCCESS_THRESHOLD", "3")
+	t.Setenv("DEPLOY_HEALTH_DEADLINE", "45s")
+	t.Setenv("DEPLOY_DISPATCH_PHASE_BUDGET", "90s")
+	if _, d, pb, err := buildDispatcher(); err != nil || d != 45*time.Second || pb != 90*time.Second {
+		t.Fatalf("정상 env: err=%v D=%s phaseBudget=%s, nil·45s·90s 기대", err, d, pb)
+	}
+}
+
 // TestResolveRole은 역할 해석의 fail-closed 계약을 다룬다: 유효 값은 통과하고,
 // 빈 값·미지원 값은 오류가 되어 기동을 막는다.
 func TestResolveRole(t *testing.T) {

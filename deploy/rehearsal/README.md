@@ -70,8 +70,9 @@ agent가 자동으로 하는 판정: baseline 재시작 횟수를 한 번 읽고
 green을 `down`해 **미전환**(net-0)으로 되돌린다(롤백 아님 — CD-4 ④).
 
 환경 변수로 튜닝(agent 기준): `DEPLOY_HEALTH_SUCCESS_THRESHOLD`(N)·`DEPLOY_HEALTH_INTERVAL`
-(T)·`DEPLOY_HEALTH_TIMEOUT`·`DEPLOY_HEALTH_DEADLINE`(D)·`DEPLOY_HEALTH_CONTAINER`. 기본값
-N=3·T=2s·timeout=3s·D=60s(모두 [구현 검증] CDV-1 — 리허설 실측으로 정한다).
+(T)·`DEPLOY_HEALTH_TIMEOUT`·`DEPLOY_HEALTH_DEADLINE`(D). 기본값 N=3·T=2s·timeout=3s·D=60s
+(모두 [구현 검증] CDV-1 — 리허설 실측으로 정한다). 재시작 검사 대상 컨테이너는 설정으로
+지정하지 않고 compose 프로젝트(`-p $PROJECT`)에서 파생한다 — 방어선은 항상 켜진다(CD-1).
 
 ### 4. down (green 프로젝트만 · 이미지는 남긴다 — RL-5)
 
