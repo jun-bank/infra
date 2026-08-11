@@ -14,14 +14,18 @@ import (
 
 // fakeExec는 HostExecutor 페이크다 — 호출 인자·횟수를 포착하고 설정된 오류를 낸다.
 type fakeExec struct {
-	pullRef string
-	upRef   string
-	pullErr error
-	upErr   error
-	downErr error
-	pulls   int
-	ups     int
-	downs   int
+	pullRef    string
+	upRef      string
+	verifyRef  string
+	pullErr    error
+	upErr      error
+	verifyErr  error
+	downErr    error
+	pulls      int
+	ups        int
+	verifies   int
+	downs      int
+	downCtxErr error // 마지막 Down에 넘어온 context의 Err()(취소된 ctx 재사용 감시 — O1).
 }
 
 func (f *fakeExec) Pull(_ context.Context, ref string) error {
@@ -34,8 +38,14 @@ func (f *fakeExec) Up(_ context.Context, ref string) error {
 	f.upRef = ref
 	return f.upErr
 }
-func (f *fakeExec) Down(context.Context) error {
+func (f *fakeExec) VerifyImageDigest(_ context.Context, ref string) error {
+	f.verifies++
+	f.verifyRef = ref
+	return f.verifyErr
+}
+func (f *fakeExec) Down(ctx context.Context) error {
 	f.downs++
+	f.downCtxErr = ctx.Err()
 	return f.downErr
 }
 
@@ -169,6 +179,64 @@ func TestDispatchHealthFailDownFailUnknown(t *testing.T) {
 	st, err := dispatch(t, x, fakeHealth{err: errors.New("헬스 실패")}, manifest(validDigest))
 	if st != StateUnknown || err == nil {
 		t.Fatalf("헬스 실패·down 실패: state=%v, UNKNOWN 기대", st)
+	}
+}
+
+// C2: up 후 이미지 대조 실패 + down 성공 = 미전환·net0 = UNEXECUTED(silent COMPLETED 차단).
+// 헬스는 통과하도록 두어, 대조가 없으면 엉뚱한 이미지가 COMPLETED로 위장함을 재현한다.
+func TestDispatchImageMismatchDownOK(t *testing.T) {
+	x := &fakeExec{verifyErr: errors.New("실행 이미지가 pinned digest와 불일치")}
+	st, err := dispatch(t, x, fakeHealth{}, manifest(validDigest))
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("이미지 불일치·down 성공: state=%v err=%v, UNEXECUTED·err 기대(silent COMPLETED 차단)", st, err)
+	}
+	if x.verifies != 1 {
+		t.Fatalf("이미지 대조 호출 = %d, 기대 1(up 후 헬스 전)", x.verifies)
+	}
+	if x.downs != 1 {
+		t.Fatalf("정리 down = %d, 기대 1", x.downs)
+	}
+	// 대조가 up 뒤·헬스 전이므로, 대조 실패 시 헬스는 부르지 않는다(down으로 미전환).
+}
+
+// C2: 이미지 대조 실패 + down 실패 = green 잔존 가능 = UNKNOWN.
+func TestDispatchImageMismatchDownFailUnknown(t *testing.T) {
+	x := &fakeExec{verifyErr: errors.New("불일치"), downErr: errors.New("down 실패")}
+	st, err := dispatch(t, x, fakeHealth{}, manifest(validDigest))
+	if st != StateUnknown || err == nil {
+		t.Fatalf("이미지 불일치·down 실패: state=%v, UNKNOWN 기대", st)
+	}
+}
+
+// C2: 정상 경로에서도 이미지 대조가 pinned 참조로 정확히 1회 호출된다.
+func TestDispatchVerifiesImageOnSuccess(t *testing.T) {
+	x := &fakeExec{}
+	st, err := dispatch(t, x, fakeHealth{}, manifest(validDigest))
+	if st != StateCompleted || err != nil {
+		t.Fatalf("정상 경로: state=%v err=%v, COMPLETED 기대", st, err)
+	}
+	wantRef := "registry.example/core@" + validDigest
+	if x.verifies != 1 || x.verifyRef != wantRef {
+		t.Fatalf("이미지 대조 verifies=%d ref=%q, 기대 1·%q", x.verifies, x.verifyRef, wantRef)
+	}
+}
+
+// O1: 요청 ctx가 취소돼도 정리 down은 detached ctx로 완주해야 한다(net-0 복원 성립).
+// 취소된 ctx로 up 실패 → 정리 down이 받은 ctx가 취소돼 있지 않음을 확인한다.
+func TestDispatchCleanupDownUsesDetachedCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 요청 ctx를 미리 취소한다.
+	x := &fakeExec{upErr: errors.New("up 실패")}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos()}
+	st, err := d.Dispatch(ctx, manifest(validDigest), store.FencingToken(1))
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("취소 ctx·up 실패·down 성공: state=%v, UNEXECUTED 기대(정리 완주)", st)
+	}
+	if x.downs != 1 {
+		t.Fatalf("정리 down = %d, 기대 1", x.downs)
+	}
+	if x.downCtxErr != nil {
+		t.Fatalf("정리 down이 취소된 ctx를 재사용함(Err=%v) — detached ctx여야 한다(O1)", x.downCtxErr)
 	}
 }
 

@@ -39,9 +39,11 @@ const digestPrefix = "sha256:"
 // digestHexLen은 sha256 digest의 hex 부분 길이다(256비트 = 64자 hex).
 const digestHexLen = 64
 
-// validSHA256Digest는 image 참조가 sha256: 접두 + 정확히 64자 hex인지 본다(DO-18 ⑵ —
-// 내용 주소 고정). 접두만 보고 통과시키면 sha256:abc·sha256:latest 같은 위조·오타가
+// validSHA256Digest는 image 참조가 sha256: 접두 + 정확히 64자 소문자 hex인지 본다(DO-18 ⑵
+// — 내용 주소 고정). 접두만 보고 통과시키면 sha256:abc·sha256:latest 같은 위조·오타가
 // digest로 위장해 실행 대상 고정이 무너지므로, 길이와 hex 문자 집합을 함께 강제한다.
+// OCI/Docker canonical digest는 소문자 hex만 쓴다(대문자는 canonical이 아니어서 pull
+// 참조로 재현되지 않을 수 있다) — 그래서 0-9a-f만 허용하고 대문자 A-F는 거부한다.
 func validSHA256Digest(d string) bool {
 	hex, ok := strings.CutPrefix(d, digestPrefix)
 	if !ok || len(hex) != digestHexLen {
@@ -49,7 +51,7 @@ func validSHA256Digest(d string) bool {
 	}
 	for _, c := range hex {
 		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
 		default:
 			return false
 		}

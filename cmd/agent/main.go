@@ -244,13 +244,16 @@ func buildDispatcher() (deploy.Dispatcher, error) {
 		return nil, errors.New("IMAGE_CORE·IMAGE_SETTLEMENT·IMAGE_LEDGER 중 최소 하나가 필요하다 (배포 대상 이미지 repo — fail-closed)")
 	}
 
-	execr := dispatch.NewExecutor(dispatch.Config{
+	execr, err := dispatch.NewExecutor(dispatch.Config{
 		SudoPrefix:   strings.Fields(os.Getenv("DEPLOY_SUDO_PREFIX")), // 공백 split · 비면 직접 실행
 		SudoPassword: os.Getenv("DEPLOY_SUDO_PASSWORD"),
 		ComposeFile:  composeFile,
 		Project:      project,
 		ImageEnvVar:  os.Getenv("DEPLOY_IMAGE_ENV"), // 비면 dispatch 기본(DEPLOY_IMAGE_REF)
 	})
+	if err != nil {
+		return nil, fmt.Errorf("특권 실행기 조립(sudo 프리픽스 검증 — fail-closed): %w", err)
+	}
 
 	prober := dispatch.NewProber(dispatch.HealthConfig{
 		URL:              healthURL,
