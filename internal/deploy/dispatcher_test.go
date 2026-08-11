@@ -15,19 +15,20 @@ import (
 
 // fakeExec는 HostExecutor 페이크다 — 호출 인자·횟수를 포착하고 설정된 오류를 낸다.
 type fakeExec struct {
-	pullRef    string
-	upRef      string
-	verifyRef  string
-	pullErr    error
-	upErr      error
-	verifyErr  error
-	downErr    error
-	pulls      int
-	ups        int
-	verifies   int
-	downs      int
-	downCtxErr error // 마지막 Down에 넘어온 context의 Err()(취소된 ctx 재사용 감시 — O1).
-	blockUp    bool  // true면 Up이 ctx.Done까지 블록하고 ctx.Err()를 낸다(phase budget 초과 재현).
+	pullRef     string
+	upRef       string
+	verifyRef   string
+	pullErr     error
+	upErr       error
+	verifyErr   error
+	downErr     error
+	pulls       int
+	ups         int
+	verifies    int
+	downs       int
+	downCtxErr  error // 마지막 Down에 넘어온 context의 Err()(취소된 ctx 재사용 감시 — O1).
+	blockUp     bool  // true면 Up이 ctx.Done까지 블록하고 ctx.Err()를 낸다(phase budget 초과 재현).
+	blockVerify bool  // true면 VerifyImageDigest가 ctx.Done까지 블록한다(phase budget이 verify를 상한하는지 — H1).
 }
 
 func (f *fakeExec) Pull(_ context.Context, ref string) error {
@@ -44,9 +45,13 @@ func (f *fakeExec) Up(ctx context.Context, ref string) error {
 	}
 	return f.upErr
 }
-func (f *fakeExec) VerifyImageDigest(_ context.Context, ref string) error {
+func (f *fakeExec) VerifyImageDigest(ctx context.Context, ref string) error {
 	f.verifies++
 	f.verifyRef = ref
+	if f.blockVerify {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return f.verifyErr
 }
 func (f *fakeExec) Down(ctx context.Context) error {
@@ -264,6 +269,27 @@ func TestDispatchPhaseBudgetTimeoutUpCleanup(t *testing.T) {
 	}
 	if x.downCtxErr != nil {
 		t.Fatalf("정리 down이 취소된 ctx를 재사용함(Err=%v) — detached ctx여야 한다", x.downCtxErr)
+	}
+}
+
+// H1: VerifyImageDigest도 phase budget으로 상한돼야 한다 — 느린 inspect가 lease를 넘기면
+// cleanup이 락 만료 뒤 실행될 여지가 생긴다. verify가 블록하면 phaseBudget이 취소해 실패로
+// 접히고, 정리 down은 detached ctx로 완주해야 한다.
+func TestDispatchPhaseBudgetTimeoutVerifyCleanup(t *testing.T) {
+	x := &fakeExec{blockVerify: true}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: 10 * time.Millisecond}
+	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
+	if err == nil || (st != StateUnexecuted && st != StateUnknown) {
+		t.Fatalf("phase budget 초과 verify: state=%v err=%v, UNEXECUTED/UNKNOWN 기대", st, err)
+	}
+	if x.verifies != 1 {
+		t.Fatalf("verify 호출 = %d, 기대 1", x.verifies)
+	}
+	if x.downs != 1 {
+		t.Fatalf("verify 상한 후 정리 down = %d, 기대 1", x.downs)
+	}
+	if x.downCtxErr != nil {
+		t.Fatalf("정리 down이 취소된 ctx 재사용(Err=%v) — detached여야 한다", x.downCtxErr)
 	}
 }
 

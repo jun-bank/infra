@@ -97,8 +97,11 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, _ store.Fenci
 	// m.ConfigVersion과 일치하는지 결박한다. 그 전까지 호스트 compose 파일은 신뢰 설정으로
 	// 취급된다(후속 이슈는 메인이 연다).
 
-	// pull+up 단계를 phase budget으로 감싼다(P3) — 상한 없는 pull/up이 lease 마진을 초과해
-	// 정상 배포 도중 락이 만료되는 것을 막는다. 초과 시 pull/up이 취소돼 실패로 접힌다.
+	// pull+up+무결성대조 단계를 phase budget으로 감싼다(P3·H1) — 상한 없는 pull/up/inspect가
+	// lease 마진을 초과해 정상 배포 도중 락이 만료되는 것을 막는다. 초과 시 그 단계가 취소돼
+	// 실패로 접힌다. ⚠️ VerifyImageDigest도 이 예산 안에서 돌려야(⑶) 하한식이 조건부가 아니라
+	// 구조적으로 성립한다 — 그러지 않으면 느린 docker inspect가 slack을 넘어 cleanup이 락
+	// 만료 뒤 실행될 여지가 생긴다(H1). 헬스는 자체 Deadline D로 상한된다.
 	phaseCtx, cancel := context.WithTimeout(ctx, d.PhaseBudget)
 	defer cancel()
 
@@ -118,7 +121,9 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, _ store.Fenci
 	// 3. 이미지 무결성 대조(DO-16 ⑶ 사후조건). up이 env 주입 없이 :latest·오타 이미지를
 	//    띄웠는데 헬스만 통과하면 엉뚱한 이미지가 COMPLETED로 위장한다 — 헬스 전에 실제 뜬
 	//    이미지가 pinned digest인지 증명한다. 불일치·조회 불가면 green을 정리하고 미전환.
-	if err := d.Exec.VerifyImageDigest(ctx, imageRef); err != nil {
+	//    phaseCtx로 상한해(H1) inspect 지연이 lease를 넘지 않게 한다 — 정리(cleanup)는 여전히
+	//    요청 ctx 기반 detached이므로 phase 취소와 무관하게 완주한다.
+	if err := d.Exec.VerifyImageDigest(phaseCtx, imageRef); err != nil {
 		return d.cleanupAfterFailure(ctx, "이미지 무결성 대조 실패", err)
 	}
 

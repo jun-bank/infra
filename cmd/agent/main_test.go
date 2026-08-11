@@ -52,6 +52,21 @@ func TestDefaultConfigLeaseCoversDispatch(t *testing.T) {
 	}
 }
 
+// H3: 거대 duration이 하한식 덧셈을 int64 overflow로 음수로 뒤집어 작은 lease가 검증을
+// 통과(fail-open)하면 안 된다. 상한(maxDispatchDuration)을 넘는 phaseBudget·healthDeadline은
+// 거부한다 — overflow 재현: 각각을 int64 최대의 절반 이상으로 두면 합이 음수가 된다.
+func TestLeaseCoversDispatchRejectsOverflow(t *testing.T) {
+	huge := time.Duration(1<<62) + time.Hour // maxDispatchDuration을 크게 넘고, 둘을 더하면 overflow
+	// 작은 lease인데도 overflow로 통과해선 안 된다(fail-closed).
+	if err := leaseCoversDispatch(time.Second, huge, huge); err == nil {
+		t.Fatalf("거대 phaseBudget·healthDeadline(overflow 유발)인데 작은 lease가 통과 — fail-open")
+	}
+	// 상한을 살짝 넘는 값도 거부.
+	if err := leaseCoversDispatch(24*time.Hour, maxDispatchDuration+time.Second, defaultHealthDeadline); err == nil {
+		t.Fatalf("phaseBudget이 상한 초과인데 통과 — fail-closed 위반")
+	}
+}
+
 // P8: 헬스·phaseBudget env가 설정됐으나 파싱 불가·범위 위반이면 boot에서 거부해야 한다
 // (fail-fast) — 조용히 기본값으로 삼켜 잘못된 튜닝이 런타임까지 숨는 것을 막는다.
 func setRequiredDispatchEnv(t *testing.T) {
