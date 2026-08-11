@@ -17,12 +17,11 @@ import (
 func TestObserveConsecutive(t *testing.T) {
 	h := &healthEval{threshold: 3}
 	for i, ok := range []bool{true, true} {
-		done, _, _ := h.observe(ok, 0, false)
-		if done {
+		if done, _ := h.observe(ok); done {
 			t.Fatalf("표본 %d에서 조기 종료", i)
 		}
 	}
-	done, healthy, _ := h.observe(true, 0, false)
+	done, healthy := h.observe(true)
 	if !done || !healthy {
 		t.Fatalf("연속 3회 후 done=%v healthy=%v, 통과 기대", done, healthy)
 	}
@@ -32,38 +31,12 @@ func TestObserveResetOnFail(t *testing.T) {
 	h := &healthEval{threshold: 3}
 	seq := []bool{true, true, false, true, true} // 실패가 연속을 리셋
 	for _, ok := range seq {
-		if done, _, _ := h.observe(ok, 0, false); done {
+		if done, _ := h.observe(ok); done {
 			t.Fatal("리셋 전 조기 통과")
 		}
 	}
-	if done, healthy, _ := h.observe(true, 0, false); !done || !healthy {
+	if done, healthy := h.observe(true); !done || !healthy {
 		t.Fatal("리셋 후 연속 3회 재달성 시 통과해야 한다")
-	}
-}
-
-// Q1: 재시작 횟수가 증가하면 2xx여도 즉시 FAIL(그린 위장 방어).
-func TestObserveRestartIncreaseFails(t *testing.T) {
-	h := &healthEval{threshold: 2}
-	if done, _, _ := h.observe(true, 0, true); done { // baseline=0, consec=1
-		t.Fatal("baseline 표본에서 조기 종료")
-	}
-	done, healthy, reason := h.observe(true, 1, true) // 재시작 증가
-	if !done || healthy {
-		t.Fatalf("재시작 증가인데 done=%v healthy=%v, FAIL 기대", done, healthy)
-	}
-	if !strings.Contains(reason, "재시작") {
-		t.Fatalf("사유에 재시작 언급 없음: %q", reason)
-	}
-}
-
-// Q1: baseline이 0이 아니어도 대기 중 불변이면 통과(==0 강제 아님).
-func TestObserveRestartStableNonZero(t *testing.T) {
-	h := &healthEval{threshold: 2}
-	if done, _, _ := h.observe(true, 3, true); done { // baseline=3
-		t.Fatal("조기 종료")
-	}
-	if done, healthy, _ := h.observe(true, 3, true); !done || !healthy {
-		t.Fatal("baseline 3 불변인데 통과 실패 — ==0 강제 오탐")
 	}
 }
 
@@ -88,9 +61,21 @@ func (f *fakeHTTP) Do(*http.Request) (*http.Response, error) {
 }
 
 type fakeRestart struct {
-	counts []int
-	i      int
-	err    error
+	counts     []int // 단일 컨테이너의 호출별 재시작 횟수(소진되면 마지막 반복)
+	i          int
+	err        error    // RestartCount 오류
+	containers []string // GreenContainers가 줄 컨테이너 목록(nil이면 기본 1개)
+	greenErr   error    // GreenContainers 오류
+}
+
+func (f *fakeRestart) GreenContainers(context.Context) ([]string, error) {
+	if f.greenErr != nil {
+		return nil, f.greenErr
+	}
+	if f.containers != nil {
+		return f.containers, nil
+	}
+	return []string{"core-green-app-1"}, nil
 }
 
 func (f *fakeRestart) RestartCount(context.Context, string) (int, error) {
@@ -112,7 +97,6 @@ func fastHealthCfg() HealthConfig {
 		Interval:         1 * time.Millisecond,
 		Timeout:          50 * time.Millisecond,
 		Deadline:         200 * time.Millisecond,
-		ContainerName:    "core-green-app-1",
 	}
 }
 
@@ -148,13 +132,61 @@ func TestCheckRestartReadErrorFails(t *testing.T) {
 	}
 }
 
-// ContainerName 미설정이면 재시작 검사를 생략하고 HTTP만으로 판정한다.
-func TestCheckNoContainerSkipsRestart(t *testing.T) {
+// C3: green 컨테이너를 확정하지 못하면 재시작 방어선이 성립하지 않는다 → fail-closed
+// (통과로 넘기지 않는다). 예전엔 ContainerName이 비면 검사를 통째로 생략했다.
+func TestCheckGreenContainersErrorFailsClosed(t *testing.T) {
+	p := &Prober{cfg: fastHealthCfg(), http: &fakeHTTP{codes: []int{200}}, restarts: &fakeRestart{greenErr: errors.New("ps -q 실패"), counts: []int{0}}}
+	if err := p.Check(context.Background()); err == nil {
+		t.Fatal("green 컨테이너 확정 실패인데 헬스 통과(판정 불가 = 실패여야 한다)")
+	}
+}
+
+// C3: green 컨테이너가 0개면 재시작 검사를 켤 수 없다 → fail-closed.
+func TestCheckNoGreenContainersFailsClosed(t *testing.T) {
+	p := &Prober{cfg: fastHealthCfg(), http: &fakeHTTP{codes: []int{200}}, restarts: &fakeRestart{containers: []string{}, counts: []int{0}}}
+	if err := p.Check(context.Background()); err == nil {
+		t.Fatal("green 컨테이너 0개인데 헬스 통과(재시작 검사 불가 = 실패여야 한다)")
+	}
+}
+
+// C3: 여러 컨테이너 중 하나라도 재시작하면(합 증가) 즉시 실패.
+func TestCheckMultiContainerRestartFails(t *testing.T) {
+	p := &Prober{
+		cfg:      fastHealthCfg(),
+		http:     &fakeHTTP{codes: []int{200}},
+		restarts: &fakeRestart{containers: []string{"a", "b"}, counts: []int{0, 0, 1}},
+	}
+	if err := p.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "재시작") {
+		t.Fatalf("다중 컨테이너 재시작 감지 실패: %v", err)
+	}
+}
+
+// C4: baseline을 프로브 루프 전에 읽어, threshold 도달 전이라도 첫 프로브 중 일어난
+// 재시작을 놓치지 않는다. threshold=1·counts=[0,1]: 예전엔 첫 표본(count0)으로 baseline을
+// 잡으며 동시에 consec=1로 통과해 재시작(count1)을 아예 못 봤다. 이제는 baseline(0)을
+// 먼저 고정하고 첫 프로브에서 1>0을 잡아 실패한다.
+func TestCheckBaselineReadBeforeFirstProbe(t *testing.T) {
 	cfg := fastHealthCfg()
-	cfg.ContainerName = ""
-	// restarts가 nil이어도 호출되지 않아야 한다.
-	p := &Prober{cfg: cfg, http: &fakeHTTP{codes: []int{200}}, restarts: nil}
-	if err := p.Check(context.Background()); err != nil {
-		t.Fatalf("컨테이너 미설정 정상 경로 실패: %v", err)
+	cfg.SuccessThreshold = 1
+	p := &Prober{cfg: cfg, http: &fakeHTTP{codes: []int{200}}, restarts: &fakeRestart{counts: []int{0, 1}}}
+	if err := p.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "재시작") {
+		t.Fatalf("첫 프로브 중 재시작을 놓침(baseline이 대기 시작에 안 잡힘): %v", err)
+	}
+}
+
+// O3: 0 이하 duration은 busy-loop·즉시 만료를 만든다 → 진입에서 거부한다.
+func TestCheckRejectsNonPositiveDurations(t *testing.T) {
+	for _, mut := range []func(*HealthConfig){
+		func(c *HealthConfig) { c.Interval = 0 },
+		func(c *HealthConfig) { c.Deadline = 0 },
+		func(c *HealthConfig) { c.Timeout = 0 },
+		func(c *HealthConfig) { c.Interval = -1 },
+	} {
+		cfg := fastHealthCfg()
+		mut(&cfg)
+		p := &Prober{cfg: cfg, http: &fakeHTTP{codes: []int{200}}, restarts: &fakeRestart{counts: []int{0}}}
+		if err := p.Check(context.Background()); err == nil {
+			t.Fatalf("0 이하 duration인데 통과: %+v", cfg)
+		}
 	}
 }

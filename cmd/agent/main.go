@@ -261,8 +261,7 @@ func buildDispatcher() (deploy.Dispatcher, error) {
 		Interval:         envDuration("DEPLOY_HEALTH_INTERVAL", defaultHealthInterval),
 		Timeout:          envDuration("DEPLOY_HEALTH_TIMEOUT", defaultHealthTimeout),
 		Deadline:         envDuration("DEPLOY_HEALTH_DEADLINE", defaultHealthDeadline),
-		ContainerName:    os.Getenv("DEPLOY_HEALTH_CONTAINER"), // 비면 재시작 검사 생략(권장: 설정)
-	}, execr)
+	}, execr) // 재시작 검사 대상 컨테이너는 compose 프로젝트에서 파생한다(항상 켠다 — CD-1)
 
 	return deploy.LocalDispatcher{Exec: execr, Health: prober, Repos: repos}, nil
 }
