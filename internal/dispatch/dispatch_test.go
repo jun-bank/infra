@@ -246,6 +246,12 @@ func TestValidateSudoPrefixRejectsMalicious(t *testing.T) {
 		{"doas", "-S"},                         // 첫 토큰이 sudo 아님
 		{"/bin/sh", "-c"},                      // 셸 직접
 		{"sudo", "/etc/x"},                     // 경로(플래그 아님)
+		{"sudo", "-Ss"},                        // P5: 결합 short flag(-S+-s 셸) — allowlist 밖
+		{"sudo", "-b"},                         // P5: 명령을 백그라운드로(완료판정과 실변이 분리)
+		{"sudo", "--background"},               // P5: -b 롱폼
+		{"sudo", "-p", "prompt"},               // P5: 미열거 플래그(+ 인자)
+		{"sudo", "-Sk"},                        // P5: 임의 결합 short flag
+		{"sudo", "-A"},                         // P5: 미열거 플래그(askpass)
 	}
 	for _, p := range bad {
 		if err := ValidateSudoPrefix(p); err == nil {
@@ -266,6 +272,9 @@ func TestValidateSudoPrefixAcceptsSafe(t *testing.T) {
 		{"sudo", "-S"},
 		{"sudo", "-S", "-k"},
 		{"sudo", "-n"},
+		{"sudo", "-S", "-k", "-n"},               // P5: 열거 허용 플래그 조합
+		{"sudo", "--stdin", "--reset-timestamp"}, // P5: 롱폼 허용
+		{"sudo", "--non-interactive"},            // P5: 롱폼 허용
 	}
 	for _, p := range good {
 		if err := ValidateSudoPrefix(p); err != nil {

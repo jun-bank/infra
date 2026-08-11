@@ -136,15 +136,24 @@ func NewExecutor(cfg Config) (*Executor, error) {
 	return &Executor{cfg: cfg, run: osExec}, nil
 }
 
+// allowedSudoFlags는 프리픽스에 허용되는 sudo 플래그의 닫힌 allowlist다(정확 토큰만).
+// 비대화 비밀번호 주입(-S)·타임스탬프 무효화(-k)·비대화 실패(-n)와 각 롱폼만 둔다 —
+// 이들은 명령을 백그라운드로 돌리거나 셸을 열지 않는다. 여기에 없는 것은 전부 거부한다.
+var allowedSudoFlags = map[string]bool{
+	"-S": true, "--stdin": true, // 비밀번호를 stdin에서 읽는다
+	"-k": true, "--reset-timestamp": true, // sudo 타임스탬프 무효화
+	"-n": true, "--non-interactive": true, // 프롬프트 없이 실패
+}
+
 // ValidateSudoPrefix는 sudo 프리픽스가 안전한 열거 형태인지 검증한다(DO-23 ⑴). 프리픽스는
-// 각 특권 명령 앞에 argv로 그대로 붙으므로, 여기서 자유도를 닫지 않으면 설정 값이
-// raw root shell을 열 수 있다(예: "sudo -S sh -c ..."). 규칙:
+// 각 특권 명령 앞에 argv로 그대로 붙으므로, 여기서 자유도를 닫지 않으면 설정 값이 raw root
+// shell을 열거나(예: "sudo -S sh -c ...") 명령을 백그라운드로 돌려 완료 판정과 실제 변이를
+// 분리(-b/--background)할 수 있다. 규칙(엄격 allowlist):
 //   - 비어 있으면 통과한다(프리픽스 없음 = docker 그룹 소속 직접 실행).
 //   - 첫 토큰은 정확히 "sudo" 여야 한다(다른 실행 파일 금지 — 임의 wrapper·셸 차단).
-//   - 나머지 토큰은 모두 "-" 로 시작하는 sudo 플래그여야 한다(예: -S·-k·-n). 명령·경로·
-//     셸·리다이렉트가 프리픽스에 끼어들 자리를 주지 않는다.
-//   - 어떤 토큰도 셸 메타문자·제어문자를 포함하지 않는다(sh·bash·-c·;·|·&·$·백틱·>·
-//     공백외 제어문자). sudo가 셸을 띄우는 형태(-c/-s/-i 포함)를 명시적으로 거부한다.
+//   - 나머지 토큰은 allowedSudoFlags에 속한 정확 토큰만 허용한다. 결합 short flag(-Ss·-Sk)·
+//     -b/--background·-s/-i/-c(셸)·-p(prompt)·askpass·미열거 플래그·셸 메타문자·경로·명령은
+//     전부 거부한다 — allowlist에 정확히 일치하지 않으면 통과하지 못한다.
 func ValidateSudoPrefix(prefix []string) error {
 	if len(prefix) == 0 {
 		return nil
@@ -152,36 +161,9 @@ func ValidateSudoPrefix(prefix []string) error {
 	if prefix[0] != "sudo" {
 		return fmt.Errorf("dispatch: sudo 프리픽스의 첫 토큰은 정확히 %q 여야 한다(raw shell·임의 wrapper 금지 — DO-23 ⑴): %q", "sudo", prefix[0])
 	}
-	for _, tok := range prefix {
-		if err := validSudoToken(tok); err != nil {
-			return err
-		}
-	}
 	for _, tok := range prefix[1:] {
-		if !strings.HasPrefix(tok, "-") {
-			return fmt.Errorf("dispatch: sudo 프리픽스의 뒤 토큰은 플래그(- 로 시작)만 허용한다(명령·경로·셸 금지 — DO-23 ⑴): %q", tok)
-		}
-		// 셸을 여는 sudo 플래그(-c 명령 실행 · -s/-i 셸)를 명시 거부한다.
-		switch tok {
-		case "-c", "--command", "-s", "--shell", "-i", "--login":
-			return fmt.Errorf("dispatch: sudo 프리픽스에 셸을 여는 플래그 금지(%q — DO-23 ⑴ raw shell)", tok)
-		}
-	}
-	return nil
-}
-
-// validSudoToken은 한 프리픽스 토큰에 셸 평가·제어문자 흔적이 없는지 본다.
-func validSudoToken(tok string) error {
-	switch tok {
-	case "sh", "bash", "zsh", "/bin/sh", "/bin/bash":
-		return fmt.Errorf("dispatch: sudo 프리픽스에 셸 실행 파일 금지(%q — DO-23 ⑴ raw shell)", tok)
-	}
-	if strings.ContainsAny(tok, ";|&$`><\\\"'*(){}[]") {
-		return fmt.Errorf("dispatch: sudo 프리픽스 토큰에 셸 메타문자 금지(%q — DO-23 ⑴)", tok)
-	}
-	for _, r := range tok {
-		if r != ' ' && r < 0x20 || r == 0x7f {
-			return fmt.Errorf("dispatch: sudo 프리픽스 토큰에 제어문자 금지(%q — DO-23 ⑴)", tok)
+		if !allowedSudoFlags[tok] {
+			return fmt.Errorf("dispatch: sudo 프리픽스 뒤 토큰은 명시 허용 플래그(-S·--stdin·-k·--reset-timestamp·-n·--non-interactive)만 정확 토큰으로 허용한다 — 결합 short flag·-b/--background·셸 플래그·경로·명령·미열거 플래그 전부 거부(DO-23 ⑴): %q", tok)
 		}
 	}
 	return nil
