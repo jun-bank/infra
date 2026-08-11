@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jun-bank/infra/internal/store"
 )
@@ -26,6 +27,7 @@ type fakeExec struct {
 	verifies   int
 	downs      int
 	downCtxErr error // 마지막 Down에 넘어온 context의 Err()(취소된 ctx 재사용 감시 — O1).
+	blockUp    bool  // true면 Up이 ctx.Done까지 블록하고 ctx.Err()를 낸다(phase budget 초과 재현).
 }
 
 func (f *fakeExec) Pull(_ context.Context, ref string) error {
@@ -33,9 +35,13 @@ func (f *fakeExec) Pull(_ context.Context, ref string) error {
 	f.pullRef = ref
 	return f.pullErr
 }
-func (f *fakeExec) Up(_ context.Context, ref string) error {
+func (f *fakeExec) Up(ctx context.Context, ref string) error {
 	f.ups++
 	f.upRef = ref
+	if f.blockUp {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return f.upErr
 }
 func (f *fakeExec) VerifyImageDigest(_ context.Context, ref string) error {
@@ -70,7 +76,7 @@ func repos() map[Target]string {
 
 func dispatch(t *testing.T, x *fakeExec, h fakeHealth, m Manifest) (RemoteState, error) {
 	t.Helper()
-	d := LocalDispatcher{Exec: x, Health: h, Repos: repos()}
+	d := LocalDispatcher{Exec: x, Health: h, Repos: repos(), PhaseBudget: time.Minute}
 	return d.Dispatch(context.Background(), m, store.FencingToken(1))
 }
 
@@ -93,7 +99,7 @@ func TestDispatchCompleted(t *testing.T) {
 // repo 미설정 = 부작용 0 = UNEXECUTED. pull도 부르지 않는다.
 func TestDispatchRepoMissing(t *testing.T) {
 	x := &fakeExec{}
-	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: map[Target]string{}}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: map[Target]string{}, PhaseBudget: time.Minute}
 	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
 	if st != StateUnexecuted || err == nil {
 		t.Fatalf("repo 미설정: state=%v err=%v, UNEXECUTED·err 기대", st, err)
@@ -227,7 +233,7 @@ func TestDispatchCleanupDownUsesDetachedCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 요청 ctx를 미리 취소한다.
 	x := &fakeExec{upErr: errors.New("up 실패")}
-	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos()}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: time.Minute}
 	st, err := d.Dispatch(ctx, manifest(validDigest), store.FencingToken(1))
 	if st != StateUnexecuted || err == nil {
 		t.Fatalf("취소 ctx·up 실패·down 성공: state=%v, UNEXECUTED 기대(정리 완주)", st)
@@ -237,6 +243,27 @@ func TestDispatchCleanupDownUsesDetachedCtx(t *testing.T) {
 	}
 	if x.downCtxErr != nil {
 		t.Fatalf("정리 down이 취소된 ctx를 재사용함(Err=%v) — detached ctx여야 한다(O1)", x.downCtxErr)
+	}
+}
+
+// P3: pull+up이 phase budget을 초과하면(느린 up) phaseCtx가 취소돼 up이 실패로 접히고,
+// 정리 down이 (요청 ctx가 아니라 detached로) 완주해 미전환·net0 = UNEXECUTED가 된다.
+// 이로써 상한 없는 up이 lease 마진을 무한정 넘겨 락이 만료되는 일이 구조적으로 막힌다.
+func TestDispatchPhaseBudgetTimeoutUpCleanup(t *testing.T) {
+	x := &fakeExec{blockUp: true}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: 10 * time.Millisecond}
+	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("phase budget 초과 up: state=%v err=%v, UNEXECUTED 기대(정리 완주)", st, err)
+	}
+	if x.ups != 1 {
+		t.Fatalf("up 호출 = %d, 기대 1", x.ups)
+	}
+	if x.downs != 1 {
+		t.Fatalf("phase budget 초과 후 정리 down = %d, 기대 1", x.downs)
+	}
+	if x.downCtxErr != nil {
+		t.Fatalf("정리 down이 취소된 ctx를 재사용함(Err=%v) — detached ctx여야 한다", x.downCtxErr)
 	}
 }
 

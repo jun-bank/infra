@@ -43,23 +43,32 @@ import (
 // 실측 값은 배포 시간과 함께 정해진다. store.MinLease(1초) 이상이어야 한다.
 const defaultDeployLease = 2 * time.Minute
 
-// dispatchLeaseMargin은 lease가 헬스 deadline D 위에 더 덮어야 하는 여유다 — pull(② 회수)
-// + up(③ 기동)의 실시간 소요를 감싼다(CD-3 하한식: 갱신 없으면 lease ≥ ②+③+④D...).
-// ⚠️ [구현 검증]: 실제 pull/up 소요와 함께 튜닝한다(기본 30s는 합리적 상한 가정).
-// 이 마일스톤 범위(pull+up+헬스)만 덮는다 — blue 종료·정지 창 등 뒤 단계는 범위 밖이다.
-const dispatchLeaseMargin = 30 * time.Second
+// defaultDispatchPhaseBudget은 pull+up 단계 상한 phaseBudget의 기본값이다(P3). ⚠️ [구현 검증]:
+// 실제 이미지 pull(회수)·compose up(기동) 소요와 함께 sizing한다 — 이미지 pull이 이 budget
+// 보다 오래 걸리면 배포가 실패한다(운영자가 이미지 크기에 맞게 조정 · CD-3 무갱신 하한 입력).
+const defaultDispatchPhaseBudget = 120 * time.Second
 
-// leaseCoversDispatch는 배포 창 락 lease가 dispatch 전 단계 소요를 덮는지 본다(CD-3 하한식).
-// dispatch가 실시간(pull+up+헬스 deadline D)이 되면서 dispatch 중 lease 갱신이 없으므로
-// (CD-3의 무갱신 모델을 채택 — lease 갱신 goroutine을 두지 않는다), lease가 dispatch보다
-// 짧으면 실행 도중 락이 만료돼 다른 주체가 stale 락을 회수한다(동시 배포·버전 스큐).
-// lease ≥ D + margin이 아니면 오류다. ⚠️ UNKNOWN(전환 이후 상태 불명)이 lease 만료까지만
-// 유지되는 잔여는 남는다(CD-3 "만료 ≠ 상태 복구" — 사람이 만료 전 개입한다). lease는 그
-// 개입 창을 벌 뿐, 만료 자체를 상태 복구로 삼지 않는다.
-func leaseCoversDispatch(lease, healthDeadline time.Duration) error {
-	min := healthDeadline + dispatchLeaseMargin
+// dispatchLeaseSlack은 lease 하한식의 여유 상수다 — 단계 경계 오버헤드(context 전환·조회
+// 왕복)를 흡수한다. ⚠️ [구현 검증]: 실측으로 조정한다(기본 10s는 합리 가정).
+const dispatchLeaseSlack = 10 * time.Second
+
+// leaseCoversDispatch는 배포 창 락 lease가 dispatch 전체 소요를 덮는지 본다(CD-3 하한식).
+// dispatch가 실시간이 되면서 dispatch 중 lease 갱신이 없으므로(CD-3 무갱신 모델을 채택 —
+// lease 갱신 goroutine을 두지 않는다), lease가 dispatch보다 짧으면 실행 도중 락이 만료돼
+// 다른 주체가 stale 락을 회수하고(P3 동시 배포·버전 스큐), 그때 A의 detached cleanup down이
+// fencing 없이 실행돼 B가 재획득·green up한 것을 철거한다(P4 O1 회귀). 그래서 하한을
+//
+//	lease ≥ phaseBudget(pull+up 상한) + healthDeadline D(헬스) + CleanupTimeout(실패 시 정리) + slack
+//
+// 으로 강화한다 — 이러면 전체 dispatch(pull+up ≤ phaseBudget, health ≤ D, 실패 시 cleanup ≤
+// CleanupTimeout)가 lease 안에 보증돼, cleanup이 락 상실 후 실행되는 일이 구조적으로 불가능
+// 하다(P4 닫힘). 미달이면 오류(fail-closed). ⚠️ UNKNOWN(전환 이후 상태 불명)이 lease 만료
+// 까지만 유지되는 잔여는 남는다(CD-3 "만료 ≠ 상태 복구" — 사람이 만료 전 개입한다). lease는
+// 그 개입 창을 벌 뿐, 만료 자체를 상태 복구로 삼지 않는다.
+func leaseCoversDispatch(lease, phaseBudget, healthDeadline time.Duration) error {
+	min := phaseBudget + healthDeadline + deploy.CleanupTimeout + dispatchLeaseSlack
 	if lease < min {
-		return fmt.Errorf("배포 창 락 lease가 dispatch 소요를 덮지 못한다(fail-closed): lease=%s < 헬스 deadline D(%s) + 마진(%s) = %s — lease를 늘리거나 D를 줄여라(CD-3 하한식)", lease, healthDeadline, dispatchLeaseMargin, min)
+		return fmt.Errorf("배포 창 락 lease가 dispatch 소요를 덮지 못한다(fail-closed): lease=%s < phaseBudget(%s) + 헬스 deadline D(%s) + cleanup(%s) + slack(%s) = %s — lease를 늘리거나 phaseBudget·D를 줄여라(CD-3 하한식)", lease, phaseBudget, healthDeadline, deploy.CleanupTimeout, dispatchLeaseSlack, min)
 	}
 	return nil
 }
@@ -215,16 +224,17 @@ func buildCoordinator(st *store.SQLStore) (deploy.Coordinator, error) {
 		lease = d
 	}
 
-	disp, healthDeadline, err := buildDispatcher()
+	disp, healthDeadline, phaseBudget, err := buildDispatcher()
 	if err != nil {
 		return nil, fmt.Errorf("실행 지점(dispatcher) 조립: %w", err)
 	}
 
-	// C5/C6: 배포 창 락 lease가 실시간 dispatch 소요(pull+up+헬스 deadline D)를 덮는지
-	//        시동 시 검증한다(CD-3 하한식 — 갱신을 두지 않으므로 lease ≥ 전 단계 소요 합).
-	//        미달이면 기동 거부(fail-closed) — lease가 dispatch보다 짧으면 실행 중 락이
-	//        만료돼 다른 배포/배치가 stale 락을 회수, 동시 배포·버전 스큐가 난다.
-	if err := leaseCoversDispatch(lease, healthDeadline); err != nil {
+	// C5/C6: 배포 창 락 lease가 실시간 dispatch 전체 소요(pull+up 상한 phaseBudget + 헬스
+	//        deadline D + 실패 시 cleanup)를 덮는지 시동 시 검증한다(CD-3 하한식 — 갱신을 두지
+	//        않으므로 lease ≥ 전 단계 소요 합). 미달이면 기동 거부(fail-closed) — lease가
+	//        dispatch보다 짧으면 실행 중 락이 만료돼 다른 배포/배치가 stale 락을 회수하고,
+	//        A의 cleanup down이 락 상실 후 B의 green을 철거한다(P3·P4).
+	if err := leaseCoversDispatch(lease, phaseBudget, healthDeadline); err != nil {
 		return nil, err
 	}
 
@@ -251,13 +261,13 @@ const (
 // 필수인 설정(compose 파일·프로젝트·준비성 URL·이미지 repo 최소 1개)이 없으면 오류를
 // 반환해 기동을 막는다(fail-closed — 배포를 수행할 수 없는 채로 수신을 열지 않는다,
 // DO-17 ⑷와 같은 축). sudo 프리픽스·비번은 선택이다(개발 머신은 비운다 — 직접 실행).
-// 반환하는 healthDeadline은 락 lease가 dispatch 소요를 덮는지 검증하는 입력이다(C5/C6).
-func buildDispatcher() (deploy.Dispatcher, time.Duration, error) {
+// 반환하는 healthDeadline·phaseBudget은 락 lease가 dispatch 소요를 덮는지 검증하는 입력이다(C5/C6).
+func buildDispatcher() (deploy.Dispatcher, time.Duration, time.Duration, error) {
 	composeFile := os.Getenv("DEPLOY_COMPOSE_FILE")
 	project := os.Getenv("DEPLOY_COMPOSE_PROJECT")
 	healthURL := os.Getenv("DEPLOY_HEALTH_URL")
 	if composeFile == "" || project == "" || healthURL == "" {
-		return nil, 0, errors.New("DEPLOY_COMPOSE_FILE·DEPLOY_COMPOSE_PROJECT·DEPLOY_HEALTH_URL 미설정 (배포 실행에 필수 — fail-closed)")
+		return nil, 0, 0, errors.New("DEPLOY_COMPOSE_FILE·DEPLOY_COMPOSE_PROJECT·DEPLOY_HEALTH_URL 미설정 (배포 실행에 필수 — fail-closed)")
 	}
 
 	repos := map[deploy.Target]string{}
@@ -271,7 +281,7 @@ func buildDispatcher() (deploy.Dispatcher, time.Duration, error) {
 		}
 	}
 	if len(repos) == 0 {
-		return nil, 0, errors.New("IMAGE_CORE·IMAGE_SETTLEMENT·IMAGE_LEDGER 중 최소 하나가 필요하다 (배포 대상 이미지 repo — fail-closed)")
+		return nil, 0, 0, errors.New("IMAGE_CORE·IMAGE_SETTLEMENT·IMAGE_LEDGER 중 최소 하나가 필요하다 (배포 대상 이미지 repo — fail-closed)")
 	}
 
 	execr, err := dispatch.NewExecutor(dispatch.Config{
@@ -282,10 +292,11 @@ func buildDispatcher() (deploy.Dispatcher, time.Duration, error) {
 		ImageEnvVar:  os.Getenv("DEPLOY_IMAGE_ENV"), // 비면 dispatch 기본(DEPLOY_IMAGE_REF)
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("특권 실행기 조립(sudo 프리픽스 검증 — fail-closed): %w", err)
+		return nil, 0, 0, fmt.Errorf("특권 실행기 조립(sudo 프리픽스 검증 — fail-closed): %w", err)
 	}
 
 	healthDeadline := envDuration("DEPLOY_HEALTH_DEADLINE", defaultHealthDeadline)
+	phaseBudget := envDuration("DEPLOY_DISPATCH_PHASE_BUDGET", defaultDispatchPhaseBudget)
 	prober := dispatch.NewProber(dispatch.HealthConfig{
 		URL:              healthURL,
 		SuccessThreshold: envInt("DEPLOY_HEALTH_SUCCESS_THRESHOLD", defaultHealthThreshold),
@@ -294,7 +305,7 @@ func buildDispatcher() (deploy.Dispatcher, time.Duration, error) {
 		Deadline:         healthDeadline,
 	}, execr) // 재시작 검사 대상 컨테이너는 compose 프로젝트에서 파생한다(항상 켠다 — CD-1)
 
-	return deploy.LocalDispatcher{Exec: execr, Health: prober, Repos: repos}, healthDeadline, nil
+	return deploy.LocalDispatcher{Exec: execr, Health: prober, Repos: repos, PhaseBudget: phaseBudget}, healthDeadline, phaseBudget, nil
 }
 
 // envInt는 env를 정수로 읽는다(부재·파싱 실패 시 def).
