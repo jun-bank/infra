@@ -8,11 +8,13 @@ import (
 	"github.com/jun-bank/infra/internal/store"
 )
 
-// cleanupTimeout은 실패 후 정리(down)에 쓰는 detached context의 상한이다. 정리 down은
+// CleanupTimeout은 실패 후 정리(down)에 쓰는 detached context의 상한이다. 정리 down은
 // 요청 ctx가 취소·타임아웃됐어도 완주해야 net-0 복원(미전환)이 성립하므로, 요청 ctx와
 // 분리한 context.WithoutCancel + 이 상한으로 실행한다(coordinator 락 해제와 같은 패턴).
+// exported — main이 배포 창 락 lease 하한식(lease ≥ phaseBudget + D + CleanupTimeout +
+// slack)의 입력으로 읽는다(cleanup이 락 안에서 완주하도록 보증 — P4).
 // ⚠️ [구현 검증]: 실제 compose down 소요와 함께 튜닝한다.
-const cleanupTimeout = 30 * time.Second
+const CleanupTimeout = 30 * time.Second
 
 // 실행 지점(#15 S2-3) — 검증되고 락을 보유한 manifest를 자기 호스트에서 실제로 실행한다.
 // 순서: 이미지 pull(digest 고정) → compose up(green) → CD-1 헬스 → RemoteState. 블루-그린
@@ -52,6 +54,11 @@ type LocalDispatcher struct {
 	// Repos는 Target별 이미지 repo다(env IMAGE_CORE/… 에서 조립). 이미지 참조는
 	// Repos[target] + "@" + manifest.ImageDigest 로 고정한다(DO-18 ⑵).
 	Repos map[Target]string
+	// PhaseBudget은 pull+up 단계의 상한이다(P3). 상한 없는 pull/up이 배포 창 락 lease
+	// 마진을 초과해 정상 배포 도중 락이 만료되는 것을 막는다 — 이 budget으로 pull·up을
+	// 감싸 초과 시 취소·실패시킨다. main이 lease ≥ PhaseBudget + D + CleanupTimeout +
+	// slack 을 시동 시 검증해 dispatch 전체가 락 안에 들어가도록 배선한다(P4).
+	PhaseBudget time.Duration
 }
 
 // 컴파일 타임 계약 확인 — LocalDispatcher는 Dispatcher다.
@@ -82,14 +89,29 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, _ store.Fenci
 	}
 	imageRef := repo + "@" + m.ImageDigest
 
+	// ⚠️ [구현 검증]/후속 — P2(DO-18 ⑴⑶ 갭): manifest의 ComposeRevision·ConfigVersion이
+	// 서명됐지만 아직 실행에 결박되지 않는다. 호스트의 compose 파일이 낡거나 변조된 revision
+	// 이어도 이미지 digest만 맞으면 COMPLETED가 난다("이미지만 되돌리면 되돌린 것이 아니다").
+	// 이번에 닫지 않는다(잔여-6 · DO-20 ⑶ — 호스트 compose provisioning·버전관리 방식이
+	// upstream 미확정). 그 방식이 확정되면 up 전에 호스트 compose가 m.ComposeRevision·
+	// m.ConfigVersion과 일치하는지 결박한다. 그 전까지 호스트 compose 파일은 신뢰 설정으로
+	// 취급된다(후속 이슈는 메인이 연다).
+
+	// pull+up 단계를 phase budget으로 감싼다(P3) — 상한 없는 pull/up이 lease 마진을 초과해
+	// 정상 배포 도중 락이 만료되는 것을 막는다. 초과 시 pull/up이 취소돼 실패로 접힌다.
+	phaseCtx, cancel := context.WithTimeout(ctx, d.PhaseBudget)
+	defer cancel()
+
 	// 1. 이미지 pull(digest 고정 — CD-4 ②). 실패 = 부작용 0(compose 미접촉) = UNEXECUTED.
-	if err := d.Exec.Pull(ctx, imageRef); err != nil {
+	if err := d.Exec.Pull(phaseCtx, imageRef); err != nil {
 		return StateUnexecuted, fmt.Errorf("이미지 pull 실패(부작용 0 · CD-4 ②): %w", err)
 	}
 
-	// 2. green 기동(compose up · CD-4 ③). 실패 시 부분 기동이 남을 수 있으므로 down으로
-	//    net-0 복원을 시도한다 — down 성공=미전환(UNEXECUTED), down 실패=green 잔존 가능(UNKNOWN).
-	if err := d.Exec.Up(ctx, imageRef); err != nil {
+	// 2. green 기동(compose up · CD-4 ③). 실패 시(phase budget 초과 포함) 부분 기동이 남을 수
+	//    있으므로 down으로 net-0 복원을 시도한다 — down 성공=미전환(UNEXECUTED), down 실패=
+	//    green 잔존 가능(UNKNOWN). cleanup은 요청 ctx로 넘겨 phase budget 취소와 무관하게
+	//    detached로 완주시킨다(아래 cleanupAfterFailure의 WithoutCancel).
+	if err := d.Exec.Up(phaseCtx, imageRef); err != nil {
 		return d.cleanupAfterFailure(ctx, "compose up 실패", err)
 	}
 
@@ -116,7 +138,7 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, _ store.Fenci
 // 복원 성립 — coordinator 락 해제와 같은 detached 패턴). down 성공=UNEXECUTED(net-0),
 // down 실패=green 잔존 가능(UNKNOWN).
 func (d LocalDispatcher) cleanupAfterFailure(ctx context.Context, stage string, cause error) (RemoteState, error) {
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), CleanupTimeout)
 	defer cancel()
 	if derr := d.Exec.Down(cctx); derr != nil {
 		return StateUnknown, fmt.Errorf("%s 후 정리(down)도 실패 — green 잔존 가능(UNKNOWN): 원인=%v · down=%v", stage, cause, derr)
