@@ -274,46 +274,99 @@ func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// containerImageRef는 한 컨테이너가 실제로 뜬 이미지 참조를 읽는다(docker inspect
-// {{.Config.Image}} — 부작용 없는 조회). {{.Config.Image}}는 컨테이너 생성에 쓰인 이미지
-// 참조(우리가 준 참조)를 준다 — green 프로젝트는 compose 파일이 image: ${env} 로 pinned
-// digest 참조를 읽어 뜨므로, 정상이면 <repo>@sha256:... 와 같아야 한다. ⚠️ [구현 검증]:
-// docker가 이 필드로 digest 참조를 그대로 돌려주는지(vs 정규화·image ID)는 리허설에서
-// 재확인한다 — 불일치 시 실제 값이 error에 담기므로 어떤 값이 오는지 즉시 드러난다.
-// {{.Image}}(config ID)는 manifest digest와 다른 해시라 직접 대조에 쓸 수 없다.
-func (e *Executor) containerImageRef(ctx context.Context, id string) (string, error) {
-	argv := e.cfg.commandLine("docker", "inspect", "-f", "{{.Config.Image}}", id)
+// projectContainerIDs는 green 프로젝트의 모든 컨테이너 ID를 준다(docker compose ps -a -q
+// — 부작용 없는 조회). ps -q(실행중만)와 달리 -a로 종료·실패 컨테이너까지 포함해, 사후조건
+// 판정이 부분기동(일부 서비스가 up 직후 종료)을 검출할 수 있게 한다(P1). 빈 목록은 오류가
+// 아니라 빈 슬라이스로 준다 — 판정은 호출자가 한다.
+func (e *Executor) projectContainerIDs(ctx context.Context) ([]string, error) {
+	argv := e.cfg.commandLine("docker", "compose", "-f", e.cfg.ComposeFile, "-p", e.cfg.Project, "ps", "-a", "-q")
 	out, err := e.run(ctx, argv, nil, e.stdin())
 	if err != nil {
-		return "", fmt.Errorf("dispatch: 컨테이너 이미지 조회 실패(inspect %s): %w", id, err)
+		return nil, fmt.Errorf("dispatch: 프로젝트 컨테이너 조회 실패(compose ps -a -q): %w", err)
 	}
-	return strings.TrimSpace(out), nil
+	var ids []string
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			ids = append(ids, s)
+		}
+	}
+	return ids, nil
 }
 
-// VerifyImageDigest는 green 프로젝트에 실제로 뜬 컨테이너들의 이미지가 pinned digest 참조
-// (imageRef = <repo>@sha256:...)와 일치하는지 inspect로 증명한다(DO-16 ⑶ 사후조건 —
-// "기대 digest의 컨테이너가 돌고 있다"). compose 파일이 image: :latest 거나 env 변수명
-// 오타면 엉뚱한 이미지가 떠도 헬스만으로는 잡지 못한다 — up 성공 직후·헬스 전에 실제 뜬
-// 이미지를 대조한다. 뜬 컨테이너가 없거나(증명 불가)·조회 실패·불일치면 오류이며, 불일치
-// 시 정확히 어떤 값이 왔는지(기대 vs 실제)를 error에 담는다.
+// containerState는 한 컨테이너의 실행 상태와 이미지 참조다(사후조건 판정 입력).
+type containerState struct {
+	id     string
+	status string // docker State.Status: running·exited·dead·created·restarting·paused
+	image  string // Config.Image — 컨테이너 생성에 쓰인 이미지 참조(우리가 준 참조)
+}
+
+func (s containerState) running() bool { return s.status == "running" }
+
+// inspectState는 한 컨테이너의 상태·이미지를 한 번의 inspect로 읽는다(부작용 없는 조회).
+// {{.State.Status}}로 실행중/종료를 구분하고, {{.Config.Image}}로 우리가 준 참조와 대조한다.
+// 상태·이미지 참조 모두 공백을 포함하지 않으므로 첫 공백으로 안전하게 가른다.
+// ⚠️ [구현 검증]: docker가 {{.Config.Image}}로 digest 참조를 그대로 돌려주는지(vs 정규화·
+// image ID)와 {{.State.Status}} 문자열 값은 리허설에서 재확인한다 — 불일치 시 실제 값이
+// 판정·error에 그대로 드러난다. {{.Image}}(config ID)는 manifest digest와 다른 해시라
+// 직접 대조에 쓸 수 없다.
+func (e *Executor) inspectState(ctx context.Context, id string) (containerState, error) {
+	argv := e.cfg.commandLine("docker", "inspect", "-f", "{{.State.Status}} {{.Config.Image}}", id)
+	out, err := e.run(ctx, argv, nil, e.stdin())
+	if err != nil {
+		return containerState{}, fmt.Errorf("dispatch: 컨테이너 상태 조회 실패(inspect %s): %w", id, err)
+	}
+	status, image, _ := strings.Cut(strings.TrimSpace(out), " ")
+	return containerState{id: id, status: strings.TrimSpace(status), image: strings.TrimSpace(image)}, nil
+}
+
+// VerifyImageDigest는 green 프로젝트의 사후조건을 증명한다(DO-16 ⑶ — "기대 digest의
+// 컨테이너가 돌고 있다"). 세 갈래로 본다:
+//   - P1 부분기동 검출: 프로젝트에 종료/실패(running이 아닌) 컨테이너가 있으면 실패한다 —
+//     up 직후 worker가 종료됐는데 app만 2xx면 부분기동인데도 COMPLETED로 위장하므로,
+//     기대 서비스가 전부 running일 때만 통과한다. ⚠️ 가정: compose가 정상 종료하는
+//     one-shot init 컨테이너를 쓰면 이 모델 밖이다(그 경우 그 서비스는 별도로 다뤄야 한다).
+//   - P6 이미지 대조: 실행중 컨테이너 중 ≥1개의 Config.Image가 pinned digest 참조와 같으면
+//     app이 그 digest로 떴음이 증명된다. 다른 이미지의 사이드카·orphan은 실패시키지 않는다
+//     (all-match 요구는 정상 배포를 오탐했다). 실행중 일치가 0개면(엉뚱 이미지 — :latest·
+//     env 오타) 실패하며, 기대 참조를 error에 담는다.
+//
+// 뜬 컨테이너가 없거나(증명 불가)·조회 실패·부분기동·불일치면 오류다.
 func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error {
-	ids, err := e.GreenContainers(ctx)
+	ids, err := e.projectContainerIDs(ctx)
 	if err != nil {
 		return fmt.Errorf("dispatch: 이미지 대조 불가(컨테이너 조회 실패): %w", err)
 	}
 	if len(ids) == 0 {
-		return fmt.Errorf("dispatch: green 컨테이너가 없다 — 이미지 대조로 pinned digest(%s) 실행을 증명할 수 없다", imageRef)
+		return fmt.Errorf("dispatch: green 컨테이너가 없다 — 사후조건으로 pinned digest(%s) 실행을 증명할 수 없다", imageRef)
 	}
+	var running []containerState
+	var stopped []string
 	for _, id := range ids {
-		got, gerr := e.containerImageRef(ctx, id)
+		st, gerr := e.inspectState(ctx, id)
 		if gerr != nil {
 			return fmt.Errorf("dispatch: 이미지 대조 불가: %w", gerr)
 		}
-		if got != imageRef {
-			return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치(컨테이너 %s) — 기대=%q 실제=%q", id, imageRef, got)
+		if st.running() {
+			running = append(running, st)
+		} else {
+			stopped = append(stopped, fmt.Sprintf("%s(%s)", st.id, st.status))
 		}
 	}
-	return nil
+	// P1: 종료/실패 컨테이너가 하나라도 있으면 부분기동 — 실패(silent COMPLETED 차단).
+	if len(stopped) > 0 {
+		return fmt.Errorf("dispatch: 부분기동 — 종료/실패 컨테이너가 있다(기대 서비스가 전부 running이어야 한다): %v", stopped)
+	}
+	// P6: 실행중 컨테이너 중 하나라도 pinned digest면 app이 그 digest로 떴음이 증명된다.
+	for _, st := range running {
+		if st.image == imageRef {
+			return nil
+		}
+	}
+	var got []string
+	for _, st := range running {
+		got = append(got, st.image)
+	}
+	return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치 — 실행중 컨테이너 중 기대=%q 일치 0개, 실제=%v", imageRef, got)
 }
 
 // osExec는 기본 러너다. argv[0]를 실행 파일로, 나머지를 인자 슬라이스로 넘겨 셸 해석을
