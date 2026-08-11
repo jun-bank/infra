@@ -482,6 +482,59 @@ func TestParseRSAPublicKeyExponent(t *testing.T) {
 	}
 }
 
+// TestJWKSRefetchCtxCancel은 single-flight 슬롯을 기다리는 goroutine이 요청 ctx 취소에
+// 즉시 반응해 ctx 오류로 빠져나오는지 못박는다(느린 페치 뒤에서 무한 대기하지 않게).
+func TestJWKSRefetchCtxCancel(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once, relOnce sync.Once
+	releaseFn := func() { relOnce.Do(func() { close(release) }) }
+	key := genKey(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wellKnownPath {
+			once.Do(func() { close(entered); <-release }) // 첫 페치를 붙잡아 in-flight 유지
+			_ = json.NewEncoder(w).Encode(discoveryDoc{JwksURI: srv.URL + "/jwks"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(jwkSet{Keys: []jwk{rsaToJWK("kid-1", &key.PublicKey)}})
+	}))
+	defer srv.Close()
+	// 실패(t.Fatal)로 아래 close(release)를 건너뛰더라도 g1을 풀어 srv.Close() 교착을
+	// 막는다(defer LIFO — releaseFn이 srv.Close보다 먼저 실행된다).
+	defer releaseFn()
+
+	ks, err := NewHTTPKeySet(srv.URL, 10*time.Minute,
+		WithHTTPClient(srv.Client()), WithClock(&advClock{t: time.Now()}))
+	if err != nil {
+		t.Fatalf("NewHTTPKeySet 오류: %v", err)
+	}
+
+	// g1 — 느린 페치를 붙잡아 single-flight 슬롯을 점유한다.
+	g1done := make(chan struct{})
+	go func() { _, _ = ks.VerificationKey(context.Background(), "kid-1"); close(g1done) }()
+	<-entered
+
+	// g2 — 슬롯 대기 중 ctx 취소 → 즉시 ctx 오류로 빠져나와야 한다.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	g2err := make(chan error, 1)
+	go func() { _, e := ks.VerificationKey(ctx2, "kid-2"); g2err <- e }()
+	time.Sleep(50 * time.Millisecond) // g2가 슬롯 대기에 들도록 양보
+	cancel2()
+
+	select {
+	case e := <-g2err:
+		if !errors.Is(e, context.Canceled) {
+			t.Fatalf("대기 중 ctx 취소가 반영되지 않았다: %v (context.Canceled 기대)", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx 취소된 g2가 느린 페치 뒤에서 빠져나오지 못했다 (블록)")
+	}
+
+	releaseFn()
+	<-g1done
+}
+
 // TestNewHTTPKeySetValidation은 생성 시 https·TTL 불변식을 못박는다(fail-closed 뿌리).
 func TestNewHTTPKeySetValidation(t *testing.T) {
 	for _, tc := range []struct {

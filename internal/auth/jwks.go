@@ -80,9 +80,11 @@ type httpKeySet struct {
 	httpClient *http.Client
 	clock      Clock
 
-	// fetchMu는 네트워크 페치를 직렬화한다(single-flight) — 동시 미지 kid가 각자 페치를
-	// 내보내지 않게. 데이터 락(mu)과 분리해, 네트워크 대기 중 캐시 조회가 막히지 않는다.
-	fetchMu sync.Mutex
+	// fetchSem은 네트워크 페치를 직렬화하는 버퍼1 세마포어다(single-flight) — 동시 미지
+	// kid가 각자 페치를 내보내지 않게. 슬롯을 select로 획득해 대기 중 요청 ctx 취소에
+	// 즉시 반응한다(mutex.Lock은 ctx를 못 본다). 데이터 락(mu)과 분리해, 네트워크 대기
+	// 중 캐시 조회가 막히지 않는다.
+	fetchSem chan struct{}
 
 	mu          sync.Mutex
 	keys        map[string]*rsa.PublicKey // kid → 공개키(마지막 성공 페치 결과)
@@ -125,6 +127,7 @@ func NewHTTPKeySet(issuer string, ttl time.Duration, opts ...HTTPKeySetOption) (
 		httpClient: &http.Client{Timeout: defaultHTTPTimeout},
 		clock:      SystemClock{},
 		keys:       map[string]*rsa.PublicKey{},
+		fetchSem:   make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(ks)
@@ -206,8 +209,14 @@ func (ks *httpKeySet) cachedFresh(kid string) (*rsa.PublicKey, bool) {
 // 호출이 각자 네트워크를 내보내지 않게 하고, minRefetch로 시도 빈도를 제한한다(fetch
 // storm 방지). 대기 중 다른 goroutine이 방금 시도했으면 재조회로 넘어간다.
 func (ks *httpKeySet) refetch(ctx context.Context) error {
-	ks.fetchMu.Lock()
-	defer ks.fetchMu.Unlock()
+	// single-flight 슬롯을 select로 획득한다 — 앞선 페치가 느려 대기하는 동안 요청 ctx가
+	// 취소되면 즉시 빠져나온다(mutex.Lock은 ctx 취소를 못 본다). 슬롯 획득 후 반납은 defer.
+	select {
+	case ks.fetchSem <- struct{}{}:
+		defer func() { <-ks.fetchSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	// 이중 확인: fetchMu를 기다리는 동안 다른 goroutine이 방금 시도했다면(그 사이 minRefetch
 	// 안이면) 다시 두드리지 않는다 — 캐시는 그 시도 결과를 이미 반영한다.
