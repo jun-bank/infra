@@ -40,8 +40,10 @@ import (
 
 // defaultDeployLease는 배포 창 락의 기본 lease다(AGENT_DEPLOY_LEASE로 덮어쓴다). ⚠️ 이
 // 값은 [구현 검증]이다 — 한 배포 시퀀스를 넉넉히 덮으면서 죽은 주체를 오래 붙들지 않는
-// 실측 값은 배포 시간과 함께 정해진다. store.MinLease(1초) 이상이어야 한다.
-const defaultDeployLease = 2 * time.Minute
+// 실측 값은 배포 시간과 함께 정해진다. store.MinLease(1초) 이상이어야 하고, 기본 설정끼리
+// leaseCoversDispatch를 통과해야 한다(기본 phaseBudget 120s + D 60s + cleanup 30s + slack
+// 10s = 220s 하한 — TestDefaultConfigLeaseCoversDispatch가 이 정합성을 지킨다).
+const defaultDeployLease = 4 * time.Minute
 
 // defaultDispatchPhaseBudget은 pull+up 단계 상한 phaseBudget의 기본값이다(P3). ⚠️ [구현 검증]:
 // 실제 이미지 pull(회수)·compose up(기동) 소요와 함께 sizing한다 — 이미지 pull이 이 budget
