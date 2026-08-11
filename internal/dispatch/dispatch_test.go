@@ -277,15 +277,16 @@ func TestValidateSudoPrefixAcceptsSafe(t *testing.T) {
 	}
 }
 
-// --- C2: 이미지 무결성 대조 ----------------------------------------------------
+// --- C2/P1/P6: 이미지 무결성 대조 + 부분기동 검출 -------------------------------
 
 // scriptRunner는 argv에 특정 부분문자열이 있으면 그에 매핑된 출력을 돌려주는 페이크다.
-// GreenContainers(ps -q)와 containerImageRef(inspect)가 서로 다른 명령이라 last-call만
+// projectContainerIDs(ps -a -q)와 inspectState(inspect)가 서로 다른 명령이라 last-call만
 // 잡는 captureRunner로는 검증할 수 없어, 명령별 응답을 스크립트한다(부작용 0).
+// state[id] = "{{.State.Status}} {{.Config.Image}}" 한 줄(예: "running repo@sha256:...").
 type scriptRunner struct {
-	psOut      string            // compose ps -q 출력(줄바꿈 구분 컨테이너 ID)
+	psOut      string            // compose ps -a -q 출력(줄바꿈 구분 컨테이너 ID)
 	psErr      error             // ps 오류
-	inspectOut map[string]string // 컨테이너 ID → {{.Config.Image}} 출력
+	state      map[string]string // 컨테이너 ID → "<status> <image>" inspect 출력
 	inspectErr error
 }
 
@@ -299,40 +300,71 @@ func (s *scriptRunner) fn() runnerFunc {
 				return "", s.inspectErr
 			}
 			id := argv[len(argv)-1] // inspect ... <id>
-			return s.inspectOut[id], nil
+			return s.state[id], nil
 		}
 		return "", nil
 	}
 }
 
+func running(image string) string { return "running " + image }
+
+// 실행중 컨테이너가 모두 pinned digest면 통과.
 func TestVerifyImageDigestMatch(t *testing.T) {
 	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
-	s := &scriptRunner{psOut: "c1\nc2\n", inspectOut: map[string]string{"c1": ref, "c2": ref}}
+	s := &scriptRunner{psOut: "c1\nc2\n", state: map[string]string{"c1": running(ref), "c2": running(ref)}}
 	e := &Executor{cfg: baseCfg, run: s.fn()}
 	if err := e.VerifyImageDigest(context.Background(), ref); err != nil {
 		t.Fatalf("일치인데 대조 실패: %v", err)
 	}
 }
 
-func TestVerifyImageDigestMismatchNamesValue(t *testing.T) {
+// P6: 사이드카(다른 이미지)가 함께 떠 있어도, 실행중 ≥1개가 pinned digest면 통과한다
+// (all-match 요구는 정상 배포를 오탐했다 — 사이드카·orphan을 실패시키지 않는다).
+func TestVerifyImageDigestSidecarPasses(t *testing.T) {
 	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
-	wrong := "registry.example/core:latest"
-	s := &scriptRunner{psOut: "c1\n", inspectOut: map[string]string{"c1": wrong}}
+	sidecar := "prom/node-exporter@sha256:" + strings.Repeat("b", 64)
+	s := &scriptRunner{psOut: "app\nside\n", state: map[string]string{"app": running(ref), "side": running(sidecar)}}
+	e := &Executor{cfg: baseCfg, run: s.fn()}
+	if err := e.VerifyImageDigest(context.Background(), ref); err != nil {
+		t.Fatalf("app이 pinned digest로 떴는데 사이드카 때문에 대조 실패: %v", err)
+	}
+}
+
+// P1: 부분기동 — 프로젝트에 종료(exited) 컨테이너가 있으면 app이 pinned로 떠 있어도 실패
+// (worker가 up 직후 종료됐는데 app 2xx면 COMPLETED로 위장하는 silent 부분기동 차단).
+func TestVerifyImageDigestPartialBootFails(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "app\nworker\n", state: map[string]string{"app": running(ref), "worker": "exited " + ref}}
 	e := &Executor{cfg: baseCfg, run: s.fn()}
 	err := e.VerifyImageDigest(context.Background(), ref)
 	if err == nil {
-		t.Fatal("이미지 불일치인데 오류 없음(silent COMPLETED 위험)")
+		t.Fatal("worker 종료(부분기동)인데 대조 통과(silent COMPLETED 위험)")
 	}
-	// 정확히 어떤 값이 왔는지 error에 담아야 한다(기대·실제 둘 다).
-	if !strings.Contains(err.Error(), wrong) || !strings.Contains(err.Error(), ref) {
-		t.Fatalf("오류에 기대·실제 값이 없음: %v", err)
+	if !strings.Contains(err.Error(), "worker") && !strings.Contains(err.Error(), "exited") {
+		t.Fatalf("부분기동 오류에 종료 컨테이너 정보가 없음: %v", err)
+	}
+}
+
+// P6: 실행중 컨테이너 중 pinned digest 일치가 0개면(엉뚱 이미지 — :latest·오타) 실패.
+func TestVerifyImageDigestWrongImageFails(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	wrong := "registry.example/core:latest"
+	s := &scriptRunner{psOut: "c1\n", state: map[string]string{"c1": running(wrong)}}
+	e := &Executor{cfg: baseCfg, run: s.fn()}
+	err := e.VerifyImageDigest(context.Background(), ref)
+	if err == nil {
+		t.Fatal("실행 이미지가 pinned digest와 불일치인데 오류 없음(silent COMPLETED 위험)")
+	}
+	// 기대 pinned 참조를 오류에 담아야 한다(어떤 값이 떠야 했는지).
+	if !strings.Contains(err.Error(), ref) {
+		t.Fatalf("오류에 기대 pinned 참조가 없음: %v", err)
 	}
 }
 
 // 뜬 컨테이너가 없으면 pinned digest 실행을 증명할 수 없다 → 오류(fail-closed).
 func TestVerifyImageDigestNoContainers(t *testing.T) {
 	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
-	s := &scriptRunner{psOut: "\n", inspectOut: map[string]string{}}
+	s := &scriptRunner{psOut: "\n", state: map[string]string{}}
 	e := &Executor{cfg: baseCfg, run: s.fn()}
 	if err := e.VerifyImageDigest(context.Background(), ref); err == nil {
 		t.Fatal("컨테이너 0개인데 대조 통과(증명 불가 = 오류여야 한다)")
