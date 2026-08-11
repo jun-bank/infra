@@ -408,6 +408,42 @@ func TestJWKSExpiredThrottledRejectsStale(t *testing.T) {
 	}
 }
 
+// TestJWKSRejectsHTTPSDowngradeRedirect는 https discovery가 http로 302 리다이렉트할 때
+// 따라가지 않고 거절하는지 못박는다(정적 문자열 검사만으론 실제 전송 scheme을 못 막는다 —
+// CheckRedirect가 각 hop scheme을 강제해야 한다). 주입된 클라이언트에도 적용됨을 확인한다.
+func TestJWKSRejectsHTTPSDowngradeRedirect(t *testing.T) {
+	// 평문(http) 공격 서버 — 유효한 JWK Set을 서빙한다. 다운그레이드가 실제로 성공할 수
+	// 있는 상황을 만들어(따라가면 err==nil로 키를 얻는다), 거절이 unreachable이 아니라
+	// scheme 강제 때문임을 못박는다.
+	attacker := genKey(t)
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		set := jwkSet{Keys: []jwk{rsaToJWK("kid-1", &attacker.PublicKey)}}
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	defer plain.Close()
+
+	// https discovery — jwks_uri는 https(자기 자신)지만 그 /jwks가 http로 302한다.
+	var tls *httptest.Server
+	tls = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wellKnownPath {
+			_ = json.NewEncoder(w).Encode(discoveryDoc{JwksURI: tls.URL + "/jwks"})
+			return
+		}
+		http.Redirect(w, r, plain.URL, http.StatusFound) // https → http 다운그레이드
+	}))
+	defer tls.Close()
+
+	clock := &advClock{t: time.Now()}
+	ks, err := NewHTTPKeySet(tls.URL, 10*time.Minute,
+		WithHTTPClient(tls.Client()), WithClock(clock))
+	if err != nil {
+		t.Fatalf("NewHTTPKeySet 오류: %v", err)
+	}
+	if _, err := ks.VerificationKey(context.Background(), "kid-1"); err == nil {
+		t.Fatal("http 다운그레이드 리다이렉트를 따라가 공격 키를 받았다 (거절 기대 — MITM 방어)")
+	}
+}
+
 // TestNewHTTPKeySetValidation은 생성 시 https·TTL 불변식을 못박는다(fail-closed 뿌리).
 func TestNewHTTPKeySetValidation(t *testing.T) {
 	for _, tc := range []struct {

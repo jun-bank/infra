@@ -127,7 +127,27 @@ func NewHTTPKeySet(issuer string, ttl time.Duration, opts ...HTTPKeySetOption) (
 	for _, o := range opts {
 		o(ks)
 	}
+	// 리다이렉트 각 hop의 scheme을 https로 강제한다 — 정적 문자열 검사(requireHTTPS)만으론
+	// https discovery/jwks_uri가 302로 http(또는 공격자 https)로 다운그레이드하는 것을 못
+	// 막는다. 주입된 클라이언트(WithHTTPClient)에도 반드시 걸리도록 조립 지점에서 강제하되,
+	// http.Client를 값 복사해 호출자의 클라이언트에 부작용을 주지 않는다.
+	c := *ks.httpClient
+	c.CheckRedirect = checkHTTPSRedirect
+	ks.httpClient = &c
 	return ks, nil
+}
+
+// checkHTTPSRedirect는 리다이렉트 각 hop이 https가 아니면 거절한다(평문·다운그레이드 차단 ·
+// MITM 방어). CheckRedirect를 지정하면 http.Client 기본 10-hop 상한이 사라지므로 여기서
+// 함께 건다(무한 리다이렉트 방어).
+func checkHTTPSRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("auth: 리다이렉트가 10 hop을 넘었다 (fail-closed)")
+	}
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("auth: 리다이렉트가 https가 아니다 (평문 다운그레이드 거절 · MITM 방어): scheme=%q", req.URL.Scheme)
+	}
+	return nil
 }
 
 // VerificationKey는 kid에 해당하는 RSA 공개키를 반환한다(KeySet 계약). 빈 kid는 페치
