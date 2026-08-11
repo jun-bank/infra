@@ -71,7 +71,7 @@ var ErrJWKSStale = errors.New("auth: JWKS 캐시가 만료됐고 재페치가 �
 
 // httpKeySet은 발급자 JWKS를 HTTPS로 페치·캐시하는 KeySet 구현이다. kid → RSA 공개키
 // 맵을 캐시하고, 미지 kid나 TTL 만료 시 재페치해 키 회전을 따라간다. 동시 호출에
-// 안전하며(mu), 재페치는 한 번에 하나만 나가고(fetchMu — single-flight) 최소 간격으로
+// 안전하며(mu), 재페치는 한 번에 하나만 나가고(fetchSem — single-flight) 최소 간격으로
 // 제한된다(minRefetch — fetch storm 방지).
 type httpKeySet struct {
 	issuer     string        // OIDC_ISSUER — discovery base(https 강제, 뒤 슬래시 정규화)
@@ -205,7 +205,7 @@ func (ks *httpKeySet) cachedFresh(kid string) (*rsa.PublicKey, bool) {
 	return key, ok
 }
 
-// refetch는 JWKS를 다시 페치해 캐시를 교체한다. fetchMu로 직렬화해(single-flight) 동시
+// refetch는 JWKS를 다시 페치해 캐시를 교체한다. fetchSem으로 직렬화해(single-flight) 동시
 // 호출이 각자 네트워크를 내보내지 않게 하고, minRefetch로 시도 빈도를 제한한다(fetch
 // storm 방지). 대기 중 다른 goroutine이 방금 시도했으면 재조회로 넘어간다.
 func (ks *httpKeySet) refetch(ctx context.Context) error {
@@ -218,8 +218,15 @@ func (ks *httpKeySet) refetch(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// 이중 확인: fetchMu를 기다리는 동안 다른 goroutine이 방금 시도했다면(그 사이 minRefetch
+	// 이중 확인: 세마포어를 기다리는 동안 다른 goroutine이 방금 시도했다면(그 사이 minRefetch
 	// 안이면) 다시 두드리지 않는다 — 캐시는 그 시도 결과를 이미 반영한다.
+	//
+	// F3 대가: minRefetch 창 동안 발급자가 회전한 "새 kid"는 이 창이 지나기 전까지 최대
+	// minRefetch만큼 거절된다. 이는 fail-open이 아니라 storm 방지의 가용성 대가다 — 미확인
+	// 키를 통과시키는 게 아니라 아직 못 집은 키를 잠깐 거절할 뿐이다(fail-closed). GitHub
+	// Actions OIDC는 키를 겹쳐(overlap) 회전해 옛 kid와 새 kid가 한동안 공존하므로, 이 짧은
+	// 창은 실무상 수용된다. minRefetch·ttl은 둘 다 [구현 검증] 값이다(defaultMinRefetchInterval
+	// 상수 · main.go defaultJWKSCacheTTL — 발급자 회전 주기와 함께 sizing).
 	ks.mu.Lock()
 	now := ks.clock.Now()
 	if !ks.lastAttempt.IsZero() && now.Sub(ks.lastAttempt) < ks.minRefetch {
