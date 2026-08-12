@@ -411,13 +411,30 @@ func buildDispatcher() (dispatcherBuild, error) {
 	healthURL := os.Getenv("DEPLOY_HEALTH_URL")
 	gatewayURL := os.Getenv("DEPLOY_GATEWAY_URL")
 
+	// #21 — 사후조건 identity 결박: 이 배포의 대상 app compose 서비스명. 사후조건(이미지
+	// 대조·부분기동)과 CD-1 재시작 검사가 이 서비스의 컨테이너만 본다.
+	//   - 블루-그린 모드(게이트웨이 설정)에서는 **필수**다. 그 모드에서 결박 없이 판정하면
+	//     사이드카가 pinned digest를 실행 중일 때 app이 틀린 이미지여도 통과하고(H2 fail-open),
+	//     그 위로 라우트가 전환된다 — 잘못된 이미지에 트래픽을 얹는 경로라 기동을 거부한다.
+	//   - 단일 경로 모드에서는 선택이다(하위호환 — 미설정이면 프로젝트 전체 판정 그대로).
+	//     조용히 약한 판정으로 도는 것을 막기 위해 기동 로그에 한 줄 남긴다.
+	appService := strings.TrimSpace(os.Getenv("DEPLOY_APP_SERVICE"))
+	if gatewayURL != "" && appService == "" {
+		return b, errors.New("DEPLOY_GATEWAY_URL이 설정되면 DEPLOY_APP_SERVICE(배포 대상 app compose 서비스명 — 현 .9 구조는 \"app\")가 필수다 — 사후조건을 대상 서비스에 결박하지 않으면 사이드카/orphan이 pinned digest를 실행 중일 때 틀린 이미지가 COMPLETED로 기록되고 그 위로 라우트가 전환된다(H2 fail-open · fail-closed)")
+	}
+	if appService == "" {
+		fmt.Println("경고: DEPLOY_APP_SERVICE 미설정 — 사후조건·재시작 검사가 compose 프로젝트 전체를 대상으로 한다(대상 app 서비스 결박 없음 · H2·M1 잔여). 배포 대상 서비스명을 설정하면 결박이 켜진다")
+	} else {
+		fmt.Printf("사후조건 결박: 대상 app compose 서비스=%q (이미지 대조·부분기동·재시작 검사 대상)\n", appService)
+	}
+
 	var singleExec deploy.HostExecutor
 	var singleHealth deploy.HealthChecker
 	if composeFile != "" || project != "" || healthURL != "" || gatewayURL == "" {
 		if composeFile == "" || project == "" || healthURL == "" {
 			return b, errors.New("DEPLOY_COMPOSE_FILE·DEPLOY_COMPOSE_PROJECT·DEPLOY_HEALTH_URL은 함께 설정한다 (게이트웨이 미설정이면 필수 · 설정 시에도 셋 다 — fail-closed)")
 		}
-		execr, herr := newSlotExecutor(composeFile, project)
+		execr, herr := newSlotExecutor(composeFile, project, appService)
 		if herr != nil {
 			return b, herr
 		}
@@ -455,7 +472,7 @@ func buildDispatcher() (dispatcherBuild, error) {
 		if file == "" || proj == "" || probeURL == "" {
 			return b, fmt.Errorf("DEPLOY_GATEWAY_URL이 설정되면 슬롯별 설정이 필수다 — DEPLOY_COMPOSE_FILE%s·DEPLOY_COMPOSE_PROJECT%s·DEPLOY_HEALTH_URL%s (fail-closed)", suffix, suffix, suffix)
 		}
-		execr, eerr := newSlotExecutor(file, proj)
+		execr, eerr := newSlotExecutor(file, proj, appService)
 		if eerr != nil {
 			return b, eerr
 		}
@@ -503,14 +520,17 @@ func buildDispatcher() (dispatcherBuild, error) {
 }
 
 // newSlotExecutor는 한 compose 파일·프로젝트를 대상으로 하는 특권 실행기를 만든다.
-// sudo 프리픽스·비번·image env 변수명은 슬롯과 무관하게 공통이다.
-func newSlotExecutor(composeFile, project string) (*dispatch.Executor, error) {
+// sudo 프리픽스·비번·image env 변수명은 슬롯과 무관하게 공통이며, appService(사후조건
+// 결박 대상 서비스 — #21)도 슬롯마다 같다: 같은 앱의 blue/green은 compose 프로젝트만
+// 다르고 서비스 이름은 같은 파일 구조에서 온다.
+func newSlotExecutor(composeFile, project, appService string) (*dispatch.Executor, error) {
 	execr, err := dispatch.NewExecutor(dispatch.Config{
 		SudoPrefix:   strings.Fields(os.Getenv("DEPLOY_SUDO_PREFIX")), // 공백 split · 비면 직접 실행
 		SudoPassword: os.Getenv("DEPLOY_SUDO_PASSWORD"),
 		ComposeFile:  composeFile,
 		Project:      project,
 		ImageEnvVar:  os.Getenv("DEPLOY_IMAGE_ENV"), // 비면 dispatch 기본(DEPLOY_IMAGE_REF)
+		AppService:   appService,                    // 비면 결박 없음(프로젝트 전체 판정 — 하위호환)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("특권 실행기 조립(sudo 프리픽스 검증 — fail-closed): %w", err)

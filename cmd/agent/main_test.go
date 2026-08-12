@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jun-bank/infra/internal/deploy"
+	"github.com/jun-bank/infra/internal/dispatch"
 )
 
 // C5/C6·P3·P4: 배포 창 락 lease가 dispatch 전체 소요(phaseBudget + 헬스 deadline D +
@@ -208,6 +209,8 @@ func setBlueGreenEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("IMAGE_CORE", "registry.example/core")
 	t.Setenv("DEPLOY_GATEWAY_URL", "http://127.0.0.1:8090")
+	t.Setenv("DEPLOY_APP_SERVICE", "app") // #21 — 블루-그린 모드에서는 필수
+
 	t.Setenv("DEPLOY_COMPOSE_FILE_BLUE", "/x/blue.yml")
 	t.Setenv("DEPLOY_COMPOSE_PROJECT_BLUE", "core-blue")
 	t.Setenv("DEPLOY_HEALTH_URL_BLUE", "http://127.0.0.1:8081/ready")
@@ -300,6 +303,10 @@ func TestBuildDispatcherBlueGreenFailClosed(t *testing.T) {
 		{"드레인 비duration", func(t *testing.T) { t.Setenv("DEPLOY_DRAIN_WAIT", "곧") }},
 		{"게이트웨이 타임아웃 음수", func(t *testing.T) { t.Setenv("DEPLOY_GATEWAY_TIMEOUT", "-1s") }},
 		{"단일 변수 일부만 설정", func(t *testing.T) { t.Setenv("DEPLOY_COMPOSE_FILE", "/x/compose.yml") }},
+		// #21: 결박 대상 서비스 없이 블루-그린을 띄우면 사이드카/orphan이 pinned digest를
+		// 실행 중일 때 app이 틀린 이미지여도 통과하고 그 위로 라우트가 전환된다(H2 fail-open).
+		{"DEPLOY_APP_SERVICE 미설정", func(t *testing.T) { t.Setenv("DEPLOY_APP_SERVICE", "") }},
+		{"DEPLOY_APP_SERVICE 공백뿐", func(t *testing.T) { t.Setenv("DEPLOY_APP_SERVICE", "   ") }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -310,6 +317,69 @@ func TestBuildDispatcherBlueGreenFailClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// #21: env → dispatch.Config 배선이 실제로 이어지는지 본다. 값을 읽고도 실행기에 넘기지
+// 않는 것이 가장 조용한 실패다 — 그러면 기동 검증은 통과하는데 사후조건은 결박 없이 돌아
+// H2 fail-open이 그대로 되돌아온다. 슬롯별 실행기와 단일 경로 실행기 모두 결박돼야 한다.
+func TestBuildDispatcherBindsAppServiceToExecutors(t *testing.T) {
+	setBlueGreenEnv(t)
+	setSingleVars(t, "core-single") // 단일 경로(target=gateway 전용)도 함께 배선한다
+	t.Setenv("DEPLOY_APP_SERVICE", "app")
+
+	b, err := buildDispatcher()
+	if err != nil {
+		t.Fatalf("정상 env인데 조립 실패: %v", err)
+	}
+	d, ok := b.disp.(deploy.LocalDispatcher)
+	if !ok {
+		t.Fatalf("dispatcher 타입=%T, LocalDispatcher 기대", b.disp)
+	}
+	for name, ex := range map[string]deploy.HostExecutor{
+		"blue": d.SlotExec[deploy.SlotBlue], "green": d.SlotExec[deploy.SlotGreen], "단일 경로": d.Exec,
+	} {
+		x, xok := ex.(*dispatch.Executor)
+		if !xok {
+			t.Fatalf("%s 실행기 타입=%T, *dispatch.Executor 기대", name, ex)
+		}
+		if x.AppService() != "app" {
+			t.Fatalf("%s 실행기에 대상 서비스가 결박되지 않았다: %q (기대 %q)", name, x.AppService(), "app")
+		}
+	}
+}
+
+// 단일 경로 모드에서 DEPLOY_APP_SERVICE는 선택이다(하위호환) — 미설정이면 결박 없이
+// 조립되고 프로젝트 전체 판정이 유지된다. 설정하면 결박이 켜진다.
+func TestBuildDispatcherSinglePathAppServiceOptional(t *testing.T) {
+	singleExec := func(t *testing.T) *dispatch.Executor {
+		t.Helper()
+		b, err := buildDispatcher()
+		if err != nil {
+			t.Fatalf("단일 경로 조립 실패: %v", err)
+		}
+		x, ok := b.disp.(deploy.LocalDispatcher).Exec.(*dispatch.Executor)
+		if !ok {
+			t.Fatal("단일 경로 실행기가 *dispatch.Executor가 아니다")
+		}
+		return x
+	}
+
+	t.Run("미설정이면 결박 없음", func(t *testing.T) {
+		setRequiredDispatchEnv(t)
+		t.Setenv("DEPLOY_GATEWAY_URL", "")
+		t.Setenv("DEPLOY_APP_SERVICE", "")
+		if got := singleExec(t).AppService(); got != "" {
+			t.Fatalf("미설정인데 결박=%q", got)
+		}
+	})
+	t.Run("설정하면 결박", func(t *testing.T) {
+		setRequiredDispatchEnv(t)
+		t.Setenv("DEPLOY_GATEWAY_URL", "")
+		t.Setenv("DEPLOY_APP_SERVICE", "app")
+		if got := singleExec(t).AppService(); got != "app" {
+			t.Fatalf("결박=%q, %q 기대", got, "app")
+		}
+	})
 }
 
 // TestResolveRole은 역할 해석의 fail-closed 계약을 다룬다: 유효 값은 통과하고,

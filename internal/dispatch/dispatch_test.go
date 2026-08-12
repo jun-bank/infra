@@ -384,6 +384,154 @@ func TestVerifyImageDigestNoContainers(t *testing.T) {
 	}
 }
 
+// --- #21: 사후조건을 대상 app 서비스에 identity로 결박 -------------------------
+//
+// 여기 네 테스트가 H2(fail-open)·M1(오탐)의 닫힘을 증명한다. 결박의 축은 compose가 붙이는
+// 서비스 라벨 하나이며(composeServiceLabel), 판정은 그 서비스의 컨테이너만 본다.
+
+// svcCfg는 대상 app 서비스로 결박된 설정이다(현 .9 구조의 서비스명 = "app").
+var svcCfg = Config{ComposeFile: "/etc/deploy/green.yml", Project: "core-green", AppService: "app"}
+
+// line은 inspect 한 줄(status image service)을 만든다 — inspectStateFormat의 출력 형태다.
+func line(status, image, service string) string { return status + " " + image + " " + service }
+
+// H2(fail-open) 닫힘: 사이드카가 pinned digest를 실행 중이어도 **대상 app 서비스**가 틀린
+// 이미지(:latest·env 오타)를 실행 중이면 실패한다. 결박 전에는 사이드카의 일치가 app의
+// 일치를 대신해 엉뚱한 이미지가 COMPLETED로 기록될 수 있었다.
+func TestVerifyImageDigestSidecarPinnedButAppWrongFails(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	wrong := "registry.example/core:latest"
+	s := &scriptRunner{psOut: "app1\nside1\n", state: map[string]string{
+		"app1":  line("running", wrong, "app"),           // 배포 대상 — 틀린 이미지
+		"side1": line("running", ref, "metrics-sidecar"), // 사이드카 — 우연히 pinned digest
+	}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	err := e.VerifyImageDigest(context.Background(), ref)
+	if err == nil {
+		t.Fatal("app이 틀린 이미지인데 사이드카의 pinned digest가 통과시켰다(H2 fail-open — silent COMPLETED)")
+	}
+	// 무엇이 기대였고 실제 app이 무엇을 실행 중인지가 오류에 남아야 한다.
+	if !strings.Contains(err.Error(), ref) || !strings.Contains(err.Error(), wrong) {
+		t.Fatalf("오류에 기대 pinned 참조·실제 실행 이미지가 없다: %v", err)
+	}
+}
+
+// M1(fail-closed 오탐) 닫힘: 정상 종료한 one-shot/init 컨테이너나 정지 orphan이 있어도
+// 대상 app 서비스가 정상이면 통과한다(다른 서비스의 exited는 부분기동이 아니다).
+func TestVerifyImageDigestOneShotExitedPasses(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "app1\nmigrate1\norphan1\n", state: map[string]string{
+		"app1":     line("running", ref, "app"),                                                // 대상 — 정상
+		"migrate1": line("exited", ref, "db-migrate"),                                          // one-shot 정상 종료
+		"orphan1":  line("exited", "registry.example/old@sha256:"+strings.Repeat("c", 64), ""), // 라벨 없는 정지 orphan
+	}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	if err := e.VerifyImageDigest(context.Background(), ref); err != nil {
+		t.Fatalf("app이 정상인데 one-shot 종료·정지 orphan을 부분기동으로 오판했다(M1): %v", err)
+	}
+}
+
+// 대상 app 서비스의 컨테이너가 하나도 없으면 실패한다 — 사이드카만 떠 있는 상태를 통과로
+// 삼지 않는다(증명 불가 = 실패 · 기존 계약 유지).
+func TestVerifyImageDigestNoTargetServiceContainerFails(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "side1\n", state: map[string]string{
+		"side1": line("running", ref, "metrics-sidecar"),
+	}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	err := e.VerifyImageDigest(context.Background(), ref)
+	if err == nil {
+		t.Fatal("대상 app 서비스 컨테이너가 0개인데 통과(사이드카만으로 사후조건이 증명될 수 없다)")
+	}
+	if !strings.Contains(err.Error(), "app") {
+		t.Fatalf("오류에 대상 서비스명이 없다: %v", err)
+	}
+}
+
+// 부분기동 판정은 **대상 서비스 안에서는** 그대로 산다 — app replica 하나가 죽었으면
+// 다른 replica가 pinned digest로 살아 있어도 실패한다(silent 부분기동 차단).
+func TestVerifyImageDigestAppReplicaExitedFails(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "app1\napp2\n", state: map[string]string{
+		"app1": line("running", ref, "app"),
+		"app2": line("exited", ref, "app"),
+	}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	err := e.VerifyImageDigest(context.Background(), ref)
+	if err == nil {
+		t.Fatal("대상 서비스 컨테이너가 종료됐는데 통과(부분기동 위장)")
+	}
+	if !strings.Contains(err.Error(), "app2") {
+		t.Fatalf("부분기동 오류에 종료된 대상 컨테이너가 없다: %v", err)
+	}
+}
+
+// inspect는 서비스 라벨을 함께 읽는다(결박의 입력) — 포맷이 바뀌면 결박이 조용히 꺼진다.
+func TestInspectStateReadsComposeServiceLabel(t *testing.T) {
+	r := &captureRunner{out: line("running", "img", "app")}
+	e := newExec(svcCfg, r)
+	st, err := e.inspectState(context.Background(), "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.service != "app" || st.status != "running" || st.image != "img" {
+		t.Fatalf("inspect 파싱 = %+v, running/img/app 기대", st)
+	}
+	if !contains(r.argv, "-f") || !contains(r.argv, inspectStateFormat) {
+		t.Fatalf("inspect argv에 라벨 포맷이 없다: %v", r.argv)
+	}
+	if !strings.Contains(inspectStateFormat, composeServiceLabel) {
+		t.Fatalf("inspect 포맷에 compose 서비스 라벨이 없다: %q", inspectStateFormat)
+	}
+	assertNoRawShell(t, r.argv)
+}
+
+// 라벨이 없는 컨테이너는 대상이 아니다 — 결박이 켜졌는데 소속을 증명하지 못하는 컨테이너를
+// 대상으로 세면 결박이 무의미해진다(라벨 부재 = 세 번째 칸 없음).
+func TestVerifyImageDigestUnlabeledContainerNotTarget(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "x1\n", state: map[string]string{"x1": "running " + ref}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	if err := e.VerifyImageDigest(context.Background(), ref); err == nil {
+		t.Fatal("라벨 없는 컨테이너를 대상 app으로 세어 통과했다(결박 무력화)")
+	}
+}
+
+// CD-1 재시작 검사 대상도 같은 결박을 따른다 — 대상 서비스의 컨테이너만 돌려준다
+// (사이드카 재시작이 앱 준비성 판정을 실패시키지 않는다 · 트레이드오프는 구현 주석).
+func TestGreenContainersBoundToAppService(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "app1\nside1\n", state: map[string]string{
+		"app1":  line("running", ref, "app"),
+		"side1": line("running", ref, "metrics-sidecar"),
+	}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	ids, err := e.GreenContainers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eq(ids, []string{"app1"}) {
+		t.Fatalf("재시작 검사 대상 = %v, [app1] 기대(대상 서비스만)", ids)
+	}
+}
+
+// 결박 미설정(단일 경로 모드의 하위호환)은 프로젝트 전체를 보던 기존 판정 그대로다 —
+// ps -q 한 번으로 끝나고(추가 inspect 없음) 라벨 유무와 무관하다.
+func TestGreenContainersUnboundKeepsProjectScope(t *testing.T) {
+	r := &captureRunner{out: "app1\nside1\n"}
+	e := newExec(baseCfg, r) // AppService 없음
+	ids, err := e.GreenContainers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eq(ids, []string{"app1", "side1"}) {
+		t.Fatalf("결박 없음: 대상 = %v, [app1 side1] 기대(프로젝트 전체)", ids)
+	}
+	if !contains(r.argv, "ps") || !contains(r.argv, "-q") {
+		t.Fatalf("결박 없음인데 ps -q가 아니다: %v", r.argv)
+	}
+}
+
 func contains(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {
