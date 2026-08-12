@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,7 +22,18 @@ import (
 //
 //	GET  {base}/internal/routes/core         → 200 {"service","activeSlot","uri","lastAcceptedToken"}
 //	POST {base}/internal/routes/core/switch  ← {"targetSlot":"green","fencingToken":7}
-//	                                          → 200 전환 성공 / 409 stale token / 그 밖 = 실패
+//	                                          → 200 전환 성공
+//	                                            409 stale token (미전환 — state가 있으면 NOT_ATTEMPTED)
+//	                                            500 {"error","state":"ROLLED_BACK"|"INDETERMINATE"}
+//	                                            그 밖(202 포함) = 실패 · 실상태 보증 없음
+//
+// 성공은 **정확히 200**뿐이다 — 202 같은 다른 2xx는 "받아는 뒀다"일 뿐 라우트가 옮겨졌다는
+// 보증이 아니므로 성공으로 접으면 미전환이 COMPLETED로 위장한다.
+//
+// 실패 응답의 state는 게이트웨이가 자기 실상태에 대해 주는 유일한 보증이며, 이 클라이언트는
+// 그것을 파싱해 반환 오류(*SwitchError)에 그대로 싣는다 — 호출자는 그 보증에 따라 정리(down)
+// 여부를 가른다(보증 없으면 정리하지 않는다). 재조회로 이를 대신하지 않는다: GET도 registry
+// 기준이라 실상태 보증이 아니다.
 //
 // fencingToken을 요청에 싣는 이유는 BG-4 ⓐ다 — 락 재확인과 라우트 write 사이의 창에서
 // lease를 잃은 stale 실행자의 write가 최종 라우트로 남지 않도록, 게이트웨이(sink)가
@@ -40,6 +52,71 @@ const routeService = "core"
 // 게이트웨이가 이미 받아들인 토큰보다 낡았다(다른 배포가 락을 가져갔다). 전환은 일어나지
 // 않았으므로 호출자는 미전환으로 접는다(CD-4 ⑤ 실패 전이).
 var ErrStaleFencingToken = errors.New("dispatch: 게이트웨이가 fencing token을 거절했다(409 stale) — 라우트 미전환")
+
+// 전환 실패 응답의 state 값(게이트웨이 계약 그대로 — 이 클라이언트는 판정하지 않고 옮긴다).
+// 호출자는 이 값으로 "정리(down)해도 되는가"를 가른다: 미전환이 보증된 값에서만 정리한다.
+const (
+	// SwitchStateNotAttempted은 전환을 시도조차 하지 않았다는 보증이다(409 stale 포함).
+	SwitchStateNotAttempted = "NOT_ATTEMPTED"
+	// SwitchStateRolledBack은 전환을 시도했으나 되돌렸다는 보증이다 — 라우트는 구 slot이다.
+	SwitchStateRolledBack = "ROLLED_BACK"
+	// SwitchStateIndeterminate은 게이트웨이 스스로 실상태를 모른다는 뜻이다 — 보증 없음.
+	SwitchStateIndeterminate = "INDETERMINATE"
+)
+
+// maxFencingToken은 요청에 실을 수 있는 fencing token의 상한이다 — 계약상 토큰은 int64
+// 양수(≥1)이며, uint64의 상위 절반은 게이트웨이 쪽에서 음수로 접히거나 거절된다. 넘는
+// 값은 요청을 보내기 전에 거부한다(부작용 0 — 전송했다가 애매한 실패를 만들지 않는다).
+const maxFencingToken = uint64(math.MaxInt64)
+
+// SwitchError는 ⑤ 라우트 전환 실패의 구조화 오류다. 호출자가 문자열을 뒤지지 않고
+// "게이트웨이가 무엇을 보증했는가"를 읽을 수 있어야 정리(down) 여부를 안전하게 가른다:
+//
+//   - Stale(409)      → 이 실행자는 소유권을 잃었다. 승자의 슬롯을 건드리면 안 된다.
+//   - State=ROLLED_BACK → 미전환이 보증됐다. 올린 slot을 정리해 net-0으로 되돌려도 된다.
+//   - 그 밖(INDETERMINATE·전송 실패·파싱 불가) → 실상태 불명. 정리는 금지(사람이 본다).
+//
+// SwitchState()·StaleToken() 메서드는 소비 지점(internal/deploy)이 이 패키지를 import하지
+// 않고도 갈래를 읽게 하는 구조적 계약이다(IA-5 닫힌 import).
+type SwitchError struct {
+	Msg    string // 사람이 읽는 전체 메시지(단계·상태·본문 조각 포함)
+	Status int    // HTTP 상태 코드(0 = 응답을 받지 못했다 — 전송 실패·타임아웃)
+	State  string // 실패 응답의 state("" = 없음·파싱 불가 = 보증 없음)
+	Stale  bool   // true = 409 fencing token 거절(소유권 상실)
+	Err    error  // 감싼 원인(전송 오류 · stale 센티널)
+}
+
+func (e *SwitchError) Error() string { return e.Msg }
+
+// Unwrap은 errors.Is(err, ErrStaleFencingToken)·전송 오류 매칭을 보존한다.
+func (e *SwitchError) Unwrap() error { return e.Err }
+
+// SwitchState는 게이트웨이가 보증한 실상태다(빈 문자열 = 보증 없음).
+func (e *SwitchError) SwitchState() string { return e.State }
+
+// StaleToken은 이 실패가 fencing token 거절(409 — 소유권 상실)인지다.
+func (e *SwitchError) StaleToken() bool { return e.Stale }
+
+// switchFailureBody는 실패 응답 본문이다(게이트웨이 계약 — 500은 state를 싣는다).
+type switchFailureBody struct {
+	Error string `json:"error"`
+	State string `json:"state"`
+}
+
+// parseSwitchState는 실패 응답 본문에서 state를 읽는다. 파싱 불가·필드 부재·계약 밖의
+// 값은 전부 ""(보증 없음)다 — 모르는 값을 보증으로 승격시키지 않는다(fail-closed).
+func parseSwitchState(body []byte) string {
+	var b switchFailureBody
+	if err := json.Unmarshal(body, &b); err != nil {
+		return ""
+	}
+	switch b.State {
+	case SwitchStateNotAttempted, SwitchStateRolledBack, SwitchStateIndeterminate:
+		return b.State
+	default:
+		return ""
+	}
+}
 
 // GatewayClient는 게이트웨이 라우트 API의 HTTP 클라이언트다. deploy.SlotGateway를
 // 만족한다(ActiveSlot·Switch).
@@ -84,8 +161,9 @@ func (g *GatewayClient) routeURL(suffix string) string {
 	return g.base.String() + "/internal/routes/" + routeService + suffix
 }
 
-// ActiveSlot은 지금 트래픽을 받는 슬롯을 조회한다(부작용 없는 GET). 비2xx·파싱 불가·빈
-// activeSlot은 오류다 — 조회를 못 했는데 슬롯을 추측하면 살아 있는 쪽에 배포하게 된다.
+// ActiveSlot은 지금 트래픽을 받는 슬롯을 조회한다(부작용 없는 GET). 200이 아닌 응답·파싱
+// 불가·빈 activeSlot은 오류다 — 조회를 못 했는데 슬롯을 추측하면 살아 있는 쪽에 배포하게
+// 된다. 성공은 정확히 200뿐이다: 202·204 같은 다른 2xx는 조회 결과를 담고 있지 않다.
 func (g *GatewayClient) ActiveSlot(ctx context.Context) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.routeURL(""), nil)
 	if err != nil {
@@ -97,8 +175,8 @@ func (g *GatewayClient) ActiveSlot(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 	body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxGatewayBody))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("dispatch: 라우트 조회 실패 — HTTP %d · 본문=%s", resp.StatusCode, snippet(body))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("dispatch: 라우트 조회 실패 — HTTP %d(200만 성공이다) · 본문=%s", resp.StatusCode, snippet(body))
 	}
 	if rerr != nil {
 		return "", fmt.Errorf("dispatch: 라우트 조회 본문 읽기 실패: %w", rerr)
@@ -113,35 +191,67 @@ func (g *GatewayClient) ActiveSlot(ctx context.Context) (string, error) {
 	return st.ActiveSlot, nil
 }
 
-// Switch는 라우트를 targetSlot으로 옮긴다(CD-4 ⑤). 2xx = 전환 성공, 409 =
-// ErrStaleFencingToken(미전환), 그 밖의 응답·전송 실패 = 오류(미전환으로 접는다).
+// Switch는 라우트를 targetSlot으로 옮긴다(CD-4 ⑤). 200 = 전환 성공, 그 밖은 전부 실패이며
+// 실패는 *SwitchError로 돌아온다 — 그 안의 Stale·State가 호출자의 정리(down) 판단 근거다.
+//
+//	409          → Stale=true(소유권 상실 · 미전환) · errors.Is(err, ErrStaleFencingToken)
+//	500 + state  → State=ROLLED_BACK(미전환 보증) 또는 INDETERMINATE(보증 없음)
+//	그 밖·전송 실패 → State=""(보증 없음)
+//
 // ⚠️ 전송 실패(타임아웃·연결 끊김)는 "전환되지 않았다"를 증명하지 못한다 — 요청이 닿아
-// 처리됐는데 응답만 유실됐을 수 있다. 호출자는 이 오류에서 green을 정리해 미전환으로
-// 되돌리며(CD-4 ⑤ 전이), 그 정리 자체가 라우트가 옮겨진 뒤였다면 헬스가 죽은 대상을
-// 가리키게 된다 — 그래서 정리 실패·불명은 UNKNOWN으로 접히고 사람이 본다.
+// 처리됐는데 응답만 유실됐을 수 있다. 그래서 이 클라이언트는 그런 실패에 아무 보증도 싣지
+// 않으며(State=""), 호출자는 보증 없는 실패에서 정리하지 않고 UNKNOWN으로 접는다.
 func (g *GatewayClient) Switch(ctx context.Context, targetSlot string, fencingToken uint64) error {
+	// 계약 위반 토큰은 보내기 전에 거른다(부작용 0 — 전송 후 애매한 실패를 만들지 않는다).
+	if fencingToken == 0 || fencingToken > maxFencingToken {
+		return &SwitchError{
+			Msg:   fmt.Sprintf("dispatch: fencing token이 계약 범위를 벗어났다(1..%d의 int64 양수여야 한다 · 요청 미전송 · 부작용 0): token=%d", maxFencingToken, fencingToken),
+			State: SwitchStateNotAttempted,
+		}
+	}
 	payload, err := json.Marshal(switchRequest{TargetSlot: targetSlot, FencingToken: fencingToken})
 	if err != nil {
-		return fmt.Errorf("dispatch: 전환 요청 본문 조립 실패: %w", err)
+		return &SwitchError{Msg: fmt.Sprintf("dispatch: 전환 요청 본문 조립 실패(요청 미전송): %v", err), State: SwitchStateNotAttempted, Err: err}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.routeURL("/switch"), bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("dispatch: 전환 요청 조립 실패: %w", err)
+		return &SwitchError{Msg: fmt.Sprintf("dispatch: 전환 요청 조립 실패(요청 미전송): %v", err), State: SwitchStateNotAttempted, Err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := g.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("dispatch: 전환 요청 실패(게이트웨이 미응답 — 전환 여부 불명): %w", err)
+		// 응답을 받지 못했다 = 실상태 보증 없음(State 비움) — 요청이 닿았을 수 있다.
+		return &SwitchError{
+			Msg: fmt.Sprintf("dispatch: 전환 요청 실패(게이트웨이 미응답 — 전환 여부 불명 · 보증 없음): %v", err),
+			Err: err,
+		}
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxGatewayBody))
 	switch {
-	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+	case resp.StatusCode == http.StatusOK:
 		return nil
 	case resp.StatusCode == http.StatusConflict:
-		return fmt.Errorf("%w (slot=%s token=%d · 본문=%s)", ErrStaleFencingToken, targetSlot, fencingToken, snippet(body))
+		// 409는 계약상 "쓰기를 시도조차 하지 않았다"이다 — 본문에 state가 없어도 그 보증은
+		// 상태 코드가 준다. 다만 호출자는 stale에서 정리를 하지 않는다(승자의 슬롯이다).
+		state := parseSwitchState(body)
+		if state == "" {
+			state = SwitchStateNotAttempted
+		}
+		return &SwitchError{
+			Msg:    fmt.Sprintf("%v (slot=%s token=%d · state=%s · 본문=%s)", ErrStaleFencingToken, targetSlot, fencingToken, state, snippet(body)),
+			Status: resp.StatusCode,
+			State:  state,
+			Stale:  true,
+			Err:    ErrStaleFencingToken,
+		}
 	default:
-		return fmt.Errorf("dispatch: 전환 거절 — HTTP %d (slot=%s token=%d · 본문=%s)", resp.StatusCode, targetSlot, fencingToken, snippet(body))
+		state := parseSwitchState(body)
+		return &SwitchError{
+			Msg:    fmt.Sprintf("dispatch: 전환 거절 — HTTP %d(200만 성공이다) (slot=%s token=%d · state=%q · 본문=%s)", resp.StatusCode, targetSlot, fencingToken, state, snippet(body)),
+			Status: resp.StatusCode,
+			State:  state,
+		}
 	}
 }
 

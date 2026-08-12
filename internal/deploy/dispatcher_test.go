@@ -6,6 +6,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -459,14 +460,50 @@ func TestDispatchBlueGreenUsesIdleSlot(t *testing.T) {
 	}
 }
 
-// ⑵ 전환 실패(409 stale 포함) = 미전환 — 올린 slot을 정리하고 UNEXECUTED. 구 slot은
-// 손대지 않는다(살아 있는 blue를 끄면 서비스가 죽는다).
-func TestDispatchBlueGreenSwitchFailCleansGreen(t *testing.T) {
+// ⑵ 전환 실패는 게이트웨이의 **보증**으로 셋으로 갈린다. 아래 셋이 그 계약이다 —
+// 여기서 막는 치명 실패는 "실상태를 모르는데 정리(down)를 실행하는 것"이다.
+
+// fakeSwitchErr는 게이트웨이 클라이언트가 실패 오류에 싣는 구조화 정보를 흉내낸다
+// (구조적 계약 — 실제 구현은 internal/dispatch의 *SwitchError다).
+type fakeSwitchErr struct {
+	msg   string
+	state string
+	stale bool
+}
+
+func (e *fakeSwitchErr) Error() string       { return e.msg }
+func (e *fakeSwitchErr) SwitchState() string { return e.state }
+func (e *fakeSwitchErr) StaleToken() bool    { return e.stale }
+
+// ⑵-a stale(409) = 소유권 상실 — 아무것도 정리하지 않고 UNKNOWN. 승자가 같은 idle 슬롯을
+// 자기 green으로 쓰거나 이미 그쪽으로 라우트를 옮겼을 수 있어, 여기서 down을 부르면 승자의
+// 라이브 슬롯을 절단한다(치명 경합).
+func TestDispatchBlueGreenStaleTokenNoCleanupUnknown(t *testing.T) {
 	r := newBGRig(SlotBlue)
-	r.gw.switchErr = errors.New("409 stale fencing token")
+	r.gw.switchErr = &fakeSwitchErr{msg: "409 stale fencing token", state: "NOT_ATTEMPTED", stale: true}
+	st, err := r.run(t)
+	if st != StateUnknown || err == nil {
+		t.Fatalf("stale 409: state=%v err=%v, UNKNOWN·err 기대(정리 금지 — net-0이 아니다)", st, err)
+	}
+	if r.green.downs != 0 {
+		t.Fatalf("stale인데 green 정리 down=%d — 승자의 슬롯일 수 있다(0 기대)", r.green.downs)
+	}
+	if r.blue.downs != 0 {
+		t.Fatalf("stale인데 구 active(blue) down=%d — 라우트는 blue다(0 기대)", r.blue.downs)
+	}
+	if !strings.Contains(err.Error(), "⑤") || !strings.Contains(err.Error(), "소유권") {
+		t.Fatalf("오류에 단계·소유권 상실 사실이 없다 — 사람 개입의 단서다: %v", err)
+	}
+}
+
+// ⑵-b state=ROLLED_BACK = 미전환이 보증됐다 — 올린 slot을 정리해 net-0(UNEXECUTED)으로
+// 되돌린다. 구 slot은 손대지 않는다(살아 있는 blue를 끄면 서비스가 죽는다).
+func TestDispatchBlueGreenRolledBackCleansGreen(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	r.gw.switchErr = &fakeSwitchErr{msg: "500 switch failed", state: "ROLLED_BACK"}
 	st, err := r.run(t)
 	if st != StateUnexecuted || err == nil {
-		t.Fatalf("전환 실패: state=%v err=%v, UNEXECUTED·err 기대(미전환)", st, err)
+		t.Fatalf("ROLLED_BACK: state=%v err=%v, UNEXECUTED·err 기대(미전환 보증 = 정리 성립)", st, err)
 	}
 	if r.green.downs != 1 {
 		t.Fatalf("green 정리 down=%d, 1 기대(CD-4 ⑤ 실패 = green 종료·미전환)", r.green.downs)
@@ -479,14 +516,44 @@ func TestDispatchBlueGreenSwitchFailCleansGreen(t *testing.T) {
 	}
 }
 
-// 전환 실패 + green 정리 실패 = green 잔존 가능 = UNKNOWN.
-func TestDispatchBlueGreenSwitchFailCleanupFailUnknown(t *testing.T) {
+// ⑵-b' ROLLED_BACK인데 정리마저 실패 = green 잔존 가능 = UNKNOWN.
+func TestDispatchBlueGreenRolledBackCleanupFailUnknown(t *testing.T) {
 	r := newBGRig(SlotBlue)
-	r.gw.switchErr = errors.New("500")
+	r.gw.switchErr = &fakeSwitchErr{msg: "500 switch failed", state: "ROLLED_BACK"}
 	r.green.downErr = errors.New("down 실패")
 	st, err := r.run(t)
 	if st != StateUnknown || err == nil {
-		t.Fatalf("전환 실패·정리 실패: state=%v, UNKNOWN 기대", st)
+		t.Fatalf("ROLLED_BACK·정리 실패: state=%v, UNKNOWN 기대", st)
+	}
+}
+
+// ⑵-c 보증 없는 실패 전부(INDETERMINATE · 전송 실패 · state 파싱 불가 · 구조화 정보 없는
+// 오류) = 실상태 불명 = **정리 금지** + UNKNOWN. 여기서 down을 부르면 이미 트래픽이 옮겨간
+// 쪽을 끊을 수 있다.
+func TestDispatchBlueGreenIndeterminateNoCleanupUnknown(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"INDETERMINATE", &fakeSwitchErr{msg: "500 indeterminate", state: "INDETERMINATE"}},
+		{"전송 실패(보증 없음)", &fakeSwitchErr{msg: "게이트웨이 미응답", state: ""}},
+		{"구조화 정보 없는 오류", errors.New("알 수 없는 실패")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newBGRig(SlotBlue)
+			r.gw.switchErr = c.err
+			st, err := r.run(t)
+			if st != StateUnknown || err == nil {
+				t.Fatalf("%s: state=%v err=%v, UNKNOWN·err 기대", c.name, st, err)
+			}
+			if r.green.downs != 0 || r.blue.downs != 0 {
+				t.Fatalf("%s: 실상태 불명인데 정리 down 실행됨(green=%d blue=%d) — 트래픽이 가는 쪽을 끊을 수 있다", c.name, r.green.downs, r.blue.downs)
+			}
+			if !strings.Contains(err.Error(), "⑤") {
+				t.Fatalf("%s: 오류에 실패 단계가 없다: %v", c.name, err)
+			}
+		})
 	}
 }
 
@@ -637,5 +704,56 @@ func TestDispatchGatewayTargetWithoutSingleWiringUnexecuted(t *testing.T) {
 	st, err := d.Dispatch(context.Background(), m, store.FencingToken(1))
 	if st != StateUnexecuted || err == nil {
 		t.Fatalf("배선 없는 게이트웨이 배포: state=%v err=%v, UNEXECUTED·err 기대", st, err)
+	}
+}
+
+// ⑹ 블루-그린 경로는 target=core에만 결박된다 — 게이트웨이 클라이언트가 보는 라우트가
+// core 하나이기 때문이다. settlement·ledger가 이 경로로 흘러들면 그 이미지가 core의 슬롯을
+// 덮고 그 위에 core 라우트가 전환된다(대상 뒤바뀜 — 치명). 시작 전에 요란하게 거절한다.
+func TestDispatchBlueGreenRejectsNonCoreTarget(t *testing.T) {
+	for _, target := range []Target{TargetSettlement, TargetLedger} {
+		t.Run(string(target), func(t *testing.T) {
+			r := newBGRig(SlotBlue)
+			single := &fakeExec{}
+			d := r.dispatcher()
+			// 단일 경로 배선이 있어도 슬롯 경로로도 단일 경로로도 흘려보내지 않는다.
+			d.Exec, d.Health = single, fakeHealth{}
+			d.Repos = map[Target]string{target: "registry.example/" + string(target)}
+
+			m := manifest(validDigest)
+			m.Target = target
+			st, err := d.Dispatch(context.Background(), m, store.FencingToken(7))
+			if st != StateUnexecuted || err == nil {
+				t.Fatalf("target=%s: state=%v err=%v, UNEXECUTED·err 기대(부작용 0)", target, st, err)
+			}
+			if !strings.Contains(err.Error(), "슬롯 배선") {
+				t.Fatalf("오류에 배선 부재 사실이 없다: %v", err)
+			}
+			// 부작용 0 — 페이크 실행기·게이트웨이 호출이 하나도 없어야 한다.
+			calls := r.blue.pulls + r.blue.ups + r.blue.downs + r.green.pulls + r.green.ups + r.green.downs +
+				single.pulls + single.ups + single.downs + r.gw.queries + r.gw.switches
+			if calls != 0 {
+				t.Fatalf("target=%s인데 실행 호출 %d회 발생(부작용 0 위반) — 순서=%v", target, calls, r.order)
+			}
+		})
+	}
+}
+
+// fencing token은 계약상 int64 양수(≥1)다 — 범위 밖이면 이미지를 올리기 전에 거절한다
+// (전환 단계에서 애매하게 실패해 green을 남기는 대신 부작용 0으로 접는다).
+func TestDispatchBlueGreenRejectsOutOfRangeToken(t *testing.T) {
+	for _, tok := range []store.FencingToken{
+		0,
+		store.FencingToken(uint64(math.MaxInt64) + 1),
+		store.FencingToken(^uint64(0)),
+	} {
+		r := newBGRig(SlotBlue)
+		st, err := r.dispatcher().Dispatch(context.Background(), manifest(validDigest), tok)
+		if st != StateUnexecuted || err == nil {
+			t.Fatalf("token=%d: state=%v err=%v, UNEXECUTED·err 기대", uint64(tok), st, err)
+		}
+		if r.gw.queries != 0 || r.gw.switches != 0 || r.green.pulls != 0 {
+			t.Fatalf("token=%d인데 부작용 발생(queries=%d switches=%d pulls=%d)", uint64(tok), r.gw.queries, r.gw.switches, r.green.pulls)
+		}
 	}
 }

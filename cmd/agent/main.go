@@ -70,15 +70,26 @@ const dispatchLeaseSlack = 10 * time.Second
 const maxDispatchDuration = time.Hour
 
 // cutoverBudget은 전환 단계(CD-4 ⑤⑥⑨)의 소요 상한이다 — 게이트웨이가 설정되지 않았으면
-// 그 단계가 아예 없으므로 0이다. 항은 셋이다:
+// 그 단계가 아예 없으므로 0이다(그때는 이 함수를 부르지 않는다). 항은 셋이다:
 //
 //	게이트웨이 왕복 2회(배포 시작 전 active slot 조회 + ⑤ 전환) + 드레인 대기(⑥) + 구 slot down(⑨)
 //
 // 각 게이트웨이 요청은 클라이언트 타임아웃으로, 드레인은 선언값으로, down은 CleanupTimeout
 // 으로 상한되므로 이 합이 전환 구간의 상한이 된다(락 안에서 완주하도록 lease 하한에 더한다 —
 // BG-4: 전환은 락 보유 단계다).
-func cutoverBudget(gatewayTimeout, drainWait time.Duration) time.Duration {
-	return 2*gatewayTimeout + drainWait + deploy.CleanupTimeout
+//
+// ⚠️ 합산 **전에** 각 항을 개별로 상한한다(H3와 같은 축) — 거대 env 값(예: DEPLOY_DRAIN_WAIT
+// =2562047h)이 들어오면 2*gatewayTimeout+drainWait이 int64 overflow로 음수가 되고, 그 음수
+// 예산은 leaseCoversDispatch의 [0, max] 검사를 "작은 값"으로 통과해 하한식 자체를 fail-open
+// 시킨다. 항별 검증이 서면 합은 최대 3*maxDispatchDuration + CleanupTimeout이라 넘칠 수 없다.
+func cutoverBudget(gatewayTimeout, drainWait time.Duration) (time.Duration, error) {
+	if gatewayTimeout <= 0 || gatewayTimeout > maxDispatchDuration {
+		return 0, fmt.Errorf("DEPLOY_GATEWAY_TIMEOUT은 (0, %s] 범위여야 한다(fail-closed · 전환 예산 overflow 방지): %s", maxDispatchDuration, gatewayTimeout)
+	}
+	if drainWait <= 0 || drainWait > maxDispatchDuration {
+		return 0, fmt.Errorf("DEPLOY_DRAIN_WAIT은 (0, %s] 범위여야 한다(fail-closed · 전환 예산 overflow 방지): %s", maxDispatchDuration, drainWait)
+	}
+	return 2*gatewayTimeout + drainWait + deploy.CleanupTimeout, nil
 }
 
 // leaseCoversDispatch는 배포 창 락 lease가 dispatch 전체 소요를 덮는지 본다(CD-3 하한식).
@@ -433,6 +444,7 @@ func buildDispatcher() (dispatcherBuild, error) {
 
 	slotExec := map[deploy.Slot]deploy.HostExecutor{}
 	slotHealth := map[deploy.Slot]deploy.HealthChecker{}
+	slotProject := map[deploy.Slot]string{}
 	for _, s := range []deploy.Slot{deploy.SlotBlue, deploy.SlotGreen} {
 		suffix := "_" + strings.ToUpper(string(s))
 		file, proj, probeURL := os.Getenv("DEPLOY_COMPOSE_FILE"+suffix), os.Getenv("DEPLOY_COMPOSE_PROJECT"+suffix), os.Getenv("DEPLOY_HEALTH_URL"+suffix)
@@ -445,10 +457,25 @@ func buildDispatcher() (dispatcherBuild, error) {
 		}
 		slotExec[s] = execr
 		slotHealth[s] = newSlotProber(healthCfg, probeURL, execr)
+		slotProject[s] = proj
 	}
-	// blue와 green이 같은 compose project면 down이 새 slot까지 끈다(BG-3 ⑶) — 조립에서 막는다.
-	if os.Getenv("DEPLOY_COMPOSE_PROJECT_BLUE") == os.Getenv("DEPLOY_COMPOSE_PROJECT_GREEN") {
-		return b, errors.New("DEPLOY_COMPOSE_PROJECT_BLUE와 DEPLOY_COMPOSE_PROJECT_GREEN이 같다 — down이 프로젝트 단위라 구 slot 종료가 새 slot까지 끈다(BG-3 ⑶ · fail-closed)")
+	// compose project가 겹치면 down 하나가 남의 컨테이너를 철거한다(down은 프로젝트 단위다 —
+	// BG-3 ⑶). 겹칠 수 있는 쌍은 셋이며(blue·green·단일), **쌍별로** 다 본다:
+	//   blue=green   → 구 slot 종료가 방금 올린 slot까지 끈다.
+	//   단일=blue|green → target=gateway 배포(단일 경로)의 실패 정리·재기동 down이 core의
+	//                     라이브 슬롯을 철거한다(게이트웨이 배포가 코어를 내린다).
+	// 단일 변수는 이 모드에서 선택이므로 비어 있으면 그 쌍은 검사 대상이 아니다.
+	for _, pair := range []struct{ aName, a, bName, b string }{
+		{"DEPLOY_COMPOSE_PROJECT_BLUE", slotProject[deploy.SlotBlue], "DEPLOY_COMPOSE_PROJECT_GREEN", slotProject[deploy.SlotGreen]},
+		{"DEPLOY_COMPOSE_PROJECT", project, "DEPLOY_COMPOSE_PROJECT_BLUE", slotProject[deploy.SlotBlue]},
+		{"DEPLOY_COMPOSE_PROJECT", project, "DEPLOY_COMPOSE_PROJECT_GREEN", slotProject[deploy.SlotGreen]},
+	} {
+		if pair.a == "" || pair.b == "" {
+			continue
+		}
+		if pair.a == pair.b {
+			return b, fmt.Errorf("%s와 %s가 같다(%q) — compose down은 프로젝트 단위라 한쪽의 종료·정리가 다른 쪽 컨테이너까지 철거한다(BG-3 ⑶ · fail-closed)", pair.aName, pair.bName, pair.a)
+		}
 	}
 
 	gw, err := dispatch.NewGatewayClient(gatewayURL, gwTimeout)
@@ -461,8 +488,13 @@ func buildDispatcher() (dispatcherBuild, error) {
 	disp.SlotHealth = slotHealth
 	disp.DrainWait = drain
 
+	cutover, err := cutoverBudget(gwTimeout, drain)
+	if err != nil {
+		return b, err
+	}
+
 	b.disp, b.healthDeadline, b.phaseBudget = disp, healthDeadline, phaseBudget
-	b.cutoverBudget = cutoverBudget(gwTimeout, drain)
+	b.cutoverBudget = cutover
 	return b, nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -53,6 +54,10 @@ func TestGatewayActiveSlotFailsClosed(t *testing.T) {
 		{"정상", 200, `{"activeSlot":"green"}`, false},
 		{"5xx", 500, `boom`, true},
 		{"404", 404, `not found`, true},
+		// 200 외의 2xx는 조회 결과가 아니다 — 슬롯을 담고 있지 않은 응답을 성공으로 접으면
+		// 그 다음이 슬롯 추측이 된다.
+		{"202", 202, `{"activeSlot":"green"}`, true},
+		{"204", 204, ``, true},
 		{"깨진 JSON", 200, `{활성`, true},
 		{"activeSlot 없음", 200, `{"service":"core"}`, true},
 		{"빈 activeSlot", 200, `{"activeSlot":""}`, true},
@@ -109,7 +114,8 @@ func TestGatewaySwitchSendsContract(t *testing.T) {
 	}
 }
 
-// 409 = stale token = 미전환. 호출자가 이 갈래를 구분할 수 있어야 한다(errors.Is).
+// 409 = stale token = 미전환(소유권 상실). 호출자가 이 갈래를 구분할 수 있어야 한다 —
+// errors.Is(센티널)와 구조화 필드(StaleToken·SwitchState) 양쪽으로.
 func TestGatewaySwitchStaleToken(t *testing.T) {
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusConflict)
@@ -119,11 +125,24 @@ func TestGatewaySwitchStaleToken(t *testing.T) {
 	if !errors.Is(err, ErrStaleFencingToken) {
 		t.Fatalf("409 응답: err=%v, ErrStaleFencingToken 기대", err)
 	}
+	var se *SwitchError
+	if !errors.As(err, &se) {
+		t.Fatalf("409 응답: err=%v, *SwitchError 기대(호출자가 갈래를 구조로 읽는다)", err)
+	}
+	// 409는 계약상 "쓰기를 시도조차 하지 않았다" — 본문에 state가 없어도 그 보증은 상태
+	// 코드가 준다.
+	if !se.StaleToken() || se.SwitchState() != SwitchStateNotAttempted || se.Status != http.StatusConflict {
+		t.Fatalf("409 분류: stale=%v state=%q status=%d, true·%s·409 기대", se.StaleToken(), se.SwitchState(), se.Status, SwitchStateNotAttempted)
+	}
 }
 
-// 4xx·5xx는 전부 실패다 — 조용히 성공으로 접으면 라우트가 안 바뀐 채 배포가 COMPLETED가 된다.
-func TestGatewaySwitchRejectsNon2xx(t *testing.T) {
-	for _, status := range []int{http.StatusBadRequest, http.StatusForbidden, http.StatusInternalServerError, http.StatusBadGateway} {
+// 200이 아닌 응답은 전부 실패다 — 202처럼 "받아는 뒀다"를 성공으로 접으면 라우트가 안 바뀐
+// 채 배포가 COMPLETED가 된다(2xx 전체를 성공으로 보던 구멍).
+func TestGatewaySwitchRejectsNon200(t *testing.T) {
+	for _, status := range []int{
+		http.StatusAccepted, http.StatusNoContent, // 200 아닌 2xx = 전환 보증 아님
+		http.StatusBadRequest, http.StatusForbidden, http.StatusInternalServerError, http.StatusBadGateway,
+	} {
 		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(status)
 		}))
@@ -134,6 +153,95 @@ func TestGatewaySwitchRejectsNon2xx(t *testing.T) {
 		if errors.Is(err, ErrStaleFencingToken) {
 			t.Fatalf("HTTP %d가 stale token으로 분류됐다(409만 stale이다)", status)
 		}
+		// 보증이 없는 실패다 — state를 지어내면 호출자가 정리(down)를 실행한다.
+		var se *SwitchError
+		if !errors.As(err, &se) || se.SwitchState() != "" {
+			t.Fatalf("HTTP %d: state=%q, 빈 문자열(보증 없음) 기대", status, se.SwitchState())
+		}
+	}
+}
+
+// 실패 응답의 state는 게이트웨이가 주는 유일한 보증이다 — 그대로 실어 나르고, 계약 밖의
+// 값·깨진 본문은 "보증 없음"("")으로 접는다(모르는 값을 보증으로 승격시키지 않는다).
+func TestGatewaySwitchCarriesFailureState(t *testing.T) {
+	cases := []struct {
+		name, body, want string
+	}{
+		{"ROLLED_BACK", `{"error":"switch failed","state":"ROLLED_BACK"}`, SwitchStateRolledBack},
+		{"INDETERMINATE", `{"error":"switch failed","state":"INDETERMINATE"}`, SwitchStateIndeterminate},
+		{"state 없음", `{"error":"switch failed"}`, ""},
+		{"계약 밖 값", `{"error":"x","state":"MAYBE"}`, ""},
+		{"깨진 JSON", `{상태`, ""},
+		{"빈 본문", ``, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			err := c.Switch(context.Background(), "green", 7)
+			var se *SwitchError
+			if !errors.As(err, &se) {
+				t.Fatalf("%s: err=%v, *SwitchError 기대", tc.name, err)
+			}
+			if se.SwitchState() != tc.want {
+				t.Fatalf("%s: state=%q, %q 기대", tc.name, se.SwitchState(), tc.want)
+			}
+			if se.StaleToken() {
+				t.Fatalf("%s: 500이 stale로 분류됐다", tc.name)
+			}
+		})
+	}
+}
+
+// 전송 실패(응답 없음)는 "전환되지 않았다"를 증명하지 못한다 — 보증 없음("")으로 남겨야
+// 호출자가 정리(down)를 하지 않고 사람에게 넘긴다.
+func TestGatewaySwitchTransportFailureHasNoGuarantee(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	c, err := NewGatewayClient(srv.URL, time.Second)
+	if err != nil {
+		t.Fatalf("클라이언트 조립 실패: %v", err)
+	}
+	srv.Close()
+	serr := c.Switch(context.Background(), "green", 7)
+	var se *SwitchError
+	if !errors.As(serr, &se) {
+		t.Fatalf("전송 실패: err=%v, *SwitchError 기대", serr)
+	}
+	if se.SwitchState() != "" || se.StaleToken() || se.Status != 0 {
+		t.Fatalf("전송 실패 분류: state=%q stale=%v status=%d, \"\"·false·0 기대(보증 없음)", se.SwitchState(), se.StaleToken(), se.Status)
+	}
+}
+
+// fencing token은 계약상 int64 양수(≥1)다 — 범위 밖이면 요청 자체를 보내지 않는다(부작용 0).
+// 직렬화 형태는 그대로다(uint64 JSON 숫자).
+func TestGatewaySwitchRejectsOutOfRangeToken(t *testing.T) {
+	for _, tok := range []uint64{0, uint64(math.MaxInt64) + 1, ^uint64(0)} {
+		requests := 0
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusOK)
+		}))
+		err := c.Switch(context.Background(), "green", tok)
+		if err == nil {
+			t.Fatalf("token=%d인데 통과 — 계약 범위 밖 토큰이 전송됐다", tok)
+		}
+		if requests != 0 {
+			t.Fatalf("token=%d: 요청 %d회 전송됨, 0 기대(부작용 0)", tok, requests)
+		}
+	}
+	// 상한 경계값(MaxInt64)은 정상 전송된다 — 유효 범위를 좁히지 않는다.
+	var got switchRequest
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	if err := c.Switch(context.Background(), "green", uint64(math.MaxInt64)); err != nil {
+		t.Fatalf("token=MaxInt64인데 거부: %v", err)
+	}
+	if got.FencingToken != uint64(math.MaxInt64) {
+		t.Fatalf("직렬화된 token=%d, MaxInt64 기대(형태 불변)", got.FencingToken)
 	}
 }
 
