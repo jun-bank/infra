@@ -70,12 +70,29 @@ type Config struct {
 // defaultImageEnvVar는 ImageEnvVar 미지정 시의 기본 env 변수명이다.
 const defaultImageEnvVar = "DEPLOY_IMAGE_REF"
 
+// composeImagePlaceholder는 image가 무관한 compose 하위 명령(down·ps·status)이 프로젝트를
+// 파싱하도록 image env에 넣는 비어있지 않은 값이다. compose 파일의 image: ${VAR} 는 프로젝트
+// 로드 시 모든 서비스의 image/build를 먼저 검증하므로, VAR가 비면 "invalid compose project"로
+// 명령이 컨테이너를 건드리기도 전에 실패한다(통합 실측 — troubleshooting-false-unknown.md).
+// 이 명령들은 기존 컨테이너를 프로젝트 라벨로 다루므로 image 값 자체는 실행에 쓰이지 않는다 —
+// 파싱만 되면 되고, pull되지 않을 값으로 두어 오용을 눈에 띄게 한다. up은 별도로 실제 pinned
+// digest를 주입한다(digest 고정은 up이 늘 실주입하므로 유지된다).
+const composeImagePlaceholder = "noncreate.invalid/unused:noncreate-ops-only"
+
 // imageEnvVar는 설정된 env 변수명(없으면 기본)을 준다.
 func (c Config) imageEnvVar() string {
 	if c.ImageEnvVar == "" {
 		return defaultImageEnvVar
 	}
 	return c.ImageEnvVar
+}
+
+// composeEnv는 image-무관 compose 명령(down·ps·status)에 주입할 image env를 만든다.
+// up이 실제 digest를 주입하는 것과 짝을 이뤄, 모든 compose 명령이 프로젝트를 파싱할 수 있게
+// 한다(imageEnvVar는 기본값이 있어 항상 비어있지 않다). 실행 대상 컨테이너는 프로젝트 라벨로
+// 정해지므로 여기 image 값(placeholder)은 어떤 컨테이너도 만들거나 pull하지 않는다.
+func (c Config) composeEnv() []string {
+	return []string{c.imageEnvVar() + "=" + composeImagePlaceholder}
 }
 
 // commandLine은 sudo 프리픽스를 앞에 붙인 전체 argv를 만든다(순수 함수 — raw shell 없음).
@@ -210,7 +227,9 @@ func (e *Executor) Down(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = e.run(ctx, argv, nil, e.stdin())
+	// image-무관 명령이지만 compose 파일이 ${VAR}를 프로젝트 로드 시 검증하므로 env를 준다
+	// (없으면 "invalid compose project"로 정리가 실패해 false-UNKNOWN이 된다 — 통합 실측).
+	_, err = e.run(ctx, argv, e.cfg.composeEnv(), e.stdin())
 	return err
 }
 
@@ -220,7 +239,7 @@ func (e *Executor) Status(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return e.run(ctx, argv, nil, e.stdin())
+	return e.run(ctx, argv, e.cfg.composeEnv(), e.stdin())
 }
 
 // RestartCount는 컨테이너 재시작 횟수를 읽는다(docker inspect — 부작용 없는 조회).
@@ -246,7 +265,7 @@ func (e *Executor) RestartCount(ctx context.Context, name string) (int, error) {
 // 하게 한다. 빈 목록은 오류가 아니라 빈 슬라이스로 준다 — 판정은 호출자가 한다.
 func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
 	argv := e.cfg.commandLine("docker", "compose", "-f", e.cfg.ComposeFile, "-p", e.cfg.Project, "ps", "-q")
-	out, err := e.run(ctx, argv, nil, e.stdin())
+	out, err := e.run(ctx, argv, e.cfg.composeEnv(), e.stdin())
 	if err != nil {
 		return nil, fmt.Errorf("dispatch: green 컨테이너 조회 실패(compose ps -q): %w", err)
 	}
@@ -265,7 +284,7 @@ func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
 // 아니라 빈 슬라이스로 준다 — 판정은 호출자가 한다.
 func (e *Executor) projectContainerIDs(ctx context.Context) ([]string, error) {
 	argv := e.cfg.commandLine("docker", "compose", "-f", e.cfg.ComposeFile, "-p", e.cfg.Project, "ps", "-a", "-q")
-	out, err := e.run(ctx, argv, nil, e.stdin())
+	out, err := e.run(ctx, argv, e.cfg.composeEnv(), e.stdin())
 	if err != nil {
 		return nil, fmt.Errorf("dispatch: 프로젝트 컨테이너 조회 실패(compose ps -a -q): %w", err)
 	}

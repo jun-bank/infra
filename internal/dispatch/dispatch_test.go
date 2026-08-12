@@ -392,3 +392,69 @@ func contains(s []string, v string) bool {
 	}
 	return false
 }
+
+// 회귀(2026-08-12 통합 실측 · troubleshooting-false-unknown.md): image가 무관한 compose
+// 명령(down·ps·status)도 image env를 주입해야 한다. compose 파일의 image: ${VAR}는 프로젝트
+// 로드 시 검증되므로, VAR가 비면 "invalid compose project"로 명령이 실패해 정리(down)·이미지
+// 대조(ps)가 무너지고 false-UNKNOWN이 된다. up만 주입하던 비대칭을 이 테스트가 고정한다.
+func TestComposeOpsInjectImageEnv(t *testing.T) {
+	cfg := Config{ComposeFile: "/etc/deploy/green.yml", Project: "core-green", ImageEnvVar: "CORE_IMAGE"}
+	wantEnv := "CORE_IMAGE=" + composeImagePlaceholder
+
+	hasEnv := func(env []string) bool {
+		for _, e := range env {
+			if e == wantEnv {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("down", func(t *testing.T) {
+		r := &captureRunner{}
+		if err := newExec(cfg, r).Down(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !hasEnv(r.env) {
+			t.Fatalf("down env에 %q 없음: %v", wantEnv, r.env)
+		}
+	})
+	t.Run("GreenContainers", func(t *testing.T) {
+		r := &captureRunner{}
+		if _, err := newExec(cfg, r).GreenContainers(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !hasEnv(r.env) {
+			t.Fatalf("ps -q env에 %q 없음: %v", wantEnv, r.env)
+		}
+	})
+	t.Run("Status", func(t *testing.T) {
+		r := &captureRunner{}
+		if _, err := newExec(cfg, r).Status(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !hasEnv(r.env) {
+			t.Fatalf("status env에 %q 없음: %v", wantEnv, r.env)
+		}
+	})
+	t.Run("up은 placeholder가 아니라 실제 digest를 주입", func(t *testing.T) {
+		r := &captureRunner{}
+		ref := "ghcr.io/jun-bank/core@sha256:" + strings.Repeat("a", 64)
+		if err := newExec(cfg, r).Up(context.Background(), ref); err != nil {
+			t.Fatal(err)
+		}
+		want := "CORE_IMAGE=" + ref
+		found := false
+		for _, e := range r.env {
+			if e == want {
+				found = true
+			}
+			if e == wantEnv {
+				t.Fatalf("up이 placeholder를 주입함(digest 고정 붕괴): %v", r.env)
+			}
+		}
+		if !found {
+			t.Fatalf("up env에 실제 digest %q 없음: %v", want, r.env)
+		}
+	})
+}
