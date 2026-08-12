@@ -78,12 +78,41 @@ type OIDCPolicy struct {
 	Skew         time.Duration // exp/nbf/iat 판정 허용 시계 편차([구현 검증])
 }
 
+// 게이트 2가 내는 기계 판독 거절 코드다(RL-8 이력의 ReasonCode). 사람이 읽는 사유
+// 문자열은 문면이 바뀌면 집계·알림이 조용히 깨지므로, **운영 대응이 갈리는** 사유에는
+// 코드를 함께 싣는다:
+//
+//	UNREGISTERED_REPO      — 등재되지 않은 저장소(권한 없음 · 침입 조사 대상)
+//	REPO_RENAMED           — ID는 등재됐으나 이름이 다름(allowlist 갱신 필요 · 운영 조치)
+//	WORKFLOW_REF_MISMATCH  — 등재 저장소의 다른 워크플로(CI 설정 오류 또는 우회 시도)
+//
+// 나머지 행렬 칸(iss·aud·시간·jti 등)은 코드를 붙이지 않는다 — 대응이 "거절 확인"으로
+// 같고, 코드 어휘를 필요 없이 늘리면 그 자체가 유지 대상이 된다. 필요해지면 그때 는다.
+const (
+	ReasonUnregisteredRepo    = "UNREGISTERED_REPO"
+	ReasonRepoRenamed         = "REPO_RENAMED"
+	ReasonWorkflowRefMismatch = "WORKFLOW_REF_MISMATCH"
+)
+
+// OIDCReject는 하나의 거절이다: 기계 판독 코드(없을 수 있다)와 사람이 읽는 사유.
+// Reason이 비어 있으면 거절이 아니다(통과).
+type OIDCReject struct {
+	Code   string
+	Reason string
+}
+
+// rejected는 이 값이 거절인지 본다(사유가 곧 거절의 존재다).
+func (r OIDCReject) rejected() bool { return r.Reason != "" }
+
 // OIDCDecision은 게이트 2의 결과다. 거절 사유(RL-8 기록 의무)와, 통과 시 선점할 jti,
 // 그리고 운영 승인이 자기 신고에 머무는지(SelfReport · 잔여-5)를 담는다.
 type OIDCDecision struct {
 	Accepted bool
-	Reason   string // Accepted=false일 때 영속화할 거절 사유(RL-8)
-	JTI      string // 검증된 토큰의 jti — 부작용 전 선점에 쓴다(DO-10 ⑶)
+	Reason   string // Accepted=false일 때 영속화할 거절 사유(RL-8 — 사람이 읽는 문장)
+	// ReasonCode는 그 거절의 기계 판독 코드다(위 Reason* 상수 중 하나 또는 빈 값).
+	// 이력에 함께 남아 코드별 질의·알림이 문자열 매칭에 기대지 않게 한다.
+	ReasonCode string
+	JTI        string // 검증된 토큰의 jti — 부작용 전 선점에 쓴다(DO-10 ⑶)
 	// AllowedTarget은 이 신원이 배포할 수 있는 대상 하나다(allowlist 항목의 target).
 	// Accepted=true일 때만 의미가 있으며, 진입 층이 요청 manifest의 target과 대조해
 	// repo↔target 결박을 세운다(A2 · design rev.2 변경 ①). 신원 판정의 산출물이므로
@@ -265,10 +294,10 @@ func (v *OIDCVerifier) Verify(ctx context.Context, rawToken string) OIDCDecision
 	if err != nil {
 		return OIDCDecision{Accepted: false, Reason: "OIDC 서명 검증 실패"}
 	}
-	target, reason := v.checkClaims(claims, v.clock.Now())
-	if reason != "" {
+	target, rej := v.checkClaims(claims, v.clock.Now())
+	if rej.rejected() {
 		// jti는 담아 둔다 — 감사 기록이 어떤 토큰이 거절됐는지 알 수 있게(신뢰값 아님).
-		return OIDCDecision{Accepted: false, Reason: reason, JTI: claims.JTI}
+		return OIDCDecision{Accepted: false, Reason: rej.Reason, ReasonCode: rej.Code, JTI: claims.JTI}
 	}
 	// 통과 — "우리 파이프라인에서 왔다"까지 기계 증명. "운영 승인됐다"는 environment
 	// 결박이 플랫폼에서 서는지 판정되기 전까지 자기 신고다(잔여-5 · IV-37). 허용 target을
@@ -287,72 +316,72 @@ func (v *OIDCVerifier) Verify(ctx context.Context, rawToken string) OIDCDecision
 //
 // ★ sub는 검사하지 않는다(DO-11 각주). claims.Subject는 위 칸들의 합성일 뿐이라
 // 대조하면 형식 변화에 조용히 무너진다 — 구성 요소를 각각 본 것으로 판정이 끝난다.
-func (v *OIDCVerifier) checkClaims(c Claims, now time.Time) (deploy.Target, string) {
+func (v *OIDCVerifier) checkClaims(c Claims, now time.Time) (deploy.Target, OIDCReject) {
 	if c.Issuer != v.policy.Issuer {
-		return "", "iss 불일치 (다른 발급자)"
+		return "", OIDCReject{Reason: "iss 불일치 (다른 발급자)"}
 	}
 	// aud는 정확히 우리 audience 하나여야 한다 — 포함(contains) 검사면 우리값에 다른
 	// audience가 섞인 다중 aud 토큰도 통과한다. DO-11의 "전용" 문언은 단일값 기대이므로,
 	// 배열이면 원소가 1개이고 그 값이 우리 audience와 같아야 한다(정확 일치).
 	if len(c.Audience) != 1 || c.Audience[0] != v.policy.Audience {
-		return "", "aud 불일치 (우리 배포 전용 audience 정확히 하나 아님)"
+		return "", OIDCReject{Reason: "aud 불일치 (우리 배포 전용 audience 정확히 하나 아님)"}
 	}
 	// ★ allowlist의 키는 수치 ID다 — 이름은 이전·삭제 후 재생성으로 재사용되지만 수치
 	// ID는 재사용되지 않는다(A1). 이름은 아래에서 부가 대조한다.
 	entry, listed := v.policy.Allowlist.lookup(c.RepositoryID)
 	if !listed {
-		return "", "미등재 저장소 (repository_id가 allowlist에 없다 — 배포 권한 없음)"
+		return "", OIDCReject{Code: ReasonUnregisteredRepo, Reason: "미등재 저장소 (repository_id가 allowlist에 없다 — 배포 권한 없음)"}
 	}
 	// ID는 등재됐는데 이름이 다르다 = 저장소 개명·이전이거나 토큰 위조 시도다. 어느 쪽이든
 	// allowlist가 현실과 어긋난 상태이므로 통과시키지 않고 사유를 구분해 남긴다.
 	if !asciiEqualFold(c.Repository, entry.Repository) {
-		return "", "repository 이름 불일치 (등재 ID의 이름은 " + entry.Repository + " — 개명·이전 감지)"
+		return "", OIDCReject{Code: ReasonRepoRenamed, Reason: "repository 이름 불일치 (등재 ID의 이름은 " + entry.Repository + " — 개명·이전 감지)"}
 	}
 	if c.OwnerID != v.policy.OwnerID {
-		return "", "repository_owner_id 불일치 (수치 ID)"
+		return "", OIDCReject{Reason: "repository_owner_id 불일치 (수치 ID)"}
 	}
 	// ★ repository_owner(이름)·ref_type을 별도 칸으로 보지 않는 것은 무음 누락이 아니라
 	// 의도된 대체다 — owner는 위 수치 repository_owner_id(이름 재사용에 강함)로, ref_type은
 	// 아래 완전 ref 허용목록(refs/heads/main 등 ref 전체 대조)으로 각각 더 강하게 판정한다
 	// (DO-11 문언의 이름·ref_type 검사보다 강한 검사로 대체).
 	if !contains(v.policy.RefAllowlist, c.Ref) {
-		return "", "ref 허용목록 밖 (임의 브랜치·태그 배포 금지)"
+		return "", OIDCReject{Reason: "ref 허용목록 밖 (임의 브랜치·태그 배포 금지)"}
 	}
 	if c.JobWorkflowRef != entry.JobWorkflowRef {
-		return "", "job_workflow_ref 불일치 (같은 저장소의 다른 워크플로)"
+		return "", OIDCReject{Code: ReasonWorkflowRefMismatch, Reason: "job_workflow_ref 불일치 (같은 저장소의 다른 워크플로)"}
 	}
 
 	// 시간 — exp/nbf/iat. 게이트 1의 신선도와 같은 축이며 허용 skew를 함께 본다.
 	// 값이 존재하나 형식이 깨진 시간 claim은 무음 스킵하지 않고 거절한다(absent와 invalid를
 	// 구분: 없으면 아래 필수 여부로, 있는데 형식 오류면 여기서 거절).
 	if c.malformedTime != "" {
-		return "", "시간 claim 형식 오류 (" + c.malformedTime + " 값이 수치 아님 — 무음 스킵 금지)"
+		return "", OIDCReject{Reason: "시간 claim 형식 오류 (" + c.malformedTime + " 값이 수치 아님 — 무음 스킵 금지)"}
 	}
 	if c.ExpiresAt == 0 || c.IssuedAt == 0 {
-		return "", "시간 claim 부재 (exp/iat)"
+		return "", OIDCReject{Reason: "시간 claim 부재 (exp/iat)"}
 	}
 	skew := v.policy.Skew
 	exp := time.Unix(c.ExpiresAt, 0)
 	if now.After(exp.Add(skew)) {
-		return "", "토큰 만료 (exp 경과)"
+		return "", OIDCReject{Reason: "토큰 만료 (exp 경과)"}
 	}
 	iat := time.Unix(c.IssuedAt, 0)
 	if iat.After(now.Add(skew)) {
-		return "", "iat 미래 (아직 발급되지 않은 토큰)"
+		return "", OIDCReject{Reason: "iat 미래 (아직 발급되지 않은 토큰)"}
 	}
 	if c.NotBefore != 0 {
 		nbf := time.Unix(c.NotBefore, 0)
 		if now.Add(skew).Before(nbf) {
-			return "", "nbf 미도래 (아직 유효하지 않은 토큰)"
+			return "", OIDCReject{Reason: "nbf 미도래 (아직 유효하지 않은 토큰)"}
 		}
 	}
 
 	// jti는 부작용 전에 선점해야 재전송을 막는다(DO-10 ⑶) — 비어 있으면 선점할 키가
 	// 없으므로 거절한다.
 	if strings.TrimSpace(c.JTI) == "" {
-		return "", "jti 부재 (일회성 선점 불가 — 재전송 방어)"
+		return "", OIDCReject{Reason: "jti 부재 (일회성 선점 불가 — 재전송 방어)"}
 	}
-	return entry.Target, ""
+	return entry.Target, OIDCReject{}
 }
 
 // contains는 s에 target이 있는지 본다(정확 일치 — 부분·프리픽스 대조가 아니다).

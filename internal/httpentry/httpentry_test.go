@@ -97,20 +97,54 @@ func (f *fakeLedger) Reserve(_ context.Context, requestID, jti, bodyDigest strin
 // 배선(토큰 헤더 읽기·jti 전달·거절 시 401·기록)만 못박는다.
 // allowedTarget은 게이트 2가 판정한 이 신원의 허용 배포 대상이다(allowlist 항목의 target).
 // 진입 층의 결박 대조 입력이며, 기본은 core다 — 이 파일의 요청 대부분이 core manifest다.
+//
+// 동시성 테스트가 이 페이크를 여러 goroutine에서 공유하므로 상태는 mu가 지킨다(페이크의
+// 자체 race가 진짜 결함을 가리지 않게).
 type fakeOIDC struct {
+	mu            sync.Mutex
 	accept        bool
 	fixedJTI      string
 	reason        string
+	reasonCode    string
 	lastToken     string
+	calls         int
 	allowedTarget deploy.Target
+	// byToken이 설정되면 토큰 문자열마다 다른 결정을 낸다(교차 repo 시나리오 — 한 핸들러에
+	// 두 신원이 동시에 들어오는 경우). 없는 토큰은 거절이다.
+	byToken map[string]auth.OIDCDecision
 }
 
 func (f *fakeOIDC) Verify(_ context.Context, rawToken string) auth.OIDCDecision {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastToken = rawToken
+	f.calls++
+	if f.byToken != nil {
+		dec, ok := f.byToken[rawToken]
+		if !ok {
+			return auth.OIDCDecision{Accepted: false, Reason: "미등재 저장소(페이크)", ReasonCode: auth.ReasonUnregisteredRepo}
+		}
+		return dec
+	}
 	if !f.accept {
-		return auth.OIDCDecision{Accepted: false, Reason: f.reason}
+		return auth.OIDCDecision{Accepted: false, Reason: f.reason, ReasonCode: f.reasonCode}
 	}
 	return auth.OIDCDecision{Accepted: true, JTI: f.fixedJTI, SelfReport: true, AllowedTarget: f.allowedTarget}
+}
+
+// verifyCalls는 게이트 2가 몇 번 불렸는지다(게이트 1 실패 시 미호출 확인용).
+func (f *fakeOIDC) verifyCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// setAllowed는 다음 요청부터의 허용 대상·jti를 바꾼다(같은 요청을 다른 신원이 재전송하는
+// 시나리오 — 순차 호출 사이에서만 쓴다).
+func (f *fakeOIDC) setAllowed(jti string, target deploy.Target) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fixedJTI, f.allowedTarget = jti, target
 }
 
 // acceptingOIDC는 지정한 대상을 허용하는 통과 게이트 2 페이크다.
@@ -676,6 +710,11 @@ func TestTargetMismatchForbiddenBeforeReserve(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("허용 밖 대상: 코드 = %d, 기대 = 403", rec.Code)
 	}
+	// 응답은 "허용되지 않았다"까지다 — 허용 대상을 알려 주면 토큰을 쥔 쪽이 응답만으로
+	// 정책을 탐색할 수 있다(진단 값은 이력에 남는다).
+	if body := rec.Body.String(); strings.Contains(body, "core") || strings.Contains(body, "gateway") {
+		t.Errorf("403 응답이 대상 정보를 노출했다: %q", body)
+	}
 	if n := ledger.reserveCount(); n != 0 {
 		t.Errorf("결박 거절인데 원장 선점이 %d회 일어났다 (선점 이전에 끊어야 한다 — 부작용 0)", n)
 	}
@@ -737,8 +776,7 @@ func TestCompletedRequestResentByOtherRepoForbidden(t *testing.T) {
 
 	// 2차 — 같은 요청을 gateway repo의 토큰(허용 target = gateway)이 재전송한다.
 	// 요청 body의 대상은 core이므로 그 신원에는 허용되지 않는다.
-	oidc.allowedTarget = deploy.TargetGateway
-	oidc.fixedJTI = "jti-cross-done-2"
+	oidc.setAllowed("jti-cross-done-2", deploy.TargetGateway)
 	second := signedRequest("core", "req-cross-done", iat, exp)
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, second)

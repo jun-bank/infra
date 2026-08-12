@@ -36,6 +36,43 @@ tab	end`,
 	}
 }
 
+// 기계 판독 코드가 붙은 이력 행의 detail은 JSON **객체**여야 한다 — code로 질의·집계할 수
+// 있어야 하기 때문이다(스키마 ALTER 없이 detail->>'$.code'). 사람이 읽는 문장은 detail 키에
+// 함께 남는다.
+func TestCodedDetailJSONCarriesCode(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		code       string
+		detail     string
+		wantDetail bool
+	}{
+		{"코드 + 사유", "TARGET_FORBIDDEN", `허용=core 요청=gateway`, true},
+		{"코드만", "INTERNAL_BINDING_ERROR", "", false},
+		{"따옴표·개행 섞인 사유", "REPO_RENAMED", "이름=\"jun-bank/x\"\n줄바꿈", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := codedDetailJSON(tc.code, tc.detail)
+			str, ok := v.(string)
+			if !ok {
+				t.Fatalf("codedDetailJSON = %T, 문자열(JSON) 기대", v)
+			}
+			if !json.Valid([]byte(str)) {
+				t.Fatalf("codedDetailJSON = %q — 유효 JSON 아님(JSON 컬럼 INSERT 거부됨)", str)
+			}
+			var back map[string]string
+			if err := json.Unmarshal([]byte(str), &back); err != nil {
+				t.Fatalf("역직렬화 실패: %v (JSON 객체여야 한다 — 문자열이면 code 질의가 불가능)", err)
+			}
+			if back["code"] != tc.code {
+				t.Errorf("code = %q, 기대 = %q", back["code"], tc.code)
+			}
+			if got, has := back["detail"]; has != tc.wantDetail || (tc.wantDetail && got != tc.detail) {
+				t.Errorf("detail = %q(존재=%v), 기대 = %q(존재=%v)", got, has, tc.detail, tc.wantDetail)
+			}
+		})
+	}
+}
+
 // 리뷰 P3(수용된 동작): 비 UTF-8 바이트가 섞인 detail(실행기 원시 stdout/stderr)도 INSERT를
 // 깨서는 안 된다 — json.Marshal이 U+FFFD로 치환해 유효 JSON을 만든다(바이트 무손실은 아니지만
 // P1의 핵심인 INSERT 안전은 지킨다). 무손실 왕복은 이 입력에 요구하지 않는다(주석 계약).
