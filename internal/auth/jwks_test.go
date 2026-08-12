@@ -444,6 +444,38 @@ func TestJWKSRejectsHTTPSDowngradeRedirect(t *testing.T) {
 	}
 }
 
+// TestJWKSComposesInjectedCheckRedirect는 주입 클라이언트가 이미 건 CheckRedirect(여기선
+// 리다이렉트 전면 금지)를 조립이 덮어써 더 느슨하게 만들지 않는지 못박는다 — https 검사를
+// 먼저 하고 기존 정책도 이어 적용해야 한다(정책 합성). https 리다이렉트라 scheme 검사는
+// 통과하지만, 호출자의 금지 정책이 보존돼 거절돼야 한다.
+func TestJWKSComposesInjectedCheckRedirect(t *testing.T) {
+	key := genKey(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wellKnownPath:
+			_ = json.NewEncoder(w).Encode(discoveryDoc{JwksURI: srv.URL + "/jwks"})
+		case "/jwks":
+			http.Redirect(w, r, srv.URL+"/jwks2", http.StatusFound) // https(자기) — scheme은 통과
+		default:
+			_ = json.NewEncoder(w).Encode(jwkSet{Keys: []jwk{rsaToJWK("kid-1", &key.PublicKey)}})
+		}
+	}))
+	defer srv.Close()
+
+	client := srv.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return errors.New("호출자: 리다이렉트 전면 금지")
+	}
+	ks, err := NewHTTPKeySet(srv.URL, 10*time.Minute, WithHTTPClient(client), WithClock(&advClock{t: time.Now()}))
+	if err != nil {
+		t.Fatalf("NewHTTPKeySet 오류: %v", err)
+	}
+	if _, err := ks.VerificationKey(context.Background(), "kid-1"); err == nil {
+		t.Fatal("주입 클라이언트의 CheckRedirect(리다이렉트 금지)가 덮어써져 https 리다이렉트를 따라갔다 (정책 합성 실패)")
+	}
+}
+
 // TestParseRSAPublicKeyExponent는 지수(e) 조립이 플랫폼 무관하게 안전한지 못박는다.
 // 32비트에서 int 오버플로로 거대 e가 정상 양수로 wrap되지 않도록 길이·범위를 제한한다.
 func TestParseRSAPublicKeyExponent(t *testing.T) {

@@ -135,9 +135,20 @@ func NewHTTPKeySet(issuer string, ttl time.Duration, opts ...HTTPKeySetOption) (
 	// 리다이렉트 각 hop의 scheme을 https로 강제한다 — 정적 문자열 검사(requireHTTPS)만으론
 	// https discovery/jwks_uri가 302로 http(또는 공격자 https)로 다운그레이드하는 것을 못
 	// 막는다. 주입된 클라이언트(WithHTTPClient)에도 반드시 걸리도록 조립 지점에서 강제하되,
-	// http.Client를 값 복사해 호출자의 클라이언트에 부작용을 주지 않는다.
+	// http.Client를 값 복사해 호출자의 클라이언트에 부작용을 주지 않는다. ★ 호출자가 이미
+	// 건 CheckRedirect(예: 리다이렉트 전면 금지·host allowlist)를 덮어써 더 느슨하게 만들지
+	// 않도록, https 검사를 먼저 하고 기존 정책이 있으면 그것도 이어 적용한다(정책 합성).
 	c := *ks.httpClient
-	c.CheckRedirect = checkHTTPSRedirect
+	prev := c.CheckRedirect
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := checkHTTPSRedirect(req, via); err != nil {
+			return err
+		}
+		if prev != nil {
+			return prev(req, via)
+		}
+		return nil
+	}
 	ks.httpClient = &c
 	return ks, nil
 }
