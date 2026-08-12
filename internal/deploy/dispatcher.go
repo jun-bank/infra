@@ -2,7 +2,9 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jun-bank/infra/internal/store"
@@ -22,8 +24,10 @@ const CleanupTimeout = 30 * time.Second
 // 실제로 실행한다. 순서:
 //
 //	게이트웨이 미설정(단일 경로 · 하위호환): pull(②) → up(③) → 이미지 대조 → CD-1 헬스(④)
-//	게이트웨이 설정(블루-그린):              active slot 조회 → idle slot에 ②③④ →
+//	게이트웨이 설정 + target=core(블루-그린): active slot 조회 → idle slot에 ②③④ →
 //	                                         라우트 전환(⑤) → 드레인(⑥) → 구 slot down(⑨)
+//	게이트웨이 설정 + target=gateway:        단일 경로(자기 전환 불가 — 재기동 교체 DO-20 ⓐ)
+//	게이트웨이 설정 + 그 밖의 대상:          거절(부작용 0) — 슬롯 배선은 core 라우트 전용이다
 //
 // 전문 채널 축(⑦ 수신 정지·⑧ listener 활성)은 이 범위 밖이다 — SCG를 지나지 않는 채널이라
 // RL-3·CD-4 ⑦⑧이 따로 소유한다(ADR-031 BG-3 ⑴). 여기서 성립하는 드레인은 사람 채널뿐이다.
@@ -133,13 +137,16 @@ var _ Dispatcher = LocalDispatcher{}
 // Dispatch는 검증된 manifest를 실행하고 세 상태 중 하나를 낸다(DO-16). 상태 매핑:
 //
 //   - UNEXECUTED(+err): 부작용 순net 0이 증명됨 — repo 미설정·digest 형식 위반·배선 부재·
-//     active slot 조회 실패(전부 배포 시작 전)·pull 실패(CD-4 ②), 또는 up/헬스/전환 실패 후
-//     green을 성공적으로 down해 미전환(net 0)으로 되돌린 경우(CD-4 ④ · ⑤ 실패 전이).
+//     대상 불일치·토큰 범위 위반·active slot 조회 실패(전부 배포 시작 전)·pull 실패(CD-4 ②),
+//     또는 up/헬스 실패, 그리고 게이트웨이가 미전환을 보증한 전환 실패(state=ROLLED_BACK)
+//     뒤에 green을 성공적으로 down해 미전환(net 0)으로 되돌린 경우(CD-4 ④ · ⑤ 실패 전이).
 //     갓 pull된 로컬 이미지는 위반 부작용이 아니다(RL-5가 보존을 요구 — Q5).
 //   - COMPLETED: green up + CD-1 헬스 통과(게이트웨이 모드면 전환·드레인·구 slot 종료까지).
 //   - UNKNOWN(+err): 변이 명령을 던진 뒤 정리(down)마저 실패·불명 = green이 떠 있을 수
 //     있다. 또는 라우트 전환(⑤) 성공 후 드레인·구 slot 종료(⑨)가 실패해 신·구 두 프로세스가
-//     남았을 수 있다. 스스로 재시도하지 않는다(Q4) — 락 유지·사람 개입은 coordinator가 한다.
+//     남았을 수 있다. ⑤ 실패 중 미전환이 보증되지 않은 것(stale 409 = 소유권 상실 ·
+//     INDETERMINATE · 전송 실패)도 여기다 — 정리하지 않고 올린 컨테이너를 남긴 채 사람에게
+//     넘긴다. 스스로 재시도하지 않는다(Q4) — 락 유지·사람 개입은 coordinator가 한다.
 //     ⚠️ 이 경로의 오류 메시지는 사람 개입의 유일한 단서다 — 어느 단계가 실패했는지 반드시
 //     담는다(coordinator가 detail로 이력에 persist한다).
 //
@@ -152,13 +159,30 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, token store.F
 		return StateUnexecuted, err
 	}
 
-	// 게이트웨이 미설정 = 전환 단계가 없는 기존 단일 경로 그대로다(하위호환).
-	// target=gateway도 단일 경로다 — 게이트웨이는 전환 수단의 소유자라 자기 블루-그린을
-	// 자기가 전환할 수 없다(자기 참조). v1은 재기동 교체다(DO-20 ⓐ · 짧은 중단 수용).
-	if d.Gateway == nil || m.Target == TargetGateway {
+	switch {
+	// 게이트웨이 미설정 = 전환 단계가 없는 기존 단일 경로 그대로다(하위호환) — 이 호스트의
+	// 배포 대상이 무엇이든 자기 슬롯 없이 pull→up→대조→헬스로 끝난다.
+	case d.Gateway == nil:
 		return d.runGreenPhases(ctx, imageRef, d.Exec, d.Health)
+
+	// 블루-그린 전환은 **core 대상에만** 성립한다. 슬롯 배선(SlotExec·SlotHealth)과
+	// 게이트웨이 라우트는 core 라우트 하나에 결박돼 있다 — 게이트웨이 클라이언트가 보는
+	// 경로가 /internal/routes/core 고정이기 때문이다(BG-3 ⑴ — 사람 채널 앞단의 코어 라우트).
+	// 그래서 대상을 보지 않고 이 경로로 들어오면 settlement/ledger 이미지가 core의 슬롯을
+	// 덮어쓰고, 그 위에 core 라우트가 전환된다(대상 뒤바뀜 — 치명).
+	case m.Target == TargetCore:
+		return d.dispatchBlueGreen(ctx, imageRef, token)
+
+	// target=gateway는 단일 경로다 — 게이트웨이는 전환 수단의 소유자라 자기 블루-그린을
+	// 자기가 전환할 수 없다(자기 참조). v1은 재기동 교체다(DO-20 ⓐ · 짧은 중단 수용).
+	case m.Target == TargetGateway:
+		return d.runGreenPhases(ctx, imageRef, d.Exec, d.Health)
+
+	// 나머지(settlement·ledger)는 이 호스트의 배포 대상이 아니다. 조용히 core 슬롯으로
+	// 흘려보내지 않고 시작 전에 요란하게 거절한다(부작용 0 · fail-closed).
+	default:
+		return StateUnexecuted, fmt.Errorf("이 호스트에 해당 대상의 슬롯 배선이 없다 — target=%q는 블루-그린 슬롯(core 전용)도, 단일 경로 대상(gateway)도 아니다(부작용 0 · fail-closed · 대상 뒤바뀜 방지)", m.Target)
 	}
-	return d.dispatchBlueGreen(ctx, imageRef, token)
 }
 
 // imageRef는 실행 대상 이미지 참조를 고정한다(DO-18 ⑵). repo 미설정·digest 형식 위반은
@@ -238,14 +262,21 @@ func (d LocalDispatcher) runGreenPhases(ctx context.Context, imageRef string, ex
 // 실패 전이(cicd.md CD-4 부분 실패 전이 표 그대로):
 //   - 조회·배선 실패 = 배포 시작 전이므로 부작용 0 = UNEXECUTED(fail-closed).
 //   - ②③④ 실패 = green 정리 후 미전환(UNEXECUTED) · 정리 실패면 UNKNOWN.
-//   - ⑤ 실패(stale token 409 포함) = 라우트는 그대로 = 미전환 — green을 정리하고 UNEXECUTED.
-//     락 해제는 coordinator가 한다(전환 전 실패 = 락 해제).
+//   - ⑤ 실패 = 게이트웨이가 준 **보증**으로 셋으로 갈린다(handleSwitchFailure 참조):
+//     stale(409) = 정리 없이 UNKNOWN / ROLLED_BACK = green 정리 후 UNEXECUTED /
+//     그 밖(INDETERMINATE·전송 실패·보증 없음) = 정리 없이 UNKNOWN.
 //   - ⑤ 성공 후 ⑥⑨ 실패 = 라우트는 이미 옮겨졌다 = UNKNOWN(락 유지·사람) + 단계 명시.
 func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string, token store.FencingToken) (RemoteState, error) {
 	// 0. 배선·설정 확인(실행 전 — 부작용 0). DrainWait이 0 이하면 드레인이 실질적으로
 	//    사라져 in-flight를 절단한다 — 조용히 0으로 돌지 않고 거절한다(무음 축소 금지).
 	if d.DrainWait <= 0 {
 		return StateUnexecuted, fmt.Errorf("드레인 대기(CD-4 ⑥)가 %s로 설정돼 있다 — >0 이어야 한다(부작용 0 · fail-closed)", d.DrainWait)
+	}
+	// fencing token은 계약상 int64 양수(≥1)다 — 범위를 벗어난 토큰은 전환 요청에 실을 수
+	// 없으므로, 이미지를 올린 뒤 전환 단계에서 애매하게 실패하지 않도록 시작 전에 거절한다
+	// (부작용 0 · fail-closed).
+	if token == 0 || uint64(token) > maxFencingToken {
+		return StateUnexecuted, fmt.Errorf("fencing token이 계약 범위를 벗어났다(1..%d의 int64 양수여야 한다) — 배포 미시작(부작용 0 · fail-closed): token=%d", uint64(maxFencingToken), uint64(token))
 	}
 
 	// 1. 지금 트래픽을 받는 슬롯을 게이트웨이에 묻는다(부작용 없는 GET). 실패·미응답·낯선
@@ -274,26 +305,21 @@ func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string,
 	}
 
 	// 3. ⑤ 라우트 전환(BG-2 — CD-1 통과 뒤에만 여기 온다). fencing token을 동봉해
-	//    게이트웨이가 stale 실행자의 write를 거절하게 한다(BG-4 ⓐ). 409(stale)·그 밖의
-	//    오류 모두 "전환되지 않았다"이므로 green을 정리하고 미전환으로 되돌린다.
+	//    게이트웨이가 stale 실행자의 write를 거절하게 한다(BG-4 ⓐ). 실패 처리는
+	//    handleSwitchFailure가 게이트웨이의 보증에 따라 셋으로 가른다.
 	//    ⚠️ 잔여 ⑴: 단계 직전 락 보유 재확인(BG-4 · CD-3 — ⑤ 앞과 ⑨ 앞)은 여기서 하지
 	//    않는다 — dispatch는 락 표면을 들고 있지 않고, coordinator가 dispatch 직전 1회
 	//    확인한다. ⑤의 창은 sink-side 토큰 검증(위)이 덮지만, ⑨(구 slot down)은 그 결박
 	//    밖이다(락을 잃은 실행자의 down이 남는다 — 락 표면을 dispatch까지 내려야 닫힌다).
-	//    ⚠️ 잔여 ⑵: 전송 실패(타임아웃·연결 끊김)는 "전환되지 않았다"를 증명하지 못한다 —
-	//    요청이 닿아 처리됐는데 응답만 유실됐을 수 있다. 그때 아래 정리(down)는 트래픽이
-	//    가는 쪽을 내리게 된다. CD-4 ⑤ 전이가 "green 정리·미전환"이므로 그대로 따르되,
-	//    이 창을 닫으려면 정리 전에 라우트를 재조회해 실제 상태로 판정해야 한다(후속).
 	if err := d.Gateway.Switch(ctx, string(idle), uint64(token)); err != nil {
-		st, cerr := cleanupAfterFailure(ctx, idleExec, fmt.Sprintf("⑤ 라우트 전환 실패(미전환 · 라우트는 %s 그대로)", active), err)
-		return st, cerr
+		return handleSwitchFailure(ctx, idleExec, active, idle, err)
 	}
 
 	// 4. ⑥ 드레인 + ⑨ 구 active slot 종료. 여기부터는 라우트가 이미 옮겨졌으므로 요청 ctx가
 	//    취소돼도 완주해야 한다 — 중간에 손을 떼면 구 slot이 그대로 남아 잔존 프로세스가
 	//    된다(DB 커넥션·배치 스레드를 계속 잡는다). cleanup과 같은 detached 패턴을 쓴다.
 	post := context.WithoutCancel(ctx)
-	drainWait(post, d.DrainWait)
+	drainWait(d.DrainWait)
 
 	// ⑨ 구 active slot만 down한다(BG-3 ⑶ — 별개 compose project라 새 slot을 끄지 않는다).
 	//    이미지는 남긴다(RL-5 — 로컬 되돌림이 성립해야 한다).
@@ -306,14 +332,66 @@ func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string,
 	return StateCompleted, nil
 }
 
-// drainWait은 전환 후 구 slot의 in-flight 소진을 기다린다(CD-4 ⑥ · BG-3).
+// drainWait은 전환 후 구 slot의 in-flight 소진을 기다린다(CD-4 ⑥ · BG-3). 라우트가 이미
+// 옮겨진 뒤이므로 드레인은 **완주가 계약**이다 — 요청 ctx가 취소돼도 중간에 손을 떼면 아직
+// 처리 중인 요청 위로 down이 떨어진다. 그래서 취소 축이 없는 단순 sleep이다(이전의
+// select+ctx.Done()은 호출자가 넘기던 WithoutCancel ctx의 Done()이 nil이라 영원히 선택되지
+// 않는 죽은 가지였다 — 취소를 지원하는 것처럼 보이던 겉모습만 걷어냈다).
 // ⚠️ [구현 검증] IV-17/CDV-2 — v1은 관측이 아니라 고정 대기다(위 DrainWait 주석 참조).
-func drainWait(ctx context.Context, wait time.Duration) {
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-ctx.Done():
+func drainWait(wait time.Duration) { time.Sleep(wait) }
+
+// maxFencingToken은 전환 요청에 실을 수 있는 fencing token의 상한이다 — 계약상 토큰은
+// int64 양수(≥1)이며(store는 uint64로 들고 다닌다), 상위 절반 값은 sink 쪽에서 음수로
+// 접히거나 거절된다. 범위 밖이면 배포를 시작하지 않는다(부작용 0).
+const maxFencingToken = uint64(math.MaxInt64)
+
+// switchStateRolledBack은 전환 실패 응답이 싣는 state 중 **정리를 허가하는 유일한 값**이다
+// (게이트웨이 계약 — internal/dispatch의 클라이언트가 파싱해 오류에 싣는다): 전환을 시도했으나
+// 되돌렸다 = 라우트는 구 slot 그대로 = 미전환 보증. 나머지 값(NOT_ATTEMPTED는 409 갈래가
+// 먼저 가져가고, INDETERMINATE·부재)은 여기서 보증으로 쓰지 않는다 — 이 패키지는 문자열
+// 값만 알면 되고 구현 패키지를 import하지 않는다.
+const switchStateRolledBack = "ROLLED_BACK"
+
+// switchFailure는 ⑤ 전환 실패 오류가 실을 수 있는 구조화 정보다(소비 지점 인터페이스 —
+// 구현 패키지가 이 패키지를 import하지 않도록 메서드 시그니처만 계약이다 · IA-5).
+// 문자열 매칭으로 갈래를 읽지 않는 것이 요점이다 — 메시지가 바뀌면 조용히 오분류된다.
+type switchFailure interface {
+	// SwitchState는 게이트웨이가 보증한 실상태다("" = 보증 없음).
+	SwitchState() string
+	// StaleToken은 fencing token 거절(409 — 소유권 상실)인지다.
+	StaleToken() bool
+}
+
+// classifySwitchFailure는 전환 오류에서 보증을 읽는다. 구조화 정보가 없는 오류(평범한
+// error)는 "보증 없음"이다 — 모르면 정리하지 않는 쪽으로 접힌다(fail-closed).
+func classifySwitchFailure(err error) (stale bool, state string) {
+	var f switchFailure
+	if errors.As(err, &f) {
+		return f.StaleToken(), f.SwitchState()
+	}
+	return false, ""
+}
+
+// handleSwitchFailure는 ⑤ 실패를 게이트웨이의 **보증**에 따라 셋으로 가른다. 핵심은
+// "정리(down)는 미전환이 보증됐을 때만 한다"이다 — 실상태를 모르는데 내리면 트래픽이 가는
+// 쪽을 끊는다(별도 재조회로 대신하지 않는다: 게이트웨이 GET도 registry 기준이라 실상태
+// 보증이 아니고, 보증은 전환 응답의 state가 소유한다).
+//
+//   - stale(409): 이 실행자는 소유권을 잃었다(다른 배포가 진행 중). 승자가 같은 idle 슬롯을
+//     자기 green으로 쓰거나 이미 그쪽으로 라우트를 옮겼을 수 있으므로 **아무것도 건드리지
+//     않는다** — 정리 down이 승자의 라이브 슬롯을 절단하는 것이 여기서 막는 치명 경합이다.
+//     올린 컨테이너가 남으므로 net-0이 아니다 = UNKNOWN.
+//   - ROLLED_BACK: 라우트가 구 slot 그대로임이 보증됐다 = 올린 slot을 정리해 net-0 복원.
+//   - 그 밖(INDETERMINATE·전송 실패·타임아웃·state 파싱 불가): 실상태 불명 = 정리 금지·UNKNOWN.
+func handleSwitchFailure(ctx context.Context, idleExec HostExecutor, active, idle Slot, err error) (RemoteState, error) {
+	stale, state := classifySwitchFailure(err)
+	switch {
+	case stale:
+		return StateUnknown, fmt.Errorf("⑤ 라우트 전환이 fencing token 거절(409)로 실패했다 — 소유권 상실(다른 배포가 진행 중이다) · 승자의 슬롯을 건드리지 않는다(정리 down 생략 — 이 배포가 %s에 올린 컨테이너는 그대로 남는다 · net-0 아님) · UNKNOWN(락 유지·사람 개입): %w", idle, err)
+	case state == switchStateRolledBack:
+		return cleanupAfterFailure(ctx, idleExec, fmt.Sprintf("⑤ 라우트 전환 실패(게이트웨이가 미전환을 보증했다 state=%s · 라우트는 %s 그대로)", switchStateRolledBack, active), err)
+	default:
+		return StateUnknown, fmt.Errorf("⑤ 라우트 전환 실패 — 게이트웨이가 미전환을 보증하지 않았다(state=%q · INDETERMINATE·전송 실패·타임아웃·응답 파싱 불가가 여기 온다) · 라우트가 이미 %s로 옮겨졌을 수 있어 정리(down)를 하지 않는다(내리면 트래픽이 가는 쪽을 끊는다) · UNKNOWN(락 유지·사람 개입): %w", state, idle, err)
 	}
 }
 

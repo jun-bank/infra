@@ -49,7 +49,10 @@ func TestLeaseCoversDispatch(t *testing.T) {
 func TestLeaseCoversDispatchIncludesCutover(t *testing.T) {
 	phase, d := 120*time.Second, 60*time.Second
 	base := phase + d + deploy.CleanupTimeout + dispatchLeaseSlack
-	cutover := cutoverBudget(defaultGatewayTimeout, defaultDrainWait)
+	cutover, err := cutoverBudget(defaultGatewayTimeout, defaultDrainWait)
+	if err != nil {
+		t.Fatalf("기본값으로 전환 예산 산정 실패: %v", err)
+	}
 	if cutover <= 0 {
 		t.Fatalf("전환 예산이 0 이하다: %s", cutover)
 	}
@@ -73,9 +76,64 @@ func TestDefaultConfigLeaseCoversDispatch(t *testing.T) {
 	if err := leaseCoversDispatch(defaultDeployLease, defaultDispatchPhaseBudget, defaultHealthDeadline, 0); err != nil {
 		t.Fatalf("기본 설정이 자기정합하지 않다(게이트웨이 미설정 · 기본값으로 기동 불가): %v", err)
 	}
-	cutover := cutoverBudget(defaultGatewayTimeout, defaultDrainWait)
+	cutover, err := cutoverBudget(defaultGatewayTimeout, defaultDrainWait)
+	if err != nil {
+		t.Fatalf("기본값으로 전환 예산 산정 실패: %v", err)
+	}
 	if err := leaseCoversDispatch(defaultDeployLease, defaultDispatchPhaseBudget, defaultHealthDeadline, cutover); err != nil {
 		t.Fatalf("기본 설정이 자기정합하지 않다(블루-그린 · 기본값으로 기동 불가): %v", err)
+	}
+}
+
+// S6: 전환 예산은 **합산 전에** 항별로 상한돼야 한다 — 거대 게이트웨이 타임아웃·드레인이
+// 2*gatewayTimeout+drainWait을 int64 overflow로 음수(또는 작은 양수)로 접으면, 그 예산이
+// leaseCoversDispatch의 [0, max] 검사를 통과해 하한식 전체가 fail-open이 된다.
+func TestCutoverBudgetRejectsExtremeTerms(t *testing.T) {
+	overflowing := []struct {
+		name      string
+		gw, drain time.Duration
+	}{
+		{"게이트웨이 타임아웃 0", 0, defaultDrainWait},
+		{"드레인 0", defaultGatewayTimeout, 0},
+		{"게이트웨이 타임아웃 음수", -time.Second, defaultDrainWait},
+		{"게이트웨이 타임아웃 상한 초과", maxDispatchDuration + time.Second, defaultDrainWait},
+		{"드레인 상한 초과", defaultGatewayTimeout, maxDispatchDuration + time.Second},
+		// 합이 뒤집히는 값 — 항별 검증이 없으면 2*gw가 음수가 되어 작은 예산으로 위장한다.
+		{"overflow 유발 타임아웃", time.Duration(1<<62) + time.Hour, defaultDrainWait},
+		{"overflow 유발 드레인", defaultGatewayTimeout, time.Duration(1<<62) + time.Hour},
+	}
+	for _, c := range overflowing {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := cutoverBudget(c.gw, c.drain)
+			if err == nil {
+				t.Fatalf("%s인데 통과(예산=%s) — 합산 전 항별 상한이 없다(fail-open)", c.name, got)
+			}
+		})
+	}
+	// 정상 범위는 그대로 합산된다(검사가 유효 범위를 좁히지 않는다).
+	got, err := cutoverBudget(5*time.Second, 20*time.Second)
+	if err != nil || got != 2*5*time.Second+20*time.Second+deploy.CleanupTimeout {
+		t.Fatalf("정상 항: 예산=%s err=%v", got, err)
+	}
+}
+
+// S6(연결): 극단 env가 들어오면 기동 자체가 거부돼야 한다 — 예산 산정이 조립 경로에 있으므로
+// 런타임까지 숨지 않는다.
+func TestBuildDispatcherRejectsExtremeCutoverEnv(t *testing.T) {
+	cases := []struct{ name, key, val string }{
+		{"거대 드레인", "DEPLOY_DRAIN_WAIT", "2562047h"},
+		{"거대 게이트웨이 타임아웃", "DEPLOY_GATEWAY_TIMEOUT", "2562047h"},
+		{"상한 초과 드레인", "DEPLOY_DRAIN_WAIT", "2h"},
+		{"상한 초과 게이트웨이 타임아웃", "DEPLOY_GATEWAY_TIMEOUT", "90m"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setBlueGreenEnv(t)
+			t.Setenv(c.key, c.val)
+			if _, err := buildDispatcher(); err == nil {
+				t.Fatalf("%s(%s=%q)인데 기동 통과 — 전환 예산 overflow 경로가 열린다", c.name, c.key, c.val)
+			}
+		})
 	}
 }
 
@@ -167,7 +225,11 @@ func TestBuildDispatcherBlueGreen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("블루-그린 정상 env인데 조립 실패: %v", err)
 	}
-	if want := cutoverBudget(5*time.Second, 20*time.Second); b.cutoverBudget != want {
+	want, werr := cutoverBudget(5*time.Second, 20*time.Second)
+	if werr != nil {
+		t.Fatalf("전환 예산 산정 실패: %v", werr)
+	}
+	if b.cutoverBudget != want {
 		t.Fatalf("전환 예산=%s, 기대 %s", b.cutoverBudget, want)
 	}
 	d, ok := b.disp.(deploy.LocalDispatcher)
@@ -185,6 +247,41 @@ func TestBuildDispatcherBlueGreen(t *testing.T) {
 	// 그 배포는 실행 지점에서 요란하게 거절된다(조용한 성공 아님).
 	if d.Exec != nil || d.Health != nil {
 		t.Fatal("단일 변수 미설정인데 단일 경로가 배선됐다")
+	}
+}
+
+// setSingleVars는 단일 경로(target=gateway 전용) 변수 셋을 채운다 — project 이름만 바꿔가며
+// 프로젝트 유일성 검사를 두드리기 위한 헬퍼다.
+func setSingleVars(t *testing.T, project string) {
+	t.Helper()
+	t.Setenv("DEPLOY_COMPOSE_FILE", "/x/compose.yml")
+	t.Setenv("DEPLOY_COMPOSE_PROJECT", project)
+	t.Setenv("DEPLOY_HEALTH_URL", "http://127.0.0.1:8080/ready")
+}
+
+// S9: compose project는 single·blue·green 3자 **쌍별로** 달라야 한다 — down이 프로젝트
+// 단위라, 겹치면 한쪽의 종료·정리 down이 다른 쪽 컨테이너를 철거한다(게이트웨이 배포의
+// down이 core 슬롯을 내리는 경로가 그것이다).
+func TestBuildDispatcherRejectsDuplicateComposeProjects(t *testing.T) {
+	dup := []struct{ name, single string }{
+		{"단일 = blue", "core-blue"},
+		{"단일 = green", "core-green"},
+	}
+	for _, c := range dup {
+		t.Run(c.name, func(t *testing.T) {
+			setBlueGreenEnv(t)
+			setSingleVars(t, c.single)
+			if _, err := buildDispatcher(); err == nil {
+				t.Fatalf("%s(project=%q)인데 기동 통과 — 한쪽 down이 다른 쪽을 철거한다", c.name, c.single)
+			}
+		})
+	}
+
+	// 셋이 서로 다르면 정상 조립된다(검사가 정당한 설정을 막지 않는다).
+	setBlueGreenEnv(t)
+	setSingleVars(t, "core-single")
+	if _, err := buildDispatcher(); err != nil {
+		t.Fatalf("세 프로젝트가 서로 다른데 거부: %v", err)
 	}
 }
 
