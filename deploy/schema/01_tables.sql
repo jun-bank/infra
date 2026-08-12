@@ -76,7 +76,10 @@ CREATE TABLE IF NOT EXISTS `deploy_request_ledger` (
 -- (락 획득 시 원자적으로 검사 — DO-17 ⑴). fail-closed 기본값은 operational이다(DO-17 ⑷).
 CREATE TABLE IF NOT EXISTS `deploy_mode` (
   `id`           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  `target`       ENUM('core','settlement','ledger') NOT NULL,
+  -- target — 배포 대상의 닫힌 집합(ADR-027 DO-20 v0.5: 2026-08-12에 셋 → 넷. 게이트웨이는
+  -- 우리 배포물·우리 호스트라 엣지 제외 근거에 해당하지 않는다). ENUM이라 그 밖의 값은
+  -- INSERT 시점에 거부된다 — 닫힌 집합이 DB에서도 한 번 더 강제된다.
+  `target`       ENUM('core','settlement','ledger','gateway') NOT NULL,
   `mode`         ENUM('dev','operational') NOT NULL,
   `mode_version` BIGINT UNSIGNED NOT NULL,   -- 대상별 단조 증가 = 그 append
   `actor`        VARCHAR(255) NOT NULL,       -- 인증된 subject에서 파생(DO-12 ⑶)
@@ -98,7 +101,7 @@ CREATE TABLE IF NOT EXISTS `deploy_history` (
   -- event_type: RESERVED / PROGRESS / STEP_RESULT / COMPLETED / REJECTED /
   -- LOCK_ACQUIRED / LOCK_RELEASED / PREEMPT / SAFETY_ACK / OVERRIDE_ACQUIRED.
   `event_type`      VARCHAR(32) NOT NULL,
-  `target`          ENUM('core','settlement','ledger') NULL,
+  `target`          ENUM('core','settlement','ledger','gateway') NULL,  -- DO-20 v0.5 — 넷
   `commit_sha`      VARCHAR(64)  NULL,
   `manifest_digest` VARCHAR(128) NULL,
   `step`            VARCHAR(64)  NULL,   -- CD-4 스텝 이름

@@ -26,7 +26,7 @@ func TestLeaseCoversDispatch(t *testing.T) {
 		phase + d,             // cleanup+slack 누락
 		min - time.Nanosecond, // 경계 바로 아래
 	} {
-		if err := leaseCoversDispatch(lease, phase, d); err == nil {
+		if err := leaseCoversDispatch(lease, phase, d, 0); err == nil {
 			t.Errorf("lease=%s < min=%s 인데 통과(fail-closed 위반)", lease, min)
 		}
 	}
@@ -37,18 +37,45 @@ func TestLeaseCoversDispatch(t *testing.T) {
 		min + time.Second,
 		10 * time.Minute,
 	} {
-		if err := leaseCoversDispatch(lease, phase, d); err != nil {
+		if err := leaseCoversDispatch(lease, phase, d, 0); err != nil {
 			t.Errorf("lease=%s >= min=%s 인데 거부: %v", lease, min, err)
 		}
 	}
 }
 
-// 기본 설정끼리 자기정합해야 한다 — 기본 lease가 기본 phaseBudget+D+cleanup+slack를 덮지
-// 못하면, 아무 env도 안 준 운영자의 agent가 leaseCoversDispatch에서 fail-closed로 기동하지
-// 못한다. 기본값을 바꿀 때 이 정합성이 깨지지 않게 막는다.
+// BG-4: 전환(⑤⑥⑨)은 락 보유 단계이므로 lease 하한식에 그 예산이 들어가야 한다 — 전환 없이
+// 통과하던 lease가 전환 예산이 붙으면 거부돼야 한다(그러지 않으면 드레인·구 slot 종료가 락
+// 만료 뒤 실행돼, 다른 배포가 잡은 슬롯을 이 배포의 down이 철거할 수 있다).
+func TestLeaseCoversDispatchIncludesCutover(t *testing.T) {
+	phase, d := 120*time.Second, 60*time.Second
+	base := phase + d + deploy.CleanupTimeout + dispatchLeaseSlack
+	cutover := cutoverBudget(defaultGatewayTimeout, defaultDrainWait)
+	if cutover <= 0 {
+		t.Fatalf("전환 예산이 0 이하다: %s", cutover)
+	}
+	// 전환 없으면 딱 맞던 lease가, 전환 단계가 붙으면 미달이어야 한다.
+	if err := leaseCoversDispatch(base, phase, d, 0); err != nil {
+		t.Fatalf("전환 없음·경계 lease인데 거부: %v", err)
+	}
+	if err := leaseCoversDispatch(base, phase, d, cutover); err == nil {
+		t.Fatalf("전환 예산(%s)이 붙었는데 같은 lease(%s)가 통과 — 전환이 락 밖으로 새어나간다(fail-open)", cutover, base)
+	}
+	if err := leaseCoversDispatch(base+cutover, phase, d, cutover); err != nil {
+		t.Fatalf("lease가 전환 예산까지 덮는데 거부: %v", err)
+	}
+}
+
+// 기본 설정끼리 자기정합해야 한다 — 기본 lease가 기본 phaseBudget+D+cleanup+(전환)+slack를
+// 덮지 못하면, 아무 env도 안 준 운영자의 agent가 leaseCoversDispatch에서 fail-closed로
+// 기동하지 못한다. 기본값을 바꿀 때 이 정합성이 깨지지 않게 막는다 — 게이트웨이 미설정
+// (전환 예산 0)과 설정(기본 전환 예산) 양쪽 모두.
 func TestDefaultConfigLeaseCoversDispatch(t *testing.T) {
-	if err := leaseCoversDispatch(defaultDeployLease, defaultDispatchPhaseBudget, defaultHealthDeadline); err != nil {
-		t.Fatalf("기본 설정이 자기정합하지 않다(기본값으로 기동 불가): %v", err)
+	if err := leaseCoversDispatch(defaultDeployLease, defaultDispatchPhaseBudget, defaultHealthDeadline, 0); err != nil {
+		t.Fatalf("기본 설정이 자기정합하지 않다(게이트웨이 미설정 · 기본값으로 기동 불가): %v", err)
+	}
+	cutover := cutoverBudget(defaultGatewayTimeout, defaultDrainWait)
+	if err := leaseCoversDispatch(defaultDeployLease, defaultDispatchPhaseBudget, defaultHealthDeadline, cutover); err != nil {
+		t.Fatalf("기본 설정이 자기정합하지 않다(블루-그린 · 기본값으로 기동 불가): %v", err)
 	}
 }
 
@@ -58,12 +85,16 @@ func TestDefaultConfigLeaseCoversDispatch(t *testing.T) {
 func TestLeaseCoversDispatchRejectsOverflow(t *testing.T) {
 	huge := time.Duration(1<<62) + time.Hour // maxDispatchDuration을 크게 넘고, 둘을 더하면 overflow
 	// 작은 lease인데도 overflow로 통과해선 안 된다(fail-closed).
-	if err := leaseCoversDispatch(time.Second, huge, huge); err == nil {
+	if err := leaseCoversDispatch(time.Second, huge, huge, 0); err == nil {
 		t.Fatalf("거대 phaseBudget·healthDeadline(overflow 유발)인데 작은 lease가 통과 — fail-open")
 	}
 	// 상한을 살짝 넘는 값도 거부.
-	if err := leaseCoversDispatch(24*time.Hour, maxDispatchDuration+time.Second, defaultHealthDeadline); err == nil {
+	if err := leaseCoversDispatch(24*time.Hour, maxDispatchDuration+time.Second, defaultHealthDeadline, 0); err == nil {
 		t.Fatalf("phaseBudget이 상한 초과인데 통과 — fail-closed 위반")
+	}
+	// 전환 예산도 같은 가드를 받는다(거대 드레인 값이 덧셈을 뒤집지 못한다).
+	if err := leaseCoversDispatch(time.Second, defaultDispatchPhaseBudget, defaultHealthDeadline, huge); err == nil {
+		t.Fatalf("거대 전환 예산(overflow 유발)인데 작은 lease가 통과 — fail-open")
 	}
 }
 
@@ -91,7 +122,7 @@ func TestBuildDispatcherRejectsInvalidHealthEnv(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			setRequiredDispatchEnv(t)
 			t.Setenv(c.key, c.val)
-			if _, _, _, err := buildDispatcher(); err == nil {
+			if _, err := buildDispatcher(); err == nil {
 				t.Fatalf("%s(%s=%q)인데 buildDispatcher 통과(boot fail-fast 위반)", c.name, c.key, c.val)
 			}
 		})
@@ -103,8 +134,84 @@ func TestBuildDispatcherAcceptsValidEnv(t *testing.T) {
 	t.Setenv("DEPLOY_HEALTH_SUCCESS_THRESHOLD", "3")
 	t.Setenv("DEPLOY_HEALTH_DEADLINE", "45s")
 	t.Setenv("DEPLOY_DISPATCH_PHASE_BUDGET", "90s")
-	if _, d, pb, err := buildDispatcher(); err != nil || d != 45*time.Second || pb != 90*time.Second {
-		t.Fatalf("정상 env: err=%v D=%s phaseBudget=%s, nil·45s·90s 기대", err, d, pb)
+	b, err := buildDispatcher()
+	if err != nil || b.healthDeadline != 45*time.Second || b.phaseBudget != 90*time.Second {
+		t.Fatalf("정상 env: err=%v D=%s phaseBudget=%s, nil·45s·90s 기대", err, b.healthDeadline, b.phaseBudget)
+	}
+	// 게이트웨이 미설정 = 전환 단계 없음 = 전환 예산 0(기존 동작 그대로).
+	if b.cutoverBudget != 0 {
+		t.Fatalf("게이트웨이 미설정인데 전환 예산=%s, 0 기대", b.cutoverBudget)
+	}
+}
+
+// setBlueGreenEnv는 블루-그린 모드의 슬롯별 필수 env를 채운다(단일 변수는 두지 않는다 —
+// 게이트웨이 모드에서 단일 변수는 선택이다).
+func setBlueGreenEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("IMAGE_CORE", "registry.example/core")
+	t.Setenv("DEPLOY_GATEWAY_URL", "http://127.0.0.1:8090")
+	t.Setenv("DEPLOY_COMPOSE_FILE_BLUE", "/x/blue.yml")
+	t.Setenv("DEPLOY_COMPOSE_PROJECT_BLUE", "core-blue")
+	t.Setenv("DEPLOY_HEALTH_URL_BLUE", "http://127.0.0.1:8081/ready")
+	t.Setenv("DEPLOY_COMPOSE_FILE_GREEN", "/x/green.yml")
+	t.Setenv("DEPLOY_COMPOSE_PROJECT_GREEN", "core-green")
+	t.Setenv("DEPLOY_HEALTH_URL_GREEN", "http://127.0.0.1:8082/ready")
+}
+
+// 블루-그린 모드는 슬롯별 설정으로 조립되고 전환 예산이 lease 하한식에 실린다.
+func TestBuildDispatcherBlueGreen(t *testing.T) {
+	setBlueGreenEnv(t)
+	t.Setenv("DEPLOY_DRAIN_WAIT", "20s")
+	t.Setenv("DEPLOY_GATEWAY_TIMEOUT", "5s")
+	b, err := buildDispatcher()
+	if err != nil {
+		t.Fatalf("블루-그린 정상 env인데 조립 실패: %v", err)
+	}
+	if want := cutoverBudget(5*time.Second, 20*time.Second); b.cutoverBudget != want {
+		t.Fatalf("전환 예산=%s, 기대 %s", b.cutoverBudget, want)
+	}
+	d, ok := b.disp.(deploy.LocalDispatcher)
+	if !ok {
+		t.Fatalf("dispatcher 타입=%T, LocalDispatcher 기대", b.disp)
+	}
+	if d.Gateway == nil || d.SlotExec[deploy.SlotBlue] == nil || d.SlotExec[deploy.SlotGreen] == nil ||
+		d.SlotHealth[deploy.SlotBlue] == nil || d.SlotHealth[deploy.SlotGreen] == nil {
+		t.Fatal("블루-그린 배선 누락(게이트웨이·슬롯별 실행기·프로버가 모두 있어야 한다)")
+	}
+	if d.DrainWait != 20*time.Second {
+		t.Fatalf("드레인 대기=%s, 20s 기대", d.DrainWait)
+	}
+	// 단일 변수를 안 줬으므로 단일 경로(target=gateway 전용)는 배선되지 않는다 —
+	// 그 배포는 실행 지점에서 요란하게 거절된다(조용한 성공 아님).
+	if d.Exec != nil || d.Health != nil {
+		t.Fatal("단일 변수 미설정인데 단일 경로가 배선됐다")
+	}
+}
+
+// 블루-그린 모드의 fail-closed 조립: 슬롯 설정 누락·두 슬롯 같은 프로젝트·잘못된 게이트웨이
+// URL·0 드레인은 기동을 막아야 한다(런타임까지 숨지 않는다).
+func TestBuildDispatcherBlueGreenFailClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(t *testing.T)
+	}{
+		{"green 슬롯 compose 누락", func(t *testing.T) { t.Setenv("DEPLOY_COMPOSE_FILE_GREEN", "") }},
+		{"blue 헬스 URL 누락", func(t *testing.T) { t.Setenv("DEPLOY_HEALTH_URL_BLUE", "") }},
+		{"두 슬롯 같은 compose project", func(t *testing.T) { t.Setenv("DEPLOY_COMPOSE_PROJECT_GREEN", "core-blue") }},
+		{"게이트웨이 URL이 절대 http URL 아님", func(t *testing.T) { t.Setenv("DEPLOY_GATEWAY_URL", "127.0.0.1:8090") }},
+		{"드레인 0", func(t *testing.T) { t.Setenv("DEPLOY_DRAIN_WAIT", "0s") }},
+		{"드레인 비duration", func(t *testing.T) { t.Setenv("DEPLOY_DRAIN_WAIT", "곧") }},
+		{"게이트웨이 타임아웃 음수", func(t *testing.T) { t.Setenv("DEPLOY_GATEWAY_TIMEOUT", "-1s") }},
+		{"단일 변수 일부만 설정", func(t *testing.T) { t.Setenv("DEPLOY_COMPOSE_FILE", "/x/compose.yml") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setBlueGreenEnv(t)
+			c.mut(t)
+			if _, err := buildDispatcher(); err == nil {
+				t.Fatalf("%s인데 buildDispatcher 통과(boot fail-closed 위반)", c.name)
+			}
+		})
 	}
 }
 

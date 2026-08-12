@@ -14,7 +14,10 @@ import (
 )
 
 // fakeExec는 HostExecutor 페이크다 — 호출 인자·횟수를 포착하고 설정된 오류를 낸다.
+// name·log가 설정되면 호출을 공유 로그에 순서대로 남긴다(전환 시퀀스 순서 검증용).
 type fakeExec struct {
+	name        string    // 슬롯 이름(순서 로그에 "blue:down" 식으로 남는다)
+	log         *[]string // nil이 아니면 각 호출을 순서대로 append
 	pullRef     string
 	upRef       string
 	verifyRef   string
@@ -26,19 +29,33 @@ type fakeExec struct {
 	ups         int
 	verifies    int
 	downs       int
-	downCtxErr  error // 마지막 Down에 넘어온 context의 Err()(취소된 ctx 재사용 감시 — O1).
-	blockUp     bool  // true면 Up이 ctx.Done까지 블록하고 ctx.Err()를 낸다(phase budget 초과 재현).
-	blockVerify bool  // true면 VerifyImageDigest가 ctx.Done까지 블록한다(phase budget이 verify를 상한하는지 — H1).
+	downAt      time.Time // 마지막 Down 시각(드레인이 down 앞에 있는지 검증 — CD-4 ⑥→⑨).
+	downCtxErr  error     // 마지막 Down에 넘어온 context의 Err()(취소된 ctx 재사용 감시 — O1).
+	blockUp     bool      // true면 Up이 ctx.Done까지 블록하고 ctx.Err()를 낸다(phase budget 초과 재현).
+	blockVerify bool      // true면 VerifyImageDigest가 ctx.Done까지 블록한다(phase budget이 verify를 상한하는지 — H1).
+}
+
+// record는 호출을 공유 순서 로그에 남긴다(log가 nil이면 아무것도 하지 않는다).
+func (f *fakeExec) record(step string) {
+	if f.log == nil {
+		return
+	}
+	if f.name != "" {
+		step = f.name + ":" + step
+	}
+	*f.log = append(*f.log, step)
 }
 
 func (f *fakeExec) Pull(_ context.Context, ref string) error {
 	f.pulls++
 	f.pullRef = ref
+	f.record("pull")
 	return f.pullErr
 }
 func (f *fakeExec) Up(ctx context.Context, ref string) error {
 	f.ups++
 	f.upRef = ref
+	f.record("up")
 	if f.blockUp {
 		<-ctx.Done()
 		return ctx.Err()
@@ -48,6 +65,7 @@ func (f *fakeExec) Up(ctx context.Context, ref string) error {
 func (f *fakeExec) VerifyImageDigest(ctx context.Context, ref string) error {
 	f.verifies++
 	f.verifyRef = ref
+	f.record("verify")
 	if f.blockVerify {
 		<-ctx.Done()
 		return ctx.Err()
@@ -56,13 +74,28 @@ func (f *fakeExec) VerifyImageDigest(ctx context.Context, ref string) error {
 }
 func (f *fakeExec) Down(ctx context.Context) error {
 	f.downs++
+	f.downAt = time.Now()
 	f.downCtxErr = ctx.Err()
+	f.record("down")
 	return f.downErr
 }
 
-type fakeHealth struct{ err error }
+type fakeHealth struct {
+	err  error
+	name string
+	log  *[]string
+}
 
-func (f fakeHealth) Check(context.Context) error { return f.err }
+func (f fakeHealth) Check(context.Context) error {
+	if f.log != nil {
+		step := "health"
+		if f.name != "" {
+			step = f.name + ":" + step
+		}
+		*f.log = append(*f.log, step)
+	}
+	return f.err
+}
 
 func manifest(digest string) Manifest {
 	return Manifest{
@@ -296,4 +329,313 @@ func TestDispatchPhaseBudgetTimeoutVerifyCleanup(t *testing.T) {
 // LocalDispatcher는 Dispatcher 계약을 만족하고 coordinator에 그대로 꽂힌다.
 func TestLocalDispatcherSatisfiesInterface(t *testing.T) {
 	var _ Dispatcher = LocalDispatcher{}
+}
+
+// ─── 블루-그린 전환(CD-4 ⑤⑥⑨ · ADR-031) ────────────────────────────────────────
+//
+// 여기서 막는 치명 실패는 넷이다: ⑴ 전환이 CD-1 통과 전에 일어나는 것(BG-2) ⑵ 전환 실패를
+// 전환된 것처럼 접는 것(⑤ 실패 = 미전환) ⑶ 전환 성공 후 실패를 UNEXECUTED로 오인해 락을
+// 푸는 것(⑤ 이후 = UNKNOWN) ⑷ 구 slot을 끄는 down이 방금 올린 slot을 끄는 것(BG-3 ⑶).
+
+// fakeGateway는 SlotGateway 페이크다 — 조회 결과·전환 오류를 설정하고 호출을 포착한다.
+type fakeGateway struct {
+	active     string
+	activeErr  error
+	switchErr  error
+	queries    int
+	switches   int
+	gotSlot    string
+	gotToken   uint64
+	switchedAt time.Time
+	log        *[]string
+}
+
+func (g *fakeGateway) ActiveSlot(context.Context) (string, error) {
+	g.queries++
+	if g.log != nil {
+		*g.log = append(*g.log, "gw:active")
+	}
+	return g.active, g.activeErr
+}
+
+func (g *fakeGateway) Switch(_ context.Context, targetSlot string, token uint64) error {
+	g.switches++
+	g.gotSlot, g.gotToken = targetSlot, token
+	g.switchedAt = time.Now()
+	if g.log != nil {
+		*g.log = append(*g.log, "gw:switch")
+	}
+	return g.switchErr
+}
+
+// bgRig는 블루-그린 배선 한 벌이다(슬롯별 실행기·헬스 + 게이트웨이 + 공유 순서 로그).
+type bgRig struct {
+	blue, green   *fakeExec
+	blueH, greenH fakeHealth
+	gw            *fakeGateway
+	order         []string
+}
+
+const testDrainWait = 30 * time.Millisecond
+
+// newBGRig는 active 슬롯을 지정해 배선을 만든다.
+func newBGRig(active Slot) *bgRig {
+	r := &bgRig{}
+	r.blue = &fakeExec{name: "blue", log: &r.order}
+	r.green = &fakeExec{name: "green", log: &r.order}
+	r.blueH = fakeHealth{name: "blue", log: &r.order}
+	r.greenH = fakeHealth{name: "green", log: &r.order}
+	r.gw = &fakeGateway{active: string(active), log: &r.order}
+	return r
+}
+
+func (r *bgRig) dispatcher() LocalDispatcher {
+	return LocalDispatcher{
+		Repos:       repos(),
+		PhaseBudget: time.Minute,
+		Gateway:     r.gw,
+		SlotExec:    map[Slot]HostExecutor{SlotBlue: r.blue, SlotGreen: r.green},
+		SlotHealth:  map[Slot]HealthChecker{SlotBlue: r.blueH, SlotGreen: r.greenH},
+		DrainWait:   testDrainWait,
+	}
+}
+
+func (r *bgRig) run(t *testing.T) (RemoteState, error) {
+	t.Helper()
+	return r.dispatcher().Dispatch(context.Background(), manifest(validDigest), store.FencingToken(7))
+}
+
+func orderEq(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ⑴ 정상 완주 — active=blue면 green(idle)에 올리고, pull→up→verify→health→switch→드레인→
+// 구 slot(blue) down 순으로 끝난다. 전환 요청에는 이 배포의 fencing token이 실린다(BG-4 ⓐ).
+func TestDispatchBlueGreenCompletesInOrder(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	st, err := r.run(t)
+	if st != StateCompleted || err != nil {
+		t.Fatalf("정상 전환: state=%v err=%v, COMPLETED·nil 기대", st, err)
+	}
+	want := []string{"gw:active", "green:pull", "green:up", "green:verify", "green:health", "gw:switch", "blue:down"}
+	if !orderEq(r.order, want) {
+		t.Fatalf("실행 순서=%v\n기대=%v (CD-4 ②③④⑤⑨)", r.order, want)
+	}
+	if r.gw.gotSlot != string(SlotGreen) {
+		t.Fatalf("전환 대상 slot=%q, green 기대(idle에 올린 쪽으로 옮긴다)", r.gw.gotSlot)
+	}
+	if r.gw.gotToken != 7 {
+		t.Fatalf("전환 요청의 fencing token=%d, 7 기대(BG-4 ⓐ — sink-side 검증 근거)", r.gw.gotToken)
+	}
+	if r.green.downs != 0 {
+		t.Fatalf("새 slot(green)이 down됨(%d) — 구 slot만 내려야 한다(BG-3 ⑶)", r.green.downs)
+	}
+	// ⑥ 드레인이 ⑤와 ⑨ 사이에 실제로 있었나 — 전환 시각과 down 시각의 간격으로 본다.
+	if gap := r.blue.downAt.Sub(r.gw.switchedAt); gap < testDrainWait {
+		t.Fatalf("전환~구 slot down 간격=%s, 드레인 대기(%s) 이상 기대(CD-4 ⑥이 건너뛰어졌다)", gap, testDrainWait)
+	}
+}
+
+// active=green이면 반대쪽(blue)에 올리고 green을 내린다 — 슬롯 고정 가정이 없다.
+func TestDispatchBlueGreenUsesIdleSlot(t *testing.T) {
+	r := newBGRig(SlotGreen)
+	st, err := r.run(t)
+	if st != StateCompleted || err != nil {
+		t.Fatalf("정상 전환: state=%v err=%v, COMPLETED 기대", st, err)
+	}
+	if r.blue.ups != 1 || r.green.ups != 0 {
+		t.Fatalf("active=green인데 up: blue=%d green=%d — idle(blue)에 올려야 한다", r.blue.ups, r.green.ups)
+	}
+	if r.green.downs != 1 || r.blue.downs != 0 {
+		t.Fatalf("구 slot 종료: green=%d blue=%d, green만 1 기대", r.green.downs, r.blue.downs)
+	}
+}
+
+// ⑵ 전환 실패(409 stale 포함) = 미전환 — 올린 slot을 정리하고 UNEXECUTED. 구 slot은
+// 손대지 않는다(살아 있는 blue를 끄면 서비스가 죽는다).
+func TestDispatchBlueGreenSwitchFailCleansGreen(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	r.gw.switchErr = errors.New("409 stale fencing token")
+	st, err := r.run(t)
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("전환 실패: state=%v err=%v, UNEXECUTED·err 기대(미전환)", st, err)
+	}
+	if r.green.downs != 1 {
+		t.Fatalf("green 정리 down=%d, 1 기대(CD-4 ⑤ 실패 = green 종료·미전환)", r.green.downs)
+	}
+	if r.blue.downs != 0 {
+		t.Fatalf("구 active(blue)를 내렸다(%d) — 전환되지 않았으므로 blue가 서비스 중이다", r.blue.downs)
+	}
+	if !strings.Contains(err.Error(), "⑤") {
+		t.Fatalf("오류에 실패 단계가 없다: %v", err)
+	}
+}
+
+// 전환 실패 + green 정리 실패 = green 잔존 가능 = UNKNOWN.
+func TestDispatchBlueGreenSwitchFailCleanupFailUnknown(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	r.gw.switchErr = errors.New("500")
+	r.green.downErr = errors.New("down 실패")
+	st, err := r.run(t)
+	if st != StateUnknown || err == nil {
+		t.Fatalf("전환 실패·정리 실패: state=%v, UNKNOWN 기대", st)
+	}
+}
+
+// ⑶ 전환 성공 후 구 slot down 실패 = 신·구 두 프로세스 생존 가능 = UNKNOWN + 단계 명시.
+// 여기서 UNEXECUTED로 접으면 coordinator가 락을 풀어 라우트가 옮겨진 채로 다음 배포가 들어온다.
+func TestDispatchBlueGreenDownFailAfterSwitchUnknown(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	r.blue.downErr = errors.New("compose down 실패")
+	st, err := r.run(t)
+	if st != StateUnknown || err == nil {
+		t.Fatalf("전환 성공·구 slot down 실패: state=%v err=%v, UNKNOWN·err 기대(락 유지·사람)", st, err)
+	}
+	if !strings.Contains(err.Error(), "⑨") || !strings.Contains(err.Error(), "전환") {
+		t.Fatalf("UNKNOWN 오류에 단계(⑨ · 전환 성공 사실)가 없다 — 사람 개입의 유일한 단서다: %v", err)
+	}
+	if r.green.downs != 0 {
+		t.Fatalf("전환 뒤인데 새 slot(green)을 내렸다(%d) — 트래픽이 가는 쪽이다", r.green.downs)
+	}
+}
+
+// 헬스 실패는 전환 전이다 — 라우트를 건드리지 않고 올린 slot만 정리한다(BG-2).
+func TestDispatchBlueGreenHealthFailNoSwitch(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	r.greenH = fakeHealth{err: errors.New("헬스 실패"), name: "green", log: &r.order}
+	st, err := r.run(t)
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("헬스 실패: state=%v, UNEXECUTED 기대(미전환)", st)
+	}
+	if r.gw.switches != 0 {
+		t.Fatalf("CD-1 미통과인데 전환 호출됨(%d) — BG-2 위반", r.gw.switches)
+	}
+	if r.green.downs != 1 {
+		t.Fatalf("green 정리 down=%d, 1 기대", r.green.downs)
+	}
+}
+
+// 게이트웨이 조회 실패 = 배포 시작 전 = 부작용 0 = UNEXECUTED(fail-closed). pull도 안 한다 —
+// 어느 쪽이 idle인지 모른 채 올리면 살아 있는 slot을 덮어쓸 수 있다.
+func TestDispatchBlueGreenActiveSlotQueryFailUnexecuted(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	r.gw.activeErr = errors.New("connection refused")
+	st, err := r.run(t)
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("active slot 조회 실패: state=%v err=%v, UNEXECUTED·err 기대", st, err)
+	}
+	if r.blue.pulls+r.green.pulls != 0 || r.gw.switches != 0 {
+		t.Fatalf("조회 실패인데 부작용 발생 pulls=%d switches=%d", r.blue.pulls+r.green.pulls, r.gw.switches)
+	}
+}
+
+// 게이트웨이가 낯선 슬롯 이름을 주면 추측하지 않고 거절한다(fail-closed).
+func TestDispatchBlueGreenRejectsUnknownSlot(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	r.gw.active = "red"
+	st, err := r.run(t)
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("낯선 slot: state=%v err=%v, UNEXECUTED·err 기대", st, err)
+	}
+	if r.blue.pulls+r.green.pulls != 0 {
+		t.Fatal("낯선 slot인데 pull 호출됨(부작용 0 위반)")
+	}
+}
+
+// 드레인 대기가 0 이하면 in-flight를 절단한다 — 조용히 0으로 돌지 않고 시작 전에 거절한다.
+func TestDispatchBlueGreenRejectsZeroDrain(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	d := r.dispatcher()
+	d.DrainWait = 0
+	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("드레인 0: state=%v err=%v, UNEXECUTED·err 기대", st, err)
+	}
+	if r.gw.queries != 0 || r.green.pulls != 0 {
+		t.Fatal("드레인 0인데 조회·pull이 일어났다(부작용 0 위반)")
+	}
+}
+
+// 슬롯 배선이 빠지면 시작 전에 거절한다(부작용 0).
+func TestDispatchBlueGreenRejectsMissingSlotWiring(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	d := r.dispatcher()
+	d.SlotExec = map[Slot]HostExecutor{SlotBlue: r.blue} // green 실행기 누락
+	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("슬롯 배선 부재: state=%v err=%v, UNEXECUTED·err 기대", st, err)
+	}
+	if r.green.pulls != 0 || r.gw.switches != 0 {
+		t.Fatal("배선 부재인데 부작용 발생")
+	}
+}
+
+// ⑷ 게이트웨이 미설정 = 기존 단일 경로 그대로(하위호환) — 전환 단계가 없고 ④까지가 종단이다.
+// (기존 단일 경로 테스트 전부가 이 모드를 덮는다 — 여기서는 슬롯 배선이 있어도 Gateway가
+// nil이면 단일 실행기만 쓰인다는 것을 못 박는다.)
+func TestDispatchWithoutGatewayKeepsSinglePath(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	single := &fakeExec{}
+	d := r.dispatcher()
+	d.Gateway = nil
+	d.Exec, d.Health = single, fakeHealth{}
+	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
+	if st != StateCompleted || err != nil {
+		t.Fatalf("게이트웨이 미설정: state=%v err=%v, COMPLETED 기대(기존 동작)", st, err)
+	}
+	if single.pulls != 1 || single.ups != 1 || single.verifies != 1 {
+		t.Fatalf("단일 실행기 호출 pull=%d up=%d verify=%d, 각 1 기대", single.pulls, single.ups, single.verifies)
+	}
+	if r.gw.queries != 0 || r.gw.switches != 0 || r.blue.downs != 0 || r.green.ups != 0 {
+		t.Fatal("게이트웨이 미설정인데 전환 경로가 돌았다")
+	}
+}
+
+// ⑸ target=gateway는 전환 단계 없이 단일 경로다 — 게이트웨이는 전환 수단의 소유자라
+// 자기 자신을 전환할 수 없다(DO-20 ⓐ 재기동 교체).
+func TestDispatchGatewayTargetSkipsCutover(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	single := &fakeExec{}
+	d := r.dispatcher()
+	d.Exec, d.Health = single, fakeHealth{}
+	d.Repos = map[Target]string{TargetGateway: "registry.example/gateway"}
+
+	m := manifest(validDigest)
+	m.Target = TargetGateway
+	st, err := d.Dispatch(context.Background(), m, store.FencingToken(1))
+	if st != StateCompleted || err != nil {
+		t.Fatalf("target=gateway: state=%v err=%v, COMPLETED 기대(재기동 교체)", st, err)
+	}
+	if r.gw.queries != 0 || r.gw.switches != 0 {
+		t.Fatalf("게이트웨이 배포인데 전환 API 호출됨(active=%d switch=%d) — 자기 전환 불가(DO-20 ⓐ)", r.gw.queries, r.gw.switches)
+	}
+	if single.upRef != "registry.example/gateway@"+validDigest {
+		t.Fatalf("게이트웨이 이미지 참조=%q", single.upRef)
+	}
+	if r.blue.downs != 0 || r.green.downs != 0 {
+		t.Fatal("게이트웨이 배포가 슬롯을 내렸다")
+	}
+}
+
+// 게이트웨이 모드인데 단일 경로 배선이 없으면 target=gateway 배포를 조용히 성공시키지 않고
+// 요란하게 거절한다(부작용 0).
+func TestDispatchGatewayTargetWithoutSingleWiringUnexecuted(t *testing.T) {
+	r := newBGRig(SlotBlue)
+	d := r.dispatcher()
+	d.Repos = map[Target]string{TargetGateway: "registry.example/gateway"}
+
+	m := manifest(validDigest)
+	m.Target = TargetGateway
+	st, err := d.Dispatch(context.Background(), m, store.FencingToken(1))
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("배선 없는 게이트웨이 배포: state=%v err=%v, UNEXECUTED·err 기대", st, err)
+	}
 }

@@ -23,8 +23,8 @@ import (
 var (
 	// ErrManifestMalformed는 body가 manifest JSON으로 디코드되지 않을 때다.
 	ErrManifestMalformed = errors.New("deploy: manifest JSON 파싱 불가")
-	// ErrManifestTarget는 대상이 닫힌 집합(core|settlement|ledger) 밖일 때다(DO-20).
-	ErrManifestTarget = errors.New("deploy: manifest 대상이 닫힌 집합(core|settlement|ledger) 밖")
+	// ErrManifestTarget는 대상이 닫힌 집합(core|settlement|ledger|gateway) 밖일 때다(DO-20 v0.5).
+	ErrManifestTarget = errors.New("deploy: manifest 대상이 닫힌 집합(core|settlement|ledger|gateway) 밖")
 	// ErrManifestIncomplete는 DO-18 필수 6칸 중 하나라도 비었을 때다.
 	ErrManifestIncomplete = errors.New("deploy: manifest 필수 필드 누락(DO-18 6칸)")
 	// ErrManifestDigest는 image digest가 sha256: 고정 형식이 아닐 때다(태그 금지 — DO-18 ⑵).
@@ -59,10 +59,10 @@ func validSHA256Digest(d string) bool {
 	return true
 }
 
-// valid는 대상이 닫힌 배포 집합에 속하는지 본다(DO-20 — 정확히 셋).
+// valid는 대상이 닫힌 배포 집합에 속하는지 본다(DO-20 v0.5 — 정확히 넷).
 func (t Target) valid() bool {
 	switch t {
-	case TargetCore, TargetSettlement, TargetLedger:
+	case TargetCore, TargetSettlement, TargetLedger, TargetGateway:
 		return true
 	default:
 		return false
