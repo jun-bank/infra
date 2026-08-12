@@ -18,14 +18,19 @@ import "errors"
 // ErrNotImplemented는 스캐폴드 표면을 표시한다.
 var ErrNotImplemented = errors.New("deploy: not implemented (scaffold)")
 
-// Target은 닫힌 배포 대상 집합이다(ADR-027 DO-20: 정확히 셋 — 진입 설정과 Oracle
-// 엣지는 배포 대상이 아니다).
+// Target은 닫힌 배포 대상 집합이다(ADR-027 DO-20 v0.5: 정확히 넷 — 진입 설정과 Oracle
+// 엣지는 여전히 배포 대상이 아니다. 게이트웨이는 우리 배포물·우리 호스트라 그 제외
+// 근거에 해당하지 않아 2026-08-12에 넷으로 재판정됐다).
 type Target string
 
 const (
 	TargetCore       Target = "core"       // .9
 	TargetSettlement Target = "settlement" // .158
 	TargetLedger     Target = "ledger"     // .164
+	// TargetGateway는 내부 API 게이트웨이(SCG — ADR-031 BG-1)다. 같은 .9 호스트에 살지만
+	// 전환 수단의 소유자라 자기 자신의 블루-그린을 자기가 전환할 수 없다(자기 참조) —
+	// 그래서 v1은 전환 단계 없는 재기동 교체다(DO-20 ⓐ · 짧은 중단 수용).
+	TargetGateway Target = "gateway" // .9 (내부 게이트웨이)
 )
 
 // Manifest는 CI가 서명하는 대상이다(DO-18): 필수 6개 필드. 이미지는 태그가 아니라
