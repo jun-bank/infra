@@ -61,6 +61,11 @@ type OIDCAllowEntry struct {
 // OIDCAllowlist는 검증을 마친 항목 집합이다. 만들어진 뒤에는 불변이며 — repository_id로만
 // 조회된다(A1). 구성자를 거치지 않은 제로값은 항목이 없는 allowlist이고, 그것으로는 어떤
 // 요청도 통과하지 못한다(무설정 = 게이트 안 열림).
+//
+// ★ 무상태(리뷰 2회차 U12 — 별도 테스트 비대상): 적재 후 이 map을 쓰는 코드는 lookup뿐이며
+// 쓰기 경로가 없다(런타임 리로드 없음 · 요청 처리 중 변형 없음). 판정은 (claim, allowlist)의
+// 순수 함수이므로 "요청이 다음 요청의 판정에 영향을 준다"는 상태 결함이 성립할 자리가 없다 —
+// 동시 요청의 독립성은 구조로 서며, 그 구조가 깨지면 httpentry의 동시성 테스트가 잡는다.
 type OIDCAllowlist struct {
 	byID map[string]OIDCAllowEntry
 }
@@ -123,9 +128,13 @@ func validateAllowEntry(e OIDCAllowEntry) error {
 }
 
 // validRepositoryID는 수치 ID가 claim과 문자열로 대조 가능한 형태인지 본다: 10진수 양의
-// 정수이며 앞자리 0이 없다. 앞자리 0을 거부하는 것은 "0123"이 값으로는 123이지만 claim의
-// "123"과 문자열 대조에서 조용히 어긋나 — 등재했는데 영영 통과하지 않는 항목이 되기
-// 때문이다(무음 불일치 대신 요란한 기동 거부).
+// 정수이며, 앞자리 0이 없고, **int64 범위 안**이다.
+//
+//   - 앞자리 0 거부: "0123"은 값으로는 123이지만 claim의 "123"과 문자열 대조에서 조용히
+//     어긋난다 — 등재했는데 영영 통과하지 않는 항목이 된다(무음 불일치 대신 요란한 거부).
+//   - int64 상한: GitHub의 저장소 ID는 부호 있는 64비트 정수 도메인이다. 그 범위를 넘는
+//     값은 실재하는 ID일 수 없으므로 오타·조작으로 보고 거부한다 — 범위 밖 값을 그대로
+//     키로 받아들이면 "설정에는 있으나 어떤 토큰과도 만나지 않는 항목"이 조용히 남는다.
 func validRepositoryID(id string) error {
 	if id == "" {
 		return errors.New("repository_id가 비었다 (수치 ID가 allowlist의 유일 키다)")
@@ -135,15 +144,15 @@ func validRepositoryID(id string) error {
 			return fmt.Errorf("repository_id %q가 10진 수치가 아니다", id)
 		}
 	}
-	n, err := strconv.ParseUint(id, 10, 64)
+	if len(id) > 1 && id[0] == '0' {
+		return fmt.Errorf("repository_id %q에 앞자리 0이 있다 (claim의 정규 표기와 문자열 대조에서 어긋난다)", id)
+	}
+	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
-		return fmt.Errorf("repository_id %q를 수치로 읽을 수 없다: %v", id, err)
+		return fmt.Errorf("repository_id %q가 int64 범위를 벗어난다 (저장소 ID의 도메인 밖 — 오타·조작): %v", id, err)
 	}
 	if n == 0 {
 		return fmt.Errorf("repository_id %q가 0이다 (양의 정수여야 한다)", id)
-	}
-	if len(id) > 1 && id[0] == '0' {
-		return fmt.Errorf("repository_id %q에 앞자리 0이 있다 (claim의 정규 표기와 문자열 대조에서 어긋난다)", id)
 	}
 	return nil
 }
@@ -252,6 +261,12 @@ func loadOIDCAllowlist() (OIDCAllowlist, error) {
 // (부재·권한·디렉토리) 기동 거부다 — 경로를 적어 두고 파일이 없는 상태는 "allowlist를
 // 쓰려 했으나 비어 있다"이며, 그때 조용히 전면 거절 모드로 도는 것보다 요란하게 서지 않는
 // 편이 낫다(원인이 배포 시점에 드러난다).
+//
+// ★ 퍼미션 케이스(리뷰 2회차 S6 — 별도 테스트 비대상): 0000 같은 읽기 불가 퍼미션은
+// os.ReadFile의 오류로 이 가지에 그대로 들어오며, 부재·디렉토리 케이스가 같은 가지를
+// 이미 덮는다. 테스트를 따로 두지 않는 것은 실행 환경 때문이다 — agent 컨테이너는 root로
+// 돌아 mode 비트를 우회하므로, 그 환경에서 0000 파일은 "읽기 실패"가 아니라 그냥 읽힌다
+// (테스트가 환경에 따라 갈리는 것보다 이 계약을 주석으로 못박는 편이 정직하다).
 func loadAllowlistFile(path string) (OIDCAllowlist, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {

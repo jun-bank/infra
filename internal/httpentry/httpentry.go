@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -103,6 +104,19 @@ type Deps struct {
 	// 모드·락·manifest 검증을 거쳐 실행 지점까지 엮는다. nil이면 NewHandler가 기동을 거부한다.
 	Deploy deploy.Coordinator
 }
+
+// 진입 층이 내는 기계 판독 거절 코드다(이력의 ReasonCode — 게이트 2의 코드는 auth가
+// 소유한다). 사람이 읽는 사유는 문면이 바뀌지만 코드는 계약이므로, 코드별 집계·알림이
+// 문자열 매칭에 기대지 않게 한다.
+const (
+	// ReasonTargetForbidden은 신원↔대상 결박 위반이다 — 등재된 저장소가 자기 허용 대상이
+	// 아닌 것을 배포하려 했다(manifest 형식 오류와 구분된다).
+	ReasonTargetForbidden = "TARGET_FORBIDDEN"
+	// ReasonInternalBindingError는 게이트 2가 통과시켰는데 허용 대상이 없거나 닫힌 집합
+	// 밖인 상태다 — 요청자의 잘못이 아니라 정책 로딩·배선의 결함이며, 코드가 붙어야
+	// "권한 없는 요청이 많다"와 "우리 배선이 깨졌다"가 이력에서 갈린다.
+	ReasonInternalBindingError = "INTERNAL_BINDING_ERROR"
+)
 
 // ctxKey는 미들웨어 사이에서 검증된 요청을 나르는 컨텍스트 키의 사설 타입이다.
 type ctxKey int
@@ -248,6 +262,13 @@ func bodyDigest(body []byte) string {
 // 없는 값이지만, 감사 목적의 거절 행에는 있는 그대로 남긴다. 기록 실패는 삼키되 —
 // 거절 자체는 이미 확정이므로 통과로 뒤집지 않는다(fail-closed).
 func (d Deps) rejectUnverified(ctx context.Context, requestID, reason string) {
+	d.rejectCoded(ctx, requestID, "", reason)
+}
+
+// rejectCoded는 기계 판독 코드를 함께 남기는 거절 기록이다(RL-8 + ReasonCode). 코드는
+// 운영 대응이 갈리는 거절에만 붙는다 — 사유 문장은 문면이 바뀌면 집계가 조용히 깨지므로,
+// 코드별 질의·알림이 그 문장에 기대지 않게 한다.
+func (d Deps) rejectCoded(ctx context.Context, requestID, code, reason string) {
 	if d.History == nil {
 		return
 	}
@@ -255,6 +276,7 @@ func (d Deps) rejectUnverified(ctx context.Context, requestID, reason string) {
 		RequestID:    requestID,
 		EventType:    "REJECTED",
 		RejectReason: reason,
+		ReasonCode:   code,
 	})
 }
 
@@ -286,7 +308,9 @@ func withOIDC(d Deps) middleware {
 
 			dec := d.OIDC.Verify(r.Context(), token)
 			if !dec.Accepted {
-				d.rejectUnverified(r.Context(), vr.req.RequestID, "OIDC: "+dec.Reason)
+				// 사유는 이력에만 남기고 응답은 "검증 실패"까지다 — 어느 칸이 왜 어긋났는지
+				// (예: 등재된 저장소 이름)를 응답에 실으면 정책 내용이 밖으로 샌다.
+				d.rejectCoded(r.Context(), vr.req.RequestID, dec.ReasonCode, "OIDC: "+dec.Reason)
 				http.Error(w, "OIDC 검증 실패", http.StatusUnauthorized)
 				return
 			}
@@ -337,8 +361,14 @@ func withValidate(d Deps) middleware {
 			}
 			if !v.allowedTarget.Valid() {
 				// 게이트 2가 통과시켰는데 허용 target이 없다 = 정책 로딩·배선이 깨진 것이다.
-				// 이 상태에서 통과시키면 결박 없는 배포가 조용히 열린다.
-				http.Error(w, "내부 배선 오류: 인증된 요청에 허용 target이 없다 (게이트 2 정책·배선 확인 — fail-closed)", http.StatusInternalServerError)
+				// 이 상태에서 통과시키면 결박 없는 배포가 조용히 열린다. 500으로 닫되 —
+				// 조용히 닫지는 않는다: 운영자가 원인을 찾을 수 있게 로그와 이력에 남긴다
+				// (요청자 잘못이 아니므로 응답 본문은 일반 문구까지다).
+				log.Printf("httpentry: 내부 배선 오류 — 인증된 요청에 허용 target이 없다(값=%q · requestId=%q). 게이트 2 정책 로딩·배선을 확인하라",
+					v.allowedTarget, v.req.RequestID)
+				d.rejectCoded(r.Context(), v.req.RequestID, ReasonInternalBindingError,
+					"게이트 2가 통과시킨 요청에 허용 target이 없다(값="+string(v.allowedTarget)+") — 정책 로딩·배선 오류")
+				http.Error(w, "내부 오류로 요청을 처리할 수 없다 (fail-closed)", http.StatusInternalServerError)
 				return
 			}
 
@@ -349,11 +379,13 @@ func withValidate(d Deps) middleware {
 				return
 			}
 			if target != v.allowedTarget {
-				// RL-8 — 사유에 두 값을 남긴다. 오설정(워크플로가 남의 대상을 배포)과 침입
+				// RL-8 — 이력에는 두 값을 남긴다. 오설정(워크플로가 남의 대상을 배포)과 침입
 				// (탈취 토큰으로 다른 대상 배포)을 사후에 가르려면 무엇을 요구했는지가 필요하다.
-				d.rejectUnverified(r.Context(), v.req.RequestID,
+				// 응답에는 남기지 않는다 — 허용 대상을 돌려주면 토큰을 쥔 쪽이 "무엇을 배포할
+				// 수 있는지"를 응답만으로 알아낸다(정책 탐색). 진단은 이력의 몫이다.
+				d.rejectCoded(r.Context(), v.req.RequestID, ReasonTargetForbidden,
 					"target 불일치 (허용="+string(v.allowedTarget)+" 요청="+string(target)+") — 이 저장소는 그 대상을 배포할 수 없다")
-				http.Error(w, "허용되지 않은 배포 대상: 이 저장소에 허용된 대상은 "+string(v.allowedTarget)+"다", http.StatusForbidden)
+				http.Error(w, "허용되지 않은 배포 대상", http.StatusForbidden)
 				return
 			}
 			next.ServeHTTP(w, r)

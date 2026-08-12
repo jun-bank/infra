@@ -249,3 +249,172 @@ func TestAsciiEqualFoldNotUnicode(t *testing.T) {
 		t.Error("유니코드 fold로 다른 이름이 같다고 판정됐다 (ASCII 한정이어야 한다)")
 	}
 }
+
+// TestSingleModeEachKeyMissing은 단일 env 세트에서 **각 키를 하나씩** 빼도 기동이
+// 거부되는지 본다(S4 완전판). 넷 중 어느 하나가 빠져도 "기대값이 반쯤 정해진" 상태이며,
+// 특히 OIDC_ALLOWED_TARGET이 빠지면 결박할 대상이 없다.
+func TestSingleModeEachKeyMissing(t *testing.T) {
+	for _, tc := range []struct {
+		key   string
+		clear func(*oidcEnv)
+	}{
+		{envRepository, func(e *oidcEnv) { e.repository = "" }},
+		{envRepositoryID, func(e *oidcEnv) { e.repositoryID = "" }},
+		{envJobWorkflow, func(e *oidcEnv) { e.jobWorkflowRef = "" }},
+		{envAllowedTarget, func(e *oidcEnv) { e.allowedTarget = "" }},
+	} {
+		t.Run(tc.key+" 누락", func(t *testing.T) {
+			env := singleModeEnv()
+			tc.clear(&env)
+			env.apply(t)
+
+			_, err := LoadOIDCPolicy()
+			if err == nil {
+				t.Fatalf("%s 없이 기동이 성공했다 (부분 잔존 = 거부)", tc.key)
+			}
+			if !strings.Contains(err.Error(), "일부만") || !strings.Contains(err.Error(), tc.key) {
+				t.Errorf("오류에 빠진 키(%s)가 드러나지 않는다: %v", tc.key, err)
+			}
+		})
+	}
+}
+
+// TestEmptyFileRefused는 0바이트 allowlist 파일을 거부하는지 본다(S7). 빈 파일은
+// "등재된 저장소 0개" — 조용한 전면 거절 모드로 도는 대신 기동에서 막는다.
+func TestEmptyFileRefused(t *testing.T) {
+	env := singleModeEnv()
+	clearSingleMode(&env)
+	env.allowlistFile = writeAllowlist(t, "")
+	env.apply(t)
+
+	_, err := LoadOIDCPolicy()
+	if err == nil {
+		t.Fatal("0바이트 allowlist 파일로 기동이 성공했다 (fail-closed 기대)")
+	}
+	if !strings.Contains(err.Error(), "항목이 0개") {
+		t.Errorf("오류 = %v, '항목이 0개'를 담아야 한다", err)
+	}
+}
+
+// TestAllowlistLineErrorsReportLineNumber는 줄 단위 오류가 **몇 번째 줄인지** 알려주는지
+// 본다(S8 완전판). 수십 줄짜리 파일에서 줄 번호 없는 오류는 고칠 수 없는 오류다.
+func TestAllowlistLineErrorsReportLineNumber(t *testing.T) {
+	const good = "jun-bank/infra|123456|jun-bank/infra/.github/workflows/deploy.yml@refs/heads/main|core"
+
+	for _, tc := range []struct {
+		name     string
+		content  string
+		wantLine string
+		wantIn   string
+	}{
+		{"끝 파이프(빈 5번째 필드)", good + "\njun-bank/gateway|777777|wf@refs/heads/main|gateway|\n", "2번째 줄", "필드가 5개"},
+		{"구분자 없음", good + "\n\n" + "jun-bank/gateway 777777 wf gateway\n", "3번째 줄", "필드가 1개"},
+		{"주석·빈 줄 뒤의 오류 줄 번호", "# 머리말\n\n" + good + "\n|777777|wf@refs/heads/main|gateway\n", "4번째 줄", "repository(owner/repo)가 비었다"},
+		{"파이프만", good + "\n|||\n", "2번째 줄", "repository(owner/repo)가 비었다"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := singleModeEnv()
+			clearSingleMode(&env)
+			env.allowlistFile = writeAllowlist(t, tc.content)
+			env.apply(t)
+
+			_, err := LoadOIDCPolicy()
+			if err == nil {
+				t.Fatalf("%s: 기동이 성공했다 (거부 기대)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantLine) {
+				t.Errorf("오류에 줄 번호(%s)가 없다: %v", tc.wantLine, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("오류 = %v, %q를 담아야 한다", err, tc.wantIn)
+			}
+		})
+	}
+}
+
+// TestRepositoryIDNotationsRefused는 수치 ID 표기 변형을 전부 거부하는지 본다(S9 완전판).
+// 지수 표기·소수점·int64 초과는 값으로는 "읽히지만" claim의 정규 표기와 문자열로 만나지
+// 않는다 — 등재했는데 영영 통과하지 않는 항목을 기동에서 막는다.
+//
+// 앞뒤 공백(" 100")은 여기 없다 — 필드 trim이 먼저 걷어내 "100"이 되며 그것이 의도된
+// 동작이다(정렬 공백 허용). claim 쪽의 " 100" 위조는 TestRepositoryIDSpoofedNotations이 본다.
+func TestRepositoryIDNotationsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		id     string
+		wantIn string
+	}{
+		{"1e3", "10진 수치가 아니다"},
+		{"100.0", "10진 수치가 아니다"},
+		{"1_000", "10진 수치가 아니다"},
+		{"+100", "10진 수치가 아니다"},
+		{"-100", "10진 수치가 아니다"},
+		{"1 00", "10진 수치가 아니다"}, // 내부 공백 — trim으로 사라지지 않는다
+		{"0100", "앞자리 0"},
+		{"0", "양의 정수"},
+		{"9223372036854775808", "int64 범위"},     // int64 최대 + 1
+		{"99999999999999999999999", "int64 범위"}, // 자릿수 폭주
+	} {
+		t.Run("repository_id="+tc.id, func(t *testing.T) {
+			env := singleModeEnv()
+			clearSingleMode(&env)
+			env.allowlistFile = writeAllowlist(t, "jun-bank/infra|"+tc.id+"|wf@refs/heads/main|core\n")
+			env.apply(t)
+
+			_, err := LoadOIDCPolicy()
+			if err == nil {
+				t.Fatalf("repository_id %q로 기동이 성공했다 (거부 기대)", tc.id)
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("오류 = %v, %q를 담아야 한다", err, tc.wantIn)
+			}
+		})
+	}
+}
+
+// TestInt64BoundaryRepositoryIDAccepted는 상한 검사가 **정상 ID를 막지 않는지** 본다 —
+// 경계값(int64 최대)은 통과해야 한다(과잉 거절 방어).
+func TestInt64BoundaryRepositoryIDAccepted(t *testing.T) {
+	const maxInt64 = "9223372036854775807"
+	env := singleModeEnv()
+	clearSingleMode(&env)
+	env.allowlistFile = writeAllowlist(t, "jun-bank/infra|"+maxInt64+"|wf@refs/heads/main|core\n")
+	env.apply(t)
+
+	p, err := LoadOIDCPolicy()
+	if err != nil {
+		t.Fatalf("int64 최대값 repository_id가 거부됐다: %v", err)
+	}
+	if _, ok := p.Allowlist.lookup(maxInt64); !ok {
+		t.Error("경계값 ID가 적재되지 않았다")
+	}
+}
+
+// TestTargetCaseVariantsRefused는 target 값의 대소문자 변형을 거부하는지 본다(S11).
+// target은 정확 일치다 — 닫힌 집합(deploy.Target)의 값은 소문자 하나뿐이며, 여기서
+// 관대해지면 manifest의 target과 대조하는 축이 두 표기를 오간다.
+func TestTargetCaseVariantsRefused(t *testing.T) {
+	for _, target := range []string{"CORE", "Core", "GATEWAY", "Ledger", " core"} {
+		t.Run("target="+target, func(t *testing.T) {
+			env := singleModeEnv()
+			clearSingleMode(&env)
+			env.allowlistFile = writeAllowlist(t, "jun-bank/infra|123456|wf@refs/heads/main|"+target+"\n")
+			env.apply(t)
+
+			// " core"는 필드 trim으로 유효해진다 — 정렬 공백 허용의 의도된 결과이므로
+			// 그 한 케이스만 통과를 기대하고, 나머지 대소문자 변형은 거부를 기대한다.
+			_, err := LoadOIDCPolicy()
+			if strings.TrimSpace(target) == "core" {
+				if err != nil {
+					t.Fatalf("정렬 공백만 있는 target이 거부됐다: %v (필드 trim 계약)", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("target %q로 기동이 성공했다 (닫힌 집합은 정확 일치 — 거부 기대)", target)
+			}
+			if !strings.Contains(err.Error(), "닫힌 집합") {
+				t.Errorf("오류 = %v, '닫힌 집합'을 담아야 한다", err)
+			}
+		})
+	}
+}

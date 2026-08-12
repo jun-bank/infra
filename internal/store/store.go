@@ -180,6 +180,26 @@ func detailJSON(s string) any {
 	return string(b)
 }
 
+// codedDetailJSON은 기계 판독 코드가 있는 이력 행의 detail을 만든다: `{"code":…,"detail":…}`
+// 형태의 JSON 객체다. 코드를 **detail(JSON 컬럼) 안에** 넣는 것은 스키마 ALTER 없이
+// 구조화된 질의를 얻기 위해서다 — MySQL은 JSON 컬럼을 `detail->>'$.code'`로 조회·인덱싱할
+// 수 있으므로, 컬럼 추가 없이도 코드별 집계가 문자열 LIKE에 기대지 않는다.
+//
+// detail이 비어 있으면 code만 담는다(빈 문자열 키를 남기지 않는다). 인코딩 실패 시 NULL이
+// 아니라 코드만이라도 남기는 최소 표현으로 물러난다 — 진단의 핵심은 코드이기 때문이다.
+func codedDetailJSON(code, detail string) any {
+	payload := map[string]string{"code": code}
+	if detail != "" {
+		payload["detail"] = detail
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		// map[string]string는 실패하지 않지만, 실패하더라도 INSERT를 깨지 않는다(P1).
+		return detailJSON(code)
+	}
+	return string(b)
+}
+
 // HistoryEvent는 배포 이력에 대한 하나의 append다.
 type HistoryEvent struct {
 	RequestID      string
@@ -189,9 +209,14 @@ type HistoryEvent struct {
 	ManifestDigest string
 	Step           string
 	Result         string // 예: UNEXECUTED / DONE / UNKNOWN (ADR-027 DO-16)
-	RejectReason   string // RL-8: 기록된 거부 사유
-	Detail         string // dispatch 오류 등 진단 단서 — 특히 UNKNOWN은 사람 개입의 근거가 된다(무음 금지)
-	FencingToken   FencingToken
+	RejectReason   string // RL-8: 기록된 거부 사유(사람이 읽는 문장)
+	// ReasonCode는 거절 사유의 **기계 판독 코드**다(예: TARGET_FORBIDDEN). RejectReason은
+	// 사람을 위한 문장이라 문면이 바뀌면 집계·알림이 조용히 깨진다 — 운영 대응이 갈리는
+	// 사유에는 코드를 함께 남겨, 이력 질의가 문자열 매칭에 기대지 않게 한다.
+	// 코드 어휘의 정본은 그것을 내는 층이다(auth: 게이트 2 · httpentry: 결박).
+	ReasonCode   string
+	Detail       string // dispatch 오류 등 진단 단서 — 특히 UNKNOWN은 사람 개입의 근거가 된다(무음 금지)
+	FencingToken FencingToken
 }
 
 // HistoryStore는 배포 이력에 append한다(DT-9 ⑵). Append(INSERT)와 읽기만 노출한다
@@ -512,7 +537,11 @@ func (s *SQLStore) AppendEvent(ctx context.Context, ev HistoryEvent) error {
 	if ev.RejectReason != "" {
 		reason = ev.RejectReason
 	}
-	if ev.Detail != "" {
+	switch {
+	case ev.ReasonCode != "":
+		// 코드가 있으면 detail을 구조화한다(스키마 ALTER 없이 코드별 질의 — codedDetailJSON).
+		detail = codedDetailJSON(ev.ReasonCode, ev.Detail)
+	case ev.Detail != "":
 		detail = detailJSON(ev.Detail)
 	}
 	if ev.FencingToken != 0 {

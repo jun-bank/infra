@@ -513,3 +513,149 @@ func TestJWKSRejectsNonRSA(t *testing.T) {
 		t.Error("HS256 토큰이 통과했다 (RS256 고정 — 거절 기대)")
 	}
 }
+
+// --- claim 표기 위조·정규화 경계(리뷰 2회차 U5·U7·U10) ------------------------
+
+// TestClaimNormalizationBoundaries는 "정규화를 어디까지 하는가"의 경계를 현행 동작으로
+// 확정한다. allowlist **항목**은 적재 시 trim하지만 **claim은 손대지 않는다** — claim은
+// 발급자가 서명한 값이고, 그것을 우리가 다듬어 맞춰 주기 시작하면 "무엇이 같은 값인가"의
+// 정의가 조용히 넓어진다. 이름의 ASCII 대소문자만 예외다(GitHub이 대소문자를 구분하지
+// 않는 축이므로 과잉 거절을 막는다).
+func TestClaimNormalizationBoundaries(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name       string
+		mutate     func(*Claims)
+		wantAccept bool
+	}{
+		// U5 — claim 이름의 앞뒤 공백은 다듬지 않는다(= 거절). 등재값에 공백이 붙어 있으면
+		// 그것은 적재 시 trim되므로, 여기서 거절되는 것은 claim 쪽에 공백이 온 경우뿐이다.
+		{"repository 앞뒤 공백", func(c *Claims) { c.Repository = " jun-bank/infra " }, false},
+		{"repository 이름 ASCII 대소문자", func(c *Claims) { c.Repository = "JUN-BANK/Infra" }, true},
+		// U7 — ref는 대소문자를 구분한다(정확 일치). refs/heads/Main은 다른 ref다.
+		{"ref 대소문자 변형", func(c *Claims) { c.Ref = "Refs/Heads/Main" }, false},
+		{"ref 앞뒤 공백", func(c *Claims) { c.Ref = " refs/heads/main" }, false},
+		// job_workflow_ref도 정확 일치다(워크플로 경로는 대소문자가 의미를 가진다).
+		{"job_workflow_ref 대소문자 변형", func(c *Claims) {
+			c.JobWorkflowRef = "jun-bank/infra/.github/workflows/Deploy.yml@refs/heads/main"
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := baseClaims(now)
+			tc.mutate(&claims)
+			v := newOIDCVerifier(t, claims, now)
+
+			dec := v.Verify(context.Background(), "raw-token")
+			if dec.Accepted != tc.wantAccept {
+				t.Fatalf("%s: 수락=%v, 기대=%v (사유=%q)", tc.name, dec.Accepted, tc.wantAccept, dec.Reason)
+			}
+		})
+	}
+}
+
+// TestRepositoryIDSpoofedNotations는 수치 ID 표기를 흔든 토큰이 등재 항목과 만나지 않음을
+// 확인한다(U10). allowlist의 키는 **문자열 그대로의 수치 ID**이며, 우리는 claim 쪽 표기를
+// 관대하게 해석하지 않는다 — " 100"·"0100"을 100으로 읽어 주면 등재되지 않은 표기가 등재
+// 항목의 권한을 얻는다.
+func TestRepositoryIDSpoofedNotations(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+
+	for _, id := range []string{" 123456", "123456 ", "0123456", "123456.0", "1.23456e5", "+123456", "", "  "} {
+		t.Run("repository_id="+id, func(t *testing.T) {
+			claims := baseClaims(now)
+			claims.RepositoryID = id
+			v := newOIDCVerifier(t, claims, now)
+
+			dec := v.Verify(context.Background(), "raw-token")
+			if dec.Accepted {
+				t.Fatalf("표기가 흔들린 repository_id %q가 수락됐다 (문자열 그대로가 키다)", id)
+			}
+			if dec.ReasonCode != ReasonUnregisteredRepo {
+				t.Errorf("코드 = %q, 기대 = %s", dec.ReasonCode, ReasonUnregisteredRepo)
+			}
+		})
+	}
+}
+
+// TestNumericRepositoryIDClaimRejected는 repository_id가 **JSON 수치 타입**으로 온 토큰을
+// 실제 서명 경로로 밟는다(U10 — Claims 디코딩 경로 포함). GitHub은 이 claim을 문자열로
+// 싣지만, 수치로 온 토큰이 있다면 mapString이 빈 값을 주고 그 빈 값이 등재 항목과 만나면
+// 안 된다 — 빈 키가 조용히 어떤 항목에 매칭되는 일이 없음을 못박는다.
+func TestNumericRepositoryIDClaimRejected(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("RSA 키 생성 실패: %v", err)
+	}
+	tv := NewJWKSTokenVerifier(fakeKeySet{key: &key.PublicKey})
+	v, err := NewOIDCVerifier(tv, basePolicy(), fixedClock{now: now})
+	if err != nil {
+		t.Fatalf("NewOIDCVerifier 오류: %v", err)
+	}
+
+	// 대조군 — 문자열 표기는 통과한다(거절이 타입 때문임을 격리한다).
+	if dec := v.Verify(context.Background(), signTestToken(t, key, validMapClaims(now))); !dec.Accepted {
+		t.Fatalf("대조군(문자열 repository_id)이 거절됐다: %s", dec.Reason)
+	}
+
+	for _, tc := range []struct {
+		name string
+		set  func(jwt.MapClaims)
+	}{
+		{"수치 타입", func(mc jwt.MapClaims) { mc["repository_id"] = 123456 }},
+		{"부동소수 타입", func(mc jwt.MapClaims) { mc["repository_id"] = 123456.0 }},
+		{"claim 부재", func(mc jwt.MapClaims) { delete(mc, "repository_id") }},
+		{"null", func(mc jwt.MapClaims) { mc["repository_id"] = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := validMapClaims(now)
+			tc.set(mc)
+			dec := v.Verify(context.Background(), signTestToken(t, key, mc))
+			if dec.Accepted {
+				t.Fatalf("%s repository_id 토큰이 수락됐다 (거절 기대)", tc.name)
+			}
+			if dec.ReasonCode != ReasonUnregisteredRepo {
+				t.Errorf("코드 = %q, 기대 = %s", dec.ReasonCode, ReasonUnregisteredRepo)
+			}
+		})
+	}
+}
+
+// TestRejectionReasonCodes는 게이트 2가 내는 기계 판독 코드 3종을 못박는다(G3). 코드는
+// 이력 질의·알림의 계약이므로 사유 문장과 달리 바뀌면 안 된다.
+func TestRejectionReasonCodes(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*Claims)
+		wantCode string
+	}{
+		{"미등재", func(c *Claims) { c.RepositoryID = "999999" }, ReasonUnregisteredRepo},
+		{"개명", func(c *Claims) { c.Repository = "jun-bank/renamed" }, ReasonRepoRenamed},
+		{"다른 워크플로", func(c *Claims) {
+			c.JobWorkflowRef = "jun-bank/infra/.github/workflows/release.yml@refs/heads/main"
+		}, ReasonWorkflowRefMismatch},
+		// 코드를 붙이지 않는 칸(대응이 "거절 확인"으로 같다) — 빈 코드가 계약이다.
+		{"iss 불일치(코드 없음)", func(c *Claims) { c.Issuer = "https://evil.example" }, ""},
+		{"만료(코드 없음)", func(c *Claims) { c.ExpiresAt = now.Add(-time.Hour).Unix() }, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := baseClaims(now)
+			tc.mutate(&claims)
+			v := newOIDCVerifier(t, claims, now)
+
+			dec := v.Verify(context.Background(), "raw-token")
+			if dec.Accepted {
+				t.Fatalf("%s: 수락됐다 (거절 기대)", tc.name)
+			}
+			if dec.ReasonCode != tc.wantCode {
+				t.Errorf("코드 = %q, 기대 = %q", dec.ReasonCode, tc.wantCode)
+			}
+			if dec.Reason == "" {
+				t.Error("사유 문장이 비었다 (RL-8 — 코드가 사유를 대체하지 않는다)")
+			}
+		})
+	}
+}
