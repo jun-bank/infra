@@ -65,7 +65,22 @@ type Config struct {
 	// ImageEnvVar는 compose up이 digest 고정 참조를 읽는 env 변수명이다. compose 파일이
 	// image: ${<ImageEnvVar>} 로 이 값을 참조한다. 비면 defaultImageEnvVar를 쓴다.
 	ImageEnvVar string
+	// AppService는 이 배포의 대상 app compose 서비스명이다(#21 — 사후조건 identity 결박).
+	// 컨테이너의 소속 서비스는 docker가 붙이는 composeServiceLabel 라벨로 식별하며, 이 값이
+	// 설정되면 사후조건(이미지 대조·부분기동 판정)과 재시작 검사가 **그 서비스의 컨테이너만**
+	// 본다. 비면 프로젝트 전체를 보는 기존 판정 그대로다(하위호환 — 단일 경로 모드의 선택
+	// 설정이며, 블루-그린 모드에서는 main이 기동 시 필수로 강제한다).
+	AppService string
 }
+
+// composeServiceLabel은 docker compose가 각 컨테이너에 붙이는 서비스명 라벨이다 — 컨테이너가
+// 어느 compose 서비스의 것인지를 말하는 정본이다(compose 프로젝트 라벨과 짝). 컨테이너명
+// 규칙(<project>-<service>-<n>)을 문자열로 파싱하지 않는 이유가 이것이다: 이름 규칙은
+// compose 버전·container_name 설정에 따라 흔들리지만 이 라벨은 compose가 소유하는 계약이다.
+// ⚠️ [구현 검증] 해소 근거 = .9 호스트 실측(이슈 #21 기록): core-green-app-1 컨테이너의 이
+// 라벨 값이 "app"으로 확인됐다 — 현 .9 compose 구조의 대상 서비스명은 "app"이다. 호스트
+// compose 구조가 바뀌면 DEPLOY_APP_SERVICE 값도 함께 바뀐다(잔여-6/#19와 같은 축).
+const composeServiceLabel = "com.docker.compose.service"
 
 // defaultImageEnvVar는 ImageEnvVar 미지정 시의 기본 env 변수명이다.
 const defaultImageEnvVar = "DEPLOY_IMAGE_REF"
@@ -119,9 +134,10 @@ func (c Config) argv(act Action, ref string) ([]string, error) {
 	case ActionUp:
 		// up은 green 프로젝트를 --no-build로 띄운다(호스트에 빌드 도구 없음 — DO-4/P1).
 		// 이미지 참조는 argv가 아니라 env 치환으로 주입한다(compose 파일이 ${env}를 읽는다).
-		// --remove-orphans: 이전 revision의 orphan을 제거한다(H2 임시 완화) — orphan이 pinned
-		// digest를 실행 중이면 app이 틀린 이미지여도 사후조건 ≥1-match를 가려 silent COMPLETED가
-		// 될 수 있다. 완전한 방어(배포 대상 app 서비스를 identity로 결박)는 후속 이슈다.
+		// --remove-orphans: 이전 revision의 orphan을 제거한다(위생 — 남은 컨테이너가 포트·
+		// 볼륨을 붙들지 않게). 사후조건 fail-open(H2)의 방어는 더 이상 이 플래그에 기대지
+		// 않는다 — VerifyImageDigest가 대상 app 서비스로 결박돼(#21) orphan·사이드카가 무엇을
+		// 실행 중이든 app의 일치를 대신해 주지 못한다.
 		return c.commandLine("docker", "compose", "-f", c.ComposeFile, "-p", c.Project, "up", "-d", "--no-build", "--remove-orphans"), nil
 	case ActionDown:
 		// down은 green 프로젝트만 종료한다(-p 항상 포함 — Q2). --rmi 없음: 이미지를
@@ -155,6 +171,11 @@ func NewExecutor(cfg Config) (*Executor, error) {
 	}
 	return &Executor{cfg: cfg, run: osExec}, nil
 }
+
+// AppService는 이 실행기가 결박된 대상 app compose 서비스명이다(비면 결박 없음 — 프로젝트
+// 전체 판정). 읽기 전용 접근자이며, 조립(env → Config) 배선이 실제로 이어졌는지 boot 테스트가
+// 관측하기 위해 있다 — 결박이 조용히 끊기면 H2 fail-open이 그대로 되돌아온다(#21).
+func (e *Executor) AppService() string { return e.cfg.AppService }
 
 // allowedSudoFlags는 프리픽스에 허용되는 sudo 플래그의 닫힌 allowlist다(정확 토큰만).
 // 비대화 비밀번호 주입(-S)·타임스탬프 무효화(-k)·비대화 실패(-n)와 각 롱폼만 둔다 —
@@ -259,10 +280,19 @@ func (e *Executor) RestartCount(ctx context.Context, name string) (int, error) {
 	return n, nil
 }
 
-// GreenContainers는 green 프로젝트에 현재 뜬 컨테이너 ID 목록을 준다(docker compose ps -q
-// — 부작용 없는 조회). 컨테이너명을 설정에 하드코딩하지 않고 compose 프로젝트에서 파생해,
-// 이미지 대조(C2)·재시작 검사(CD-1 그린 위장 방어)가 항상 실제 뜬 컨테이너를 대상으로
-// 하게 한다. 빈 목록은 오류가 아니라 빈 슬라이스로 준다 — 판정은 호출자가 한다.
+// GreenContainers는 CD-1 재시작 검사(그린 위장 방어)의 대상 컨테이너 ID 목록을 준다
+// (docker compose ps -q — 부작용 없는 조회). 컨테이너명을 설정에 하드코딩하지 않고 compose
+// 프로젝트에서 파생해, 검사가 항상 실제 뜬 컨테이너를 대상으로 하게 한다. 빈 목록은 오류가
+// 아니라 빈 슬라이스로 준다 — 판정은 호출자가 한다(health가 0개면 fail-closed로 닫는다).
+//
+// AppService가 설정되면 사후조건과 **같은 결박**을 적용해 대상 app 서비스의 컨테이너만
+// 본다(#21). ⚠️ 트레이드오프(의도한 축소): 그린 위장 방어의 원래 의도는 "어느 컨테이너든
+// 재시작하면 감지"였고, 이 축소로 **사이드카·one-shot의 재시작은 더 이상 헬스를 실패시키지
+// 않는다**. 그 대가를 지는 이유는 판정 대상이 앱이기 때문이다 — 사이드카 재시작은 앱이
+// 준비됐는지와 무관한데도 정상 배포를 반복 실패시켰고(M1과 같은 오탐 축), 반대로 방어가
+// 실제로 막아야 하는 것(재시작 정책이 죽은 **앱** 프로세스를 되살려 연속 2xx를 다른
+// 프로세스의 성공으로 이어붙이는 것)은 앱 서비스 안에서 전부 관측된다. 앱 서비스의 재시작은
+// 여전히 baseline 대비 증가로 즉시 실패시킨다(방어선 자체는 그대로 켜져 있다).
 func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
 	argv := e.cfg.commandLine("docker", "compose", "-f", e.cfg.ComposeFile, "-p", e.cfg.Project, "ps", "-q")
 	out, err := e.run(ctx, argv, e.cfg.composeEnv(), e.stdin())
@@ -275,7 +305,20 @@ func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
 			ids = append(ids, s)
 		}
 	}
-	return ids, nil
+	if e.cfg.AppService == "" || len(ids) == 0 {
+		return ids, nil
+	}
+	states, serr := e.targetStates(ctx, ids)
+	if serr != nil {
+		// 소속 서비스를 확정하지 못하면 대상을 좁힐 수 없다 — 조용히 전체로 넓히지 않고
+		// 오류를 낸다(health가 fail-closed로 받는다).
+		return nil, fmt.Errorf("dispatch: green 컨테이너 서비스 식별 실패(재시작 검사 대상 확정 불가): %w", serr)
+	}
+	var target []string
+	for _, st := range states {
+		target = append(target, st.id)
+	}
+	return target, nil
 }
 
 // projectContainerIDs는 green 프로젝트의 모든 컨테이너 ID를 준다(docker compose ps -a -q
@@ -297,52 +340,87 @@ func (e *Executor) projectContainerIDs(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// containerState는 한 컨테이너의 실행 상태와 이미지 참조다(사후조건 판정 입력).
+// containerState는 한 컨테이너의 실행 상태·이미지 참조·소속 compose 서비스다(사후조건 판정 입력).
 type containerState struct {
-	id     string
-	status string // docker State.Status: running·exited·dead·created·restarting·paused
-	image  string // Config.Image — 컨테이너 생성에 쓰인 이미지 참조(우리가 준 참조)
+	id      string
+	status  string // docker State.Status: running·exited·dead·created·restarting·paused
+	image   string // Config.Image — 컨테이너 생성에 쓰인 이미지 참조(우리가 준 참조)
+	service string // composeServiceLabel 값 — 이 컨테이너가 어느 compose 서비스의 것인가(#21)
 }
 
 func (s containerState) running() bool { return s.status == "running" }
 
-// inspectState는 한 컨테이너의 상태·이미지를 한 번의 inspect로 읽는다(부작용 없는 조회).
-// {{.State.Status}}로 실행중/종료를 구분하고, {{.Config.Image}}로 우리가 준 참조와 대조한다.
-// 상태·이미지 참조 모두 공백을 포함하지 않으므로 첫 공백으로 안전하게 가른다.
+// inspectStateFormat은 상태·이미지·서비스 라벨을 공백으로 이어 한 줄로 내는 inspect 포맷이다.
+// 세 값 모두 공백을 포함하지 않으므로(상태는 열거값, 이미지 참조·compose 서비스명은 공백 불가)
+// 공백 분해가 안전하다. 라벨이 없는 컨테이너는 세 번째 칸이 빈 문자열이 된다(text/template의
+// index는 없는 키에 zero value를 준다) — 그 컨테이너는 "서비스 미상"으로 다뤄진다.
+const inspectStateFormat = "{{.State.Status}} {{.Config.Image}} {{index .Config.Labels \"" + composeServiceLabel + "\"}}"
+
+// inspectState는 한 컨테이너의 상태·이미지·소속 서비스를 한 번의 inspect로 읽는다(부작용
+// 없는 조회). {{.State.Status}}로 실행중/종료를 구분하고, {{.Config.Image}}로 우리가 준
+// 참조와 대조하며, 서비스 라벨로 "이 배포의 대상 app인가"를 가른다(#21 identity 결박).
 // ⚠️ [구현 검증]: docker가 {{.Config.Image}}로 digest 참조를 그대로 돌려주는지(vs 정규화·
 // image ID)와 {{.State.Status}} 문자열 값은 리허설에서 재확인한다 — 불일치 시 실제 값이
 // 판정·error에 그대로 드러난다. {{.Image}}(config ID)는 manifest digest와 다른 해시라
 // 직접 대조에 쓸 수 없다.
 func (e *Executor) inspectState(ctx context.Context, id string) (containerState, error) {
-	argv := e.cfg.commandLine("docker", "inspect", "-f", "{{.State.Status}} {{.Config.Image}}", id)
+	argv := e.cfg.commandLine("docker", "inspect", "-f", inspectStateFormat, id)
 	out, err := e.run(ctx, argv, nil, e.stdin())
 	if err != nil {
 		return containerState{}, fmt.Errorf("dispatch: 컨테이너 상태 조회 실패(inspect %s): %w", id, err)
 	}
-	status, image, _ := strings.Cut(strings.TrimSpace(out), " ")
-	return containerState{id: id, status: strings.TrimSpace(status), image: strings.TrimSpace(image)}, nil
+	st := containerState{id: id}
+	f := strings.Fields(strings.TrimSpace(out))
+	if len(f) > 0 {
+		st.status = f[0]
+	}
+	if len(f) > 1 {
+		st.image = f[1]
+	}
+	if len(f) > 2 {
+		st.service = f[2]
+	}
+	return st, nil
 }
 
-// VerifyImageDigest는 green 프로젝트의 사후조건을 증명한다(DO-16 ⑶ — "기대 digest의
-// 컨테이너가 돌고 있다"). 세 갈래로 본다:
-//   - P1 부분기동 검출: 프로젝트에 종료/실패(running이 아닌) 컨테이너가 있으면 실패한다 —
-//     up 직후 worker가 종료됐는데 app만 2xx면 부분기동인데도 COMPLETED로 위장하므로,
-//     기대 서비스가 전부 running일 때만 통과한다. ⚠️ 가정: compose가 정상 종료하는
-//     one-shot init 컨테이너를 쓰면 이 모델 밖이다(그 경우 그 서비스는 별도로 다뤄야 한다).
-//   - P6 이미지 대조: 실행중 컨테이너 중 ≥1개의 Config.Image가 pinned digest 참조와 같으면
-//     app이 그 digest로 떴음이 증명된다. 다른 이미지의 사이드카·orphan은 실패시키지 않는다
-//     (all-match 요구는 정상 배포를 오탐했다). 실행중 일치가 0개면(엉뚱 이미지 — :latest·
-//     env 오타) 실패하며, 기대 참조를 error에 담는다.
+// targetStates는 컨테이너 ID들을 inspect해 **이 배포의 대상 서비스**의 것만 준다(#21).
+// AppService가 비면 전부 준다 — 결박 없는 기존 전체 판정 그대로다(하위호환).
+// 소속 판정은 composeServiceLabel 하나이며, 라벨이 없는 컨테이너는 대상이 아니다(결박이
+// 켜졌는데 소속을 증명하지 못하는 컨테이너를 대상으로 세면 결박이 무의미해진다).
+func (e *Executor) targetStates(ctx context.Context, ids []string) ([]containerState, error) {
+	var out []containerState
+	for _, id := range ids {
+		st, err := e.inspectState(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if e.cfg.AppService != "" && st.service != e.cfg.AppService {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out, nil
+}
+
+// VerifyImageDigest는 사후조건을 증명한다(DO-16 ⑶ — "기대 digest의 컨테이너가 돌고 있다").
+// 판정 대상은 **이 배포의 대상 app 서비스 컨테이너**다(#21 identity 결박 — AppService가
+// 설정된 경우). 프로젝트 전체가 아니라 대상 서비스만 보는 것이 두 결함의 근원을 함께 닫는다:
+//   - H2(fail-open) 닫힘: 사이드카·orphan이 우연히 pinned digest를 실행 중이어도 그것이
+//     app의 ≥1-match를 대신해 주지 못한다 — app 서비스가 :latest·env 오타로 틀린 이미지를
+//     실행 중이면 실패한다(엉뚱한 이미지가 COMPLETED로 기록되던 경로).
+//   - M1(오탐) 닫힘: 정상 종료하는 one-shot/init 컨테이너나 정지 orphan은 다른 서비스이므로
+//     부분기동 판정에 들지 않는다 — 정상 배포를 미전환으로 오판하지 않는다.
 //
-// 뜬 컨테이너가 없거나(증명 불가)·조회 실패·부분기동·불일치면 오류다.
+// 갈래는 셋이다:
+//   - ⑴ 이미지 대조: 대상 서비스의 **실행중** 컨테이너 중 ≥1개의 Config.Image가 pinned
+//     digest 참조와 같아야 한다(app이 여러 replica면 하나만 맞아도 그 digest 실행이 증명된다).
+//     일치 0개면 실패하며 기대 참조와 실제 값을 error에 담는다.
+//   - ⑵ 부분기동 검출: 대상 서비스에 종료/실패(running이 아닌) 컨테이너가 있으면 실패한다 —
+//     app이 up 직후 죽었는데 다른 replica·프로브만 살아 통과하는 silent COMPLETED를 막는다.
+//   - ⑶ 대상 서비스 컨테이너가 0개면 실패한다 — 증명 불가는 통과가 아니다(기존 계약 유지).
 //
-// ⚠️ [구현 검증]/후속 — H2·M1 잔여: 이 검사는 raw 프로젝트 컨테이너 집합을 보지 "이 배포의
-// 대상 app 서비스"를 identity로 결박하지 않는다. 그래서 ⑴ orphan/사이드카가 pinned digest를
-// 실행 중이면 app이 틀린 이미지여도 ≥1-match가 가려 silent COMPLETED가 될 수 있고(H2 — up의
-// --remove-orphans로 현실적 orphan 벡터는 완화했으나 완전 방어 아님), ⑵ 정상 종료하는 one-shot
-// init·정지 orphan을 부분기동으로 오탐할 수 있다(M1 — fail-closed). 완전 방어 = 배포 대상 app
-// 서비스를 명시(예: DEPLOY_APP_SERVICE)해 그 서비스만 digest 대조·상태 판정. 이는 호스트
-// compose 서비스 매핑(잔여-6/#19)과 얽혀 후속 이슈로 분리한다.
+// AppService가 비면(단일 경로 모드에서 미설정) 프로젝트 전체를 보던 기존 판정 그대로다 —
+// 그 환경에는 위 H2·M1 잔여가 남는다(main이 기동 로그로 그 사실을 알린다).
 func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error {
 	ids, err := e.projectContainerIDs(ctx)
 	if err != nil {
@@ -351,24 +429,29 @@ func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error
 	if len(ids) == 0 {
 		return fmt.Errorf("dispatch: green 컨테이너가 없다 — 사후조건으로 pinned digest(%s) 실행을 증명할 수 없다", imageRef)
 	}
+	states, err := e.targetStates(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("dispatch: 이미지 대조 불가: %w", err)
+	}
+	// ⑶ 대상 서비스의 컨테이너가 하나도 없다 = 배포 대상이 뜨지 않았다(사이드카만 떠 있어도
+	//    통과시키지 않는다 — 증명 불가는 실패다).
+	if len(states) == 0 {
+		return fmt.Errorf("dispatch: 대상 서비스(%s=%q)의 컨테이너가 프로젝트에 없다(프로젝트 컨테이너 %d개) — 사후조건으로 pinned digest(%s) 실행을 증명할 수 없다", composeServiceLabel, e.cfg.AppService, len(ids), imageRef)
+	}
 	var running []containerState
 	var stopped []string
-	for _, id := range ids {
-		st, gerr := e.inspectState(ctx, id)
-		if gerr != nil {
-			return fmt.Errorf("dispatch: 이미지 대조 불가: %w", gerr)
-		}
+	for _, st := range states {
 		if st.running() {
 			running = append(running, st)
 		} else {
 			stopped = append(stopped, fmt.Sprintf("%s(%s)", st.id, st.status))
 		}
 	}
-	// P1: 종료/실패 컨테이너가 하나라도 있으면 부분기동 — 실패(silent COMPLETED 차단).
+	// ⑵ 대상 서비스에 종료/실패 컨테이너가 있으면 부분기동 — 실패(silent COMPLETED 차단).
 	if len(stopped) > 0 {
-		return fmt.Errorf("dispatch: 부분기동 — 종료/실패 컨테이너가 있다(기대 서비스가 전부 running이어야 한다): %v", stopped)
+		return fmt.Errorf("dispatch: 부분기동 — 대상 서비스(%q)에 종료/실패 컨테이너가 있다(대상 서비스가 전부 running이어야 한다): %v", e.cfg.AppService, stopped)
 	}
-	// P6: 실행중 컨테이너 중 하나라도 pinned digest면 app이 그 digest로 떴음이 증명된다.
+	// ⑴ 대상 서비스의 실행중 컨테이너 중 하나라도 pinned digest면 그 digest 실행이 증명된다.
 	for _, st := range running {
 		if st.image == imageRef {
 			return nil
@@ -378,7 +461,7 @@ func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error
 	for _, st := range running {
 		got = append(got, st.image)
 	}
-	return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치 — 실행중 컨테이너 중 기대=%q 일치 0개, 실제=%v", imageRef, got)
+	return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치 — 대상 서비스(%q)의 실행중 컨테이너 중 기대=%q 일치 0개, 실제=%v", e.cfg.AppService, imageRef, got)
 }
 
 // osExec는 기본 러너다. argv[0]를 실행 파일로, 나머지를 인자 슬라이스로 넘겨 셸 해석을
