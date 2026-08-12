@@ -40,19 +40,37 @@ func (fixedClock) Now() time.Time { return testNow }
 // --- store 페이크 -------------------------------------------------------------
 
 // fakeLedger는 인메모리 재생 방어 원장이다. store.LedgerStore의 3분기 계약을 흉내낸다.
+// reserves는 호출 횟수다 — 결박 거절이 **선점 이전**임을 증명하려면 "거절됐다"만으로는
+// 부족하고 "원장을 건드리지 않았다"를 직접 봐야 한다(부작용 0).
 type fakeLedger struct {
-	mu     sync.Mutex
-	digest map[string]string // requestID -> body digest
-	jtis   map[string]bool
+	mu       sync.Mutex
+	digest   map[string]string // requestID -> body digest
+	jtis     map[string]bool
+	reserves int
 }
 
 func newFakeLedger() *fakeLedger {
 	return &fakeLedger{digest: map[string]string{}, jtis: map[string]bool{}}
 }
 
+// reserveCount는 지금까지의 선점 시도 횟수다.
+func (f *fakeLedger) reserveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reserves
+}
+
+// jtiUsed는 jti가 소모(선점)됐는지 본다.
+func (f *fakeLedger) jtiUsed(jti string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.jtis[jti]
+}
+
 func (f *fakeLedger) Reserve(_ context.Context, requestID, jti, bodyDigest string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.reserves++
 	// 실제 store.Reserve와 같은 우선순위: requestId(PK)를 먼저 본다 — 이미 있으면
 	// digest를 대조해 재생/충돌을 가른다. requestId가 신규일 때만 jti 재사용을 본다
 	// (동일 requestId + 동일 jti + 다른 digest는 충돌이지 jti 재생이 아니다).
@@ -77,11 +95,14 @@ func (f *fakeLedger) Reserve(_ context.Context, requestID, jti, bodyDigest strin
 // fakeOIDC는 게이트 2를 대체한다. accept가 true면 fixedJTI를 실은 통과 결정을,
 // false면 거절 결정을 낸다 — 게이트 2 자체의 행렬은 auth 패키지가 검증하므로, 여기서는
 // 배선(토큰 헤더 읽기·jti 전달·거절 시 401·기록)만 못박는다.
+// allowedTarget은 게이트 2가 판정한 이 신원의 허용 배포 대상이다(allowlist 항목의 target).
+// 진입 층의 결박 대조 입력이며, 기본은 core다 — 이 파일의 요청 대부분이 core manifest다.
 type fakeOIDC struct {
-	accept    bool
-	fixedJTI  string
-	reason    string
-	lastToken string
+	accept        bool
+	fixedJTI      string
+	reason        string
+	lastToken     string
+	allowedTarget deploy.Target
 }
 
 func (f *fakeOIDC) Verify(_ context.Context, rawToken string) auth.OIDCDecision {
@@ -89,7 +110,12 @@ func (f *fakeOIDC) Verify(_ context.Context, rawToken string) auth.OIDCDecision 
 	if !f.accept {
 		return auth.OIDCDecision{Accepted: false, Reason: f.reason}
 	}
-	return auth.OIDCDecision{Accepted: true, JTI: f.fixedJTI, SelfReport: true}
+	return auth.OIDCDecision{Accepted: true, JTI: f.fixedJTI, SelfReport: true, AllowedTarget: f.allowedTarget}
+}
+
+// acceptingOIDC는 지정한 대상을 허용하는 통과 게이트 2 페이크다.
+func acceptingOIDC(jti string, target deploy.Target) *fakeOIDC {
+	return &fakeOIDC{accept: true, fixedJTI: jti, allowedTarget: target}
 }
 
 // fakeHistory는 인메모리 이력이다. append와 최신 읽기만 지원한다(append-only).
@@ -181,7 +207,7 @@ func testConfig(maxBody int64) Config {
 // 행렬 자체는 auth 패키지가 검증하므로 기본은 통과다.
 func testDeps(t *testing.T) (Deps, *fakeHistory) {
 	t.Helper()
-	return testDepsWith(t, &fakeOIDC{accept: true, fixedJTI: "jti-default"}, deploy.StubDispatcher{})
+	return testDepsWith(t, acceptingOIDC("jti-default", deploy.TargetCore), deploy.StubDispatcher{})
 }
 
 // testDepsWithOIDC는 지정한 게이트 2로 deps를 조립한다(거절·자기 신고 배선 테스트용).
@@ -215,8 +241,25 @@ func testDepsWith(t *testing.T, oidc OIDCGate, dispatcher deploy.Dispatcher) (De
 // manifestBody는 대상·requestID로 완전한(DO-18 6칸) manifest JSON을 만든다. manifest의
 // requestId는 서명될 envelope requestId와 같아야 오케스트레이션 검증을 통과한다.
 func manifestBody(target, requestID string) string {
-	return `{"target":"` + target + `","commitSha":"c1","imageDigest":"sha256:` + strings.Repeat("a", 64) + `",` +
+	return manifestBodyCommit(target, requestID, "c1")
+}
+
+// manifestBodyCommit은 커밋만 다른 manifest를 만든다 — 같은 requestId로 **내용만 다른**
+// 요청(멱등 충돌)을 만들 때 쓴다. 대상을 바꿔 내용을 다르게 하면 결박(withValidate)에
+// 먼저 걸려 멱등 충돌 자체를 밟지 못하므로, 다른 축으로 내용을 가른다.
+func manifestBodyCommit(target, requestID, commit string) string {
+	return `{"target":"` + target + `","commitSha":"` + commit + `","imageDigest":"sha256:` + strings.Repeat("a", 64) + `",` +
 		`"composeRevision":"rev1","configVersion":"v1","requestId":"` + requestID + `"}`
+}
+
+// ledgerOf는 deps에 물린 인메모리 원장을 꺼낸다(선점 횟수·jti 소모 확인용).
+func ledgerOf(t *testing.T, d Deps) *fakeLedger {
+	t.Helper()
+	l, ok := d.Ledger.(*fakeLedger)
+	if !ok {
+		t.Fatalf("테스트 deps의 Ledger가 fakeLedger가 아니다: %T", d.Ledger)
+	}
+	return l
 }
 
 // signedRequest는 대상·requestID로 완전한 manifest를 만들어 올바르게 서명된 POST /deploy
@@ -445,7 +488,7 @@ func TestReplayUnexecutedResumes(t *testing.T) {
 // 확인한다(DO-10 ⑷ — 완료는 재개하지 않는다). dispatch가 COMPLETED를 내면 첫 요청이 완료로
 // 기록되고, 같은 요청 재전송은 재개 없이 완료 상태만 반환한다.
 func TestReplayCompletedReturnsState(t *testing.T) {
-	deps, _ := testDepsWith(t, &fakeOIDC{accept: true, fixedJTI: "jti-done"}, stateDispatcher{state: deploy.StateCompleted})
+	deps, _ := testDepsWith(t, acceptingOIDC("jti-done", deploy.TargetCore), stateDispatcher{state: deploy.StateCompleted})
 	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
 	iat, exp := freshWindow()
 
@@ -508,7 +551,9 @@ func TestSameIDDifferentDigestRejected(t *testing.T) {
 	}
 
 	// 같은 id, 다른 본문(다시 올바르게 서명한다 — 서명은 유효하되 digest가 다르다).
-	second := signedRequest("ledger", "req-conflict", iat, exp)
+	// 대상은 같게 두고 커밋만 바꾼다 — 대상을 바꾸면 결박에서 먼저 403이 되어 이 테스트가
+	// 검증하려는 멱등 충돌(409)에 닿지 못한다.
+	second := signedBody(manifestBodyCommit("core", "req-conflict", "c2"), "req-conflict", iat, exp)
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, second)
 	if rec2.Code != http.StatusConflict {
@@ -578,8 +623,9 @@ func TestJTIReuseReturnsReplay(t *testing.T) {
 		t.Fatalf("1차 요청: 코드 = %d, 기대 = 501", rec1.Code)
 	}
 
-	// 2차 — 다른 requestId·다른 본문이지만 같은 jti(토큰 재사용).
-	second := signedRequest("ledger", "req-jti-B", iat, exp)
+	// 2차 — 다른 requestId·다른 본문(manifest의 requestId가 다르다)이지만 같은 jti(토큰 재사용).
+	// 대상은 허용된 core 그대로다 — 여기서 보려는 것은 결박이 아니라 jti 재사용 분기다.
+	second := signedRequest("core", "req-jti-B", iat, exp)
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, second)
 	if rec2.Code != http.StatusOK {
@@ -611,6 +657,185 @@ func TestSelfReportRecordedOnReserve(t *testing.T) {
 	}
 }
 
+// --- repo↔target 결박(withValidate · design rev.2 변경 ①) --------------------
+
+// TestTargetMismatchForbiddenBeforeReserve는 결박의 핵심을 못박는다: 게이트 1·2를 모두
+// 통과한 **정상 토큰**이라도 자기 항목의 target이 아닌 대상을 배포하려 하면 403이고,
+// 그때 원장을 건드리지 않는다(선점 0 · jti 비소모). core repo의 유효한 토큰으로 gateway를
+// 배포하려는 시도가 여기서 끊긴다.
+func TestTargetMismatchForbiddenBeforeReserve(t *testing.T) {
+	deps, hist := testDepsWithOIDC(t, acceptingOIDC("jti-bind", deploy.TargetCore))
+	ledger := ledgerOf(t, deps)
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+
+	iat, exp := freshWindow()
+	req := signedRequest("gateway", "req-cross", iat, exp) // 허용=core인데 gateway를 요구
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("허용 밖 대상: 코드 = %d, 기대 = 403", rec.Code)
+	}
+	if n := ledger.reserveCount(); n != 0 {
+		t.Errorf("결박 거절인데 원장 선점이 %d회 일어났다 (선점 이전에 끊어야 한다 — 부작용 0)", n)
+	}
+	if ledger.jtiUsed("jti-bind") {
+		t.Error("결박 거절이 jti를 소모했다 (같은 토큰의 정당한 재시도가 재전송으로 오판된다)")
+	}
+	ev, ok := hist.find("req-cross", "REJECTED")
+	if !ok {
+		t.Fatal("결박 거절이 이력에 기록되지 않았다 (RL-8)")
+	}
+	if !strings.Contains(ev.RejectReason, "target 불일치") ||
+		!strings.Contains(ev.RejectReason, "core") || !strings.Contains(ev.RejectReason, "gateway") {
+		t.Errorf("거절 사유에 허용·요청 대상이 남지 않았다: %q (오설정과 침입을 사후에 가를 수 없다)", ev.RejectReason)
+	}
+}
+
+// TestTargetMismatchRetryAfterFixSucceeds는 결박 거절이 **아무것도 소모하지 않았음**을
+// 직접 증명한다: 거절된 뒤 같은 requestId·같은 토큰으로 올바른 대상을 보내면 통과해야
+// 한다. 선점이나 jti 소모가 일어났다면 이 재시도는 재전송(200)이나 충돌(409)로 갈린다.
+func TestTargetMismatchRetryAfterFixSucceeds(t *testing.T) {
+	deps, _ := testDepsWithOIDC(t, acceptingOIDC("jti-retry", deploy.TargetCore))
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+	iat, exp := freshWindow()
+
+	// 1차 — 잘못된 대상으로 거절(403).
+	bad := signedRequest("gateway", "req-retry", iat, exp)
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, bad)
+	if rec1.Code != http.StatusForbidden {
+		t.Fatalf("1차(허용 밖 대상): 코드 = %d, 기대 = 403", rec1.Code)
+	}
+
+	// 2차 — 같은 requestId·같은 토큰, 올바른 대상 → 신규로 통과해 실행 지점(501)에 닿는다.
+	good := signedRequest("core", "req-retry", iat, exp)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, good)
+	if rec2.Code != http.StatusNotImplemented {
+		t.Fatalf("거절 후 재시도: 코드 = %d, 기대 = 501(신규 처리). 200/409면 거절이 선점·jti를 소모한 것", rec2.Code)
+	}
+}
+
+// TestCompletedRequestResentByOtherRepoForbidden은 결박이 **멱등 경로로 새지 않는지**
+// 본다: 이미 완료된 requestId를 다른 repo의 토큰으로 재전송하면, 재전송 분기(상태 반환)에
+// 닿기 전에 403이어야 한다. coordinator에서 대조했다면 이 요청은 결박을 통째로 우회해
+// 배포 상태까지 돌려받는다(design rev.2가 D3를 폐기한 이유).
+func TestCompletedRequestResentByOtherRepoForbidden(t *testing.T) {
+	oidc := acceptingOIDC("jti-cross-done", deploy.TargetCore)
+	deps, _ := testDepsWith(t, oidc, stateDispatcher{state: deploy.StateCompleted})
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+	iat, exp := freshWindow()
+
+	// 1차 — core repo가 core를 배포해 완료(200).
+	first := signedRequest("core", "req-cross-done", iat, exp)
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, first)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("1차(완료): 코드 = %d, 기대 = 200", rec1.Code)
+	}
+
+	// 2차 — 같은 요청을 gateway repo의 토큰(허용 target = gateway)이 재전송한다.
+	// 요청 body의 대상은 core이므로 그 신원에는 허용되지 않는다.
+	oidc.allowedTarget = deploy.TargetGateway
+	oidc.fixedJTI = "jti-cross-done-2"
+	second := signedRequest("core", "req-cross-done", iat, exp)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, second)
+
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("타 repo 토큰의 완료 요청 재전송: 코드 = %d, 기대 = 403 (200이면 결박이 멱등 경로로 샌다)", rec2.Code)
+	}
+	if rec2.Header().Get("X-Deploy-Idempotent-Replay") != "" {
+		t.Error("거절 응답에 멱등 재생 표식이 실렸다 — 배포 상태를 권한 밖 신원에 노출한다")
+	}
+	if strings.Contains(rec2.Body.String(), "COMPLETED") || strings.Contains(rec2.Body.String(), "이미 수신된 요청") {
+		t.Errorf("거절 응답이 배포 상태를 노출했다: %q", rec2.Body.String())
+	}
+}
+
+// TestEmptyAllowedTargetFailsClosed는 게이트 2가 통과 결정을 내면서 허용 target을 싣지
+// 않은 경우(정책 로딩·배선이 깨진 상태) 요청을 통과시키지 않고 500으로 닫는지 확인한다.
+// 요청자의 잘못이 아니므로 4xx가 아니며, 통과는 결박 없는 배포이므로 더더욱 아니다.
+func TestEmptyAllowedTargetFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target deploy.Target
+	}{
+		{"허용 target 빈 값", ""},
+		{"허용 target이 닫힌 집합 밖", "core-v2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, _ := testDepsWithOIDC(t, acceptingOIDC("jti-broken", tc.target))
+			ledger := ledgerOf(t, deps)
+			h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+
+			iat, exp := freshWindow()
+			req := signedRequest("core", "req-broken", iat, exp)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("%s: 코드 = %d, 기대 = 500(내부 배선 오류 · fail-closed)", tc.name, rec.Code)
+			}
+			if n := ledger.reserveCount(); n != 0 {
+				t.Errorf("배선 오류인데 원장 선점이 %d회 일어났다", n)
+			}
+		})
+	}
+}
+
+// TestUnparsableBodyRejectedBeforeReserve는 target을 추출할 수 없는 body(JSON 파싱 불가·
+// 필드 부재)가 결박 거절(403)이 아니라 manifest 형식 오류(422)로 닫히는지 확인한다 —
+// 권한 문제와 형식 문제를 같은 코드로 뭉개면 CI 로그에서 원인이 갈리지 않는다.
+func TestUnparsableBodyRejectedBeforeReserve(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"JSON 파싱 불가", `not-json`},
+		{"target 필드 부재", `{"commitSha":"c1"}`},
+		{"target 빈 값", `{"target":"","commitSha":"c1"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, hist := testDeps(t)
+			ledger := ledgerOf(t, deps)
+			h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+
+			iat, exp := freshWindow()
+			req := signedBody(tc.body, "req-notarget", iat, exp)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("%s: 코드 = %d, 기대 = 422(형식 오류)", tc.name, rec.Code)
+			}
+			if n := ledger.reserveCount(); n != 0 {
+				t.Errorf("형식 오류인데 원장 선점이 %d회 일어났다 (부작용 0)", n)
+			}
+			if hist.count("req-notarget") == 0 {
+				t.Error("형식 거절이 이력에 기록되지 않았다 (RL-8)")
+			}
+		})
+	}
+}
+
+// TestAllowedTargetMatchPasses는 허용 대상과 요청 대상이 같으면 결박이 길을 막지 않는지
+// 못박는다(과잉 거절 방어 — 거절 경로만 있으면 "전부 막는 미들웨어"도 통과한다).
+func TestAllowedTargetMatchPasses(t *testing.T) {
+	deps, _ := testDepsWithOIDC(t, acceptingOIDC("jti-gw", deploy.TargetGateway))
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+
+	iat, exp := freshWindow()
+	req := signedRequest("gateway", "req-gw", iat, exp)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("허용 대상 일치: 코드 = %d, 기대 = 501(실행 지점 도달)", rec.Code)
+	}
+}
+
 // --- 오케스트레이션 배선(거절·상태 사상) ------------------------------------
 
 // TestMalformedManifestRejected는 서명·게이트를 통과해도 manifest가 불완전(DO-18 6칸
@@ -634,7 +859,7 @@ func TestMalformedManifestRejected(t *testing.T) {
 // TestUnknownStateEscalates는 직전 시도가 UNKNOWN으로 남은 요청의 재전송이 무턱대고
 // 재실행되지 않고 409로 사람에게 올라가는지 확인한다(DO-16 ⑵ — 재시도·실패 접기 금지).
 func TestUnknownStateEscalates(t *testing.T) {
-	deps, _ := testDepsWith(t, &fakeOIDC{accept: true, fixedJTI: "jti-unknown"}, stateDispatcher{state: deploy.StateUnknown})
+	deps, _ := testDepsWith(t, acceptingOIDC("jti-unknown", deploy.TargetCore), stateDispatcher{state: deploy.StateUnknown})
 	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
 	iat, exp := freshWindow()
 

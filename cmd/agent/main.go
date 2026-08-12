@@ -247,6 +247,10 @@ func buildDeps() (httpentry.Deps, error) {
 	if err != nil {
 		return httpentry.Deps{}, fmt.Errorf("게이트 2 verifier: %w", err)
 	}
+	// 적재된 항목 수를 기동 로그에 남긴다 — .9 이관(파일 배치 + 단일 env 제거) 뒤 재기동이
+	// 실제로 새 allowlist를 읽었는지, 몇 저장소가 등재됐는지가 로그 한 줄로 보여야 한다.
+	// (설정이 없거나 어긋나면 여기 오기 전에 기동이 거부된다 — 이 줄은 항상 ≥1이다.)
+	fmt.Printf("게이트 2 · OIDC allowlist 항목 %d개 적재 (repo↔target 결박 유효)\n", oidcPolicy.Allowlist.Len())
 
 	dsn := os.Getenv("DEPLOY_DB_DSN")
 	if dsn == "" {

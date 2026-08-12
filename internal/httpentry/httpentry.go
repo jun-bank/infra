@@ -118,6 +118,10 @@ type verifiedRequest struct {
 	// selfReport는 운영 승인이 자기 신고임을 나타낸다(게이트 2 · 잔여-5). 신규 예약을
 	// 이력에 남길 때 이 사실을 함께 적는다.
 	selfReport bool
+	// allowedTarget은 게이트 2가 판정한 이 신원의 허용 배포 대상이다(allowlist 항목의
+	// target). withValidate가 요청 대상과 대조해 결박을 세운다 — 하류는 이 값을 다시
+	// 판정하지 않는다(게이트 판정 신뢰 계약).
+	allowedTarget deploy.Target
 }
 
 // middleware는 하나의 http.Handler를 감싸 다음 핸들러로 잇는 함수다. 체인의 각 고리가
@@ -156,7 +160,7 @@ func NewHandler(cfg Config, deps Deps) http.Handler {
 		withBodyLimit(cfg.MaxBodyBytes), // 전송 제한(DO-15 ⑵) — 바깥에서 body를 캡
 		withAuth(deps),                  // 게이트 1 — HMAC + 신선도(DO-2·DO-10 ⑴⑵)
 		withOIDC(deps),                  // 게이트 2 — OIDC claim 행렬(DO-11) · HMAC과 AND
-		withValidate,                    // 요청 형태 검증 슬롯(통과 스텁)
+		withValidate(deps),              // repo↔target 결박 — 게이트 2의 허용 target과 요청 대상 대조
 		withIdempotency(deps),           // requestId·jti 멱등 선점·3분기(DO-10 ⑶⑷)
 	))
 	return mux
@@ -287,22 +291,74 @@ func withOIDC(d Deps) middleware {
 				return
 			}
 
-			// 통과 — 선점할 jti와 자기 신고 표식을 실어 하류로 넘긴다.
+			// 통과 — 선점할 jti·자기 신고 표식과 이 신원의 허용 배포 대상을 실어 넘긴다.
+			// 허용 target의 검증(빈 값·닫힌 집합)은 결박을 세우는 withValidate가 한다.
 			vr.jti = dec.JTI
 			vr.selfReport = dec.SelfReport
+			vr.allowedTarget = dec.AllowedTarget
 			ctx := context.WithValue(r.Context(), verifiedRequestKey, vr)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-// withValidate는 요청 형태(필수 헤더·manifest 구조)를 검증할 자리다. 지금은 통과 스텁.
+// withValidate는 신원↔대상 결박을 세운다: 게이트 2가 판정한 "이 저장소가 배포할 수 있는
+// 대상"과 요청이 실제로 배포하려는 대상을 대조한다(A2). 등재된 저장소라도 자기 target
+// 하나만 배포할 수 있다 — core의 정상 토큰으로 gateway를 배포하는 것이 여기서 끊긴다.
 //
-// TODO: 서명 범위 밖의 값은 판정에 쓰지 않는다(DO-10 ⑴) · forwarded 헤더 불신(DO-15 ⑹).
-func withValidate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-	})
+// ★ 자리가 여기인 이유(design rev.2 변경 ①): 대조는 **멱등 선점 이전**이어야 한다.
+//   - 선점 뒤에 대조하면 권한 없는 요청이 requestId·jti를 소모한다(원장에 남고, 같은
+//     토큰의 정당한 재시도가 재전송으로 취급된다). 여기서 끊으면 부작용이 0이다.
+//   - 오케스트레이션(coordinator)에서 대조하면 재전송 경로(REPORT·ESCALATE)가 그 층을
+//     지나지 않아 결박이 통째로 우회된다. 미들웨어는 모든 경로가 지난다.
+//
+// 대상 추출은 target 필드 하나만 부분 디코드한다(deploy.TargetOf) — manifest 완전성
+// 검증은 여전히 VerifyManifest 하나가 소유한다(검증 정본을 둘로 만들지 않는다).
+//
+// 응답은 셋으로 갈린다:
+//   - 게이트 2가 통과시켰는데 허용 target이 비었거나 닫힌 집합 밖 = **내부 배선 오류**다.
+//     요청자의 잘못이 아니므로 4xx로 돌려주지 않고 500으로 요란하게 닫는다(fail-closed —
+//     결박 없이 배포를 열지 않는다).
+//   - target을 추출할 수 없음(JSON 파싱 불가·필드 부재·빈 값) = manifest 형식 오류 계열
+//     422. 결박 위반이 아니라 요청이 배포 요청의 형태를 갖추지 못한 것이다.
+//   - 추출한 대상 ≠ 허용 대상 = 403(권한 밖 대상). 닫힌 집합 밖의 값도 여기 걸린다.
+//
+// TODO: 이 슬롯이 원래 함께 지고 있던 요청 형태 검증(forwarded 헤더 불신 — DO-15 ⑹)은
+// 아직 없다. 서명 범위 밖의 값은 판정에 쓰지 않는다(DO-10 ⑴)는 계약은 지금도 유효하다 —
+// 여기서 쓰는 두 값은 서명된 body와 게이트 2의 판정 결과뿐이다.
+func withValidate(d Deps) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			v, ok := r.Context().Value(verifiedRequestKey).(verifiedRequest)
+			if !ok {
+				// 게이트를 거치지 않고 도달 = 조립 오류. 통과시키지 않는다(fail-closed).
+				http.Error(w, "검증되지 않은 요청 (내부 순서 오류)", http.StatusInternalServerError)
+				return
+			}
+			if !v.allowedTarget.Valid() {
+				// 게이트 2가 통과시켰는데 허용 target이 없다 = 정책 로딩·배선이 깨진 것이다.
+				// 이 상태에서 통과시키면 결박 없는 배포가 조용히 열린다.
+				http.Error(w, "내부 배선 오류: 인증된 요청에 허용 target이 없다 (게이트 2 정책·배선 확인 — fail-closed)", http.StatusInternalServerError)
+				return
+			}
+
+			target, err := deploy.TargetOf(v.body)
+			if err != nil || target == "" {
+				d.rejectUnverified(r.Context(), v.req.RequestID, "manifest target 추출 불가 (JSON 파싱 불가·target 필드 부재)")
+				http.Error(w, "manifest 검증 실패: target을 읽을 수 없다", http.StatusUnprocessableEntity)
+				return
+			}
+			if target != v.allowedTarget {
+				// RL-8 — 사유에 두 값을 남긴다. 오설정(워크플로가 남의 대상을 배포)과 침입
+				// (탈취 토큰으로 다른 대상 배포)을 사후에 가르려면 무엇을 요구했는지가 필요하다.
+				d.rejectUnverified(r.Context(), v.req.RequestID,
+					"target 불일치 (허용="+string(v.allowedTarget)+" 요청="+string(target)+") — 이 저장소는 그 대상을 배포할 수 없다")
+				http.Error(w, "허용되지 않은 배포 대상: 이 저장소에 허용된 대상은 "+string(v.allowedTarget)+"다", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // withIdempotency는 requestId를 부작용 전에 선점하고 재생을 3분기한다(DO-10 ⑶⑷).
