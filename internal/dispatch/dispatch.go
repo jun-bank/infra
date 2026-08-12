@@ -318,6 +318,13 @@ func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
 	for _, st := range states {
 		target = append(target, st.id)
 	}
+	// 프로젝트에 컨테이너는 있는데 대상 서비스 매치가 0개 = 결박 대상이 뜨지 않았거나 서비스명
+	// 오설정이다. 빈 목록을 조용히 돌려주면 호출자(health)가 "대상이 없다"를 자기 문면으로만
+	// 알게 되고, 같은 상황을 실패로 닫는 VerifyImageDigest ⑶과 비대칭이 된다 — 같은 축의
+	// 오류로 닫는다(무음 통과 금지 · fail-closed).
+	if len(target) == 0 {
+		return nil, fmt.Errorf("dispatch: 대상 서비스(%s=%q)의 컨테이너가 프로젝트에 없다(프로젝트 실행중 컨테이너 %d개) — 재시작 검사 대상을 확정할 수 없다", composeServiceLabel, e.cfg.AppService, len(ids))
+	}
 	return target, nil
 }
 
@@ -412,15 +419,25 @@ func (e *Executor) targetStates(ctx context.Context, ids []string) ([]containerS
 //     부분기동 판정에 들지 않는다 — 정상 배포를 미전환으로 오판하지 않는다.
 //
 // 갈래는 셋이다:
-//   - ⑴ 이미지 대조: 대상 서비스의 **실행중** 컨테이너 중 ≥1개의 Config.Image가 pinned
-//     digest 참조와 같아야 한다(app이 여러 replica면 하나만 맞아도 그 digest 실행이 증명된다).
-//     일치 0개면 실패하며 기대 참조와 실제 값을 error에 담는다.
+//   - ⑴ 이미지 대조(결박 시 all-match): 대상 서비스의 **실행중 컨테이너 전부**의 Config.Image가
+//     pinned digest 참조와 같아야 한다. 하나라도 다르면 실패하며 불일치 목록을 error에 담는다.
+//     ★ ≥1-match가 아닌 이유: 같은 서비스의 replica가 [pinned 1 + :latest 1]로 섞여 뜨면
+//     (rolling 잔재·부분 재생성) ≥1-match는 그 mixed-replica를 COMPLETED로 위장시킨다 —
+//     한 서비스 안의 replica는 전부 같은 버전이어야 "그 digest가 떴다"가 성립한다. 예전
+//     all-match가 정상 배포를 오탐했던 것은 판정 대상이 프로젝트 전체(사이드카 포함)였기
+//     때문이고, 결박된 지금은 다른 이미지의 사이드카가 애초에 이 집합에 들지 않는다.
+//     결박이 없는 하위호환 경로는 그 전제가 없으므로 예전 ≥1-match 그대로다.
 //   - ⑵ 부분기동 검출: 대상 서비스에 종료/실패(running이 아닌) 컨테이너가 있으면 실패한다 —
 //     app이 up 직후 죽었는데 다른 replica·프로브만 살아 통과하는 silent COMPLETED를 막는다.
 //   - ⑶ 대상 서비스 컨테이너가 0개면 실패한다 — 증명 불가는 통과가 아니다(기존 계약 유지).
 //
 // AppService가 비면(단일 경로 모드에서 미설정) 프로젝트 전체를 보던 기존 판정 그대로다 —
 // 그 환경에는 위 H2·M1 잔여가 남는다(main이 기동 로그로 그 사실을 알린다).
+//
+// ⚠️ 이 결박이 닫지 못하는 축: AppService가 **존재하지만 엉뚱한 서비스**를 가리키는 오설정.
+// 그때 이 검사는 그 서비스를 성실히 판정하므로(대상 0개면 전건 실패라 조용하지는 않다)
+// "설정이 실제 배포 대상과 같은가"는 증명하지 못한다 — 그 축은 호스트 compose·config
+// revision을 서명된 manifest에 결박하는 #19(DO-18 ⑴⑶)가 닫는다.
 func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error {
 	ids, err := e.projectContainerIDs(ctx)
 	if err != nil {
@@ -451,17 +468,34 @@ func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error
 	if len(stopped) > 0 {
 		return fmt.Errorf("dispatch: 부분기동 — 대상 서비스(%q)에 종료/실패 컨테이너가 있다(대상 서비스가 전부 running이어야 한다): %v", e.cfg.AppService, stopped)
 	}
-	// ⑴ 대상 서비스의 실행중 컨테이너 중 하나라도 pinned digest면 그 digest 실행이 증명된다.
+	// ⑴ 이미지 대조. 결박이 켜졌으면 all-match(대상 서비스의 실행중 컨테이너 **전부**가 pinned
+	//    digest), 결박이 없으면 예전 그대로 ≥1-match다. 판정 집합이 다르기 때문에 강도가 갈린다:
+	//    결박된 집합은 한 서비스의 replica들이라 전부 같은 버전이어야 하지만, 결박 없는 집합은
+	//    사이드카까지 섞여 있어 all-match를 요구하면 정상 배포를 오탐한다(그 오탐이 예전에
+	//    all-match를 걷어내게 만든 이유다 — 결박이 그 전제를 바꿨다).
+	var mismatch []string
 	for _, st := range running {
-		if st.image == imageRef {
-			return nil
+		if st.image != imageRef {
+			mismatch = append(mismatch, fmt.Sprintf("%s(%s)", st.id, st.image))
 		}
 	}
-	var got []string
-	for _, st := range running {
-		got = append(got, st.image)
+	if e.cfg.AppService == "" {
+		// 결박 없음(하위호환): 실행중 하나라도 pinned digest면 통과 — H2 잔여가 남는 경로다.
+		if len(mismatch) < len(running) {
+			return nil
+		}
+		var got []string
+		for _, st := range running {
+			got = append(got, st.image)
+		}
+		return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치 — 실행중 컨테이너 중 기대=%q 일치 0개, 실제=%v", imageRef, got)
 	}
-	return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치 — 대상 서비스(%q)의 실행중 컨테이너 중 기대=%q 일치 0개, 실제=%v", e.cfg.AppService, imageRef, got)
+	// 결박됨: 하나라도 다르면 mixed-replica다(rolling 잔재·부분 재생성) — 통과시키면 틀린
+	// 이미지를 실행하는 replica가 트래픽을 받는다.
+	if len(mismatch) > 0 {
+		return fmt.Errorf("dispatch: 실행 이미지가 pinned digest와 불일치 — 대상 서비스(%q)의 실행중 컨테이너 %d개 중 %d개가 기대=%q와 다르다(전부 일치해야 한다 · mixed-replica 차단), 불일치=%v", e.cfg.AppService, len(running), len(mismatch), imageRef, mismatch)
+	}
+	return nil
 }
 
 // osExec는 기본 러너다. argv[0]를 실행 파일로, 나머지를 인자 슬라이스로 넘겨 셸 해석을

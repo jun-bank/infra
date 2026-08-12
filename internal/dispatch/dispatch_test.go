@@ -466,6 +466,51 @@ func TestVerifyImageDigestAppReplicaExitedFails(t *testing.T) {
 	}
 }
 
+// F1: 결박된 서비스 안에서는 all-match다 — 같은 app 서비스의 replica가 [pinned + 틀린 이미지]로
+// 섞여 뜨면(rolling 잔재·부분 재생성) 실패한다. ≥1-match면 그 mixed-replica가 COMPLETED로
+// 위장하고 틀린 이미지를 실행하는 replica가 트래픽을 받는다.
+func TestVerifyImageDigestMixedReplicaFails(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	wrong := "registry.example/core:latest"
+	s := &scriptRunner{psOut: "app1\napp2\n", state: map[string]string{
+		"app1": line("running", ref, "app"),   // 새 버전
+		"app2": line("running", wrong, "app"), // 같은 서비스인데 틀린 이미지
+	}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	err := e.VerifyImageDigest(context.Background(), ref)
+	if err == nil {
+		t.Fatal("같은 서비스에 틀린 이미지 replica가 섞였는데 통과(mixed-replica 위장)")
+	}
+	// 어느 컨테이너가 무엇을 실행 중인지가 오류에 남아야 한다(진단 가능성).
+	if !strings.Contains(err.Error(), "app2") || !strings.Contains(err.Error(), wrong) {
+		t.Fatalf("불일치 목록이 오류에 없다: %v", err)
+	}
+	// 대상 서비스가 전부 pinned면 통과한다(검사가 정상 배포를 막지 않는다).
+	s2 := &scriptRunner{psOut: "app1\napp2\n", state: map[string]string{
+		"app1": line("running", ref, "app"), "app2": line("running", ref, "app"),
+	}}
+	if err := (&Executor{cfg: svcCfg, run: s2.fn()}).VerifyImageDigest(context.Background(), ref); err != nil {
+		t.Fatalf("replica가 전부 pinned인데 실패: %v", err)
+	}
+}
+
+// F3: 결박이 켜졌는데 프로젝트에 컨테이너는 있고 대상 서비스 매치가 0개면 빈 목록을 조용히
+// 돌려주지 않는다 — 같은 상황을 실패로 닫는 VerifyImageDigest ⑶과 같은 축의 오류다.
+func TestGreenContainersNoTargetServiceMatchErrors(t *testing.T) {
+	ref := "registry.example/core@sha256:" + strings.Repeat("a", 64)
+	s := &scriptRunner{psOut: "side1\n", state: map[string]string{
+		"side1": line("running", ref, "metrics-sidecar"),
+	}}
+	e := &Executor{cfg: svcCfg, run: s.fn()}
+	ids, err := e.GreenContainers(context.Background())
+	if err == nil {
+		t.Fatalf("대상 서비스 매치 0개인데 무음 통과: ids=%v (재시작 검사가 빈 대상으로 돈다)", ids)
+	}
+	if !strings.Contains(err.Error(), "app") {
+		t.Fatalf("오류에 대상 서비스명이 없다: %v", err)
+	}
+}
+
 // inspect는 서비스 라벨을 함께 읽는다(결박의 입력) — 포맷이 바뀌면 결박이 조용히 꺼진다.
 func TestInspectStateReadsComposeServiceLabel(t *testing.T) {
 	r := &captureRunner{out: line("running", "img", "app")}

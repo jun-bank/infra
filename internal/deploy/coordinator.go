@@ -230,6 +230,17 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 		dispatchDetail = derr.Error()
 	}
 
+	// 모순 조합 정규화 — **이력 기록 전에** 한다. (COMPLETED, err≠nil)은 "완료했다"와 "실패했다"를
+	// 동시에 주장하는 조합이라 어느 쪽으로도 신뢰할 수 없다. 그대로 두면 이력에는 COMPLETED가
+	// 남고 응답은 실행 실패가 나가, 재전송이 REPORT(이미 완료)로 답하면서 최초 응답과 durable
+	// 상태가 영구히 어긋난다. UNKNOWN으로 접어 락을 유지하고 사람에게 올린다(DO-16 ⑵ 축 —
+	// 모르면 재시도하지 않는다). 정상 조합은 건드리지 않는다: (UNEXECUTED, err)=실행 실패 ·
+	// (COMPLETED, nil)=완료 · (UNKNOWN, ±err)=UNKNOWN.
+	if state == StateCompleted && derr != nil {
+		state = StateUnknown
+		dispatchDetail = "모순 조합(dispatch가 COMPLETED와 오류를 함께 보고) — 완료를 신뢰할 수 없다: " + dispatchDetail
+	}
+
 	// 실행 상태를 이력에 남긴다(DO-16). 이 이력은 재전송 재개 분류(ClassifyReplay)의 유일한
 	// durable 근거다 — 쓰기가 실패하면 COMPLETED/미실행을 durable하게 증명할 수 없으므로,
 	// 완료로 보고해서는 안 된다. UNKNOWN으로 접어 락을 유지하고 사람에게 올린다(fail-closed).
@@ -262,8 +273,9 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	// 불가"(DO-17 ⑷)와 같은 코드가 되어 DO-6 관제가 두 범주를 뭉뚱그린다 — 실행 실패 전용
 	// Outcome으로 사상한다. 인프라 축 fail-closed(모드·락·mode version·fencing)는 위쪽
 	// 분기들이 그대로 FAIL_CLOSED로 닫는다(의미 보존).
-	// UNKNOWN은 위에서 이미 반환됐으므로 여기 도달하는 state는 UNEXECUTED(정리 완료·net-0)
-	// 이거나, 이론적으로 (COMPLETED, err)다 — 후자도 완료로 보고하지 않고 실행 실패로 닫는다.
+	// 여기 도달하는 (state, err≠nil) 조합은 UNEXECUTED 하나뿐이다 — UNKNOWN은 위에서 반환됐고
+	// 모순 조합 (COMPLETED, err)은 그 전에 UNKNOWN으로 정규화됐다(완료 주장과 오류가 함께 온
+	// 결과를 실행 실패로도, 완료로도 기록하지 않는다).
 	if derr != nil {
 		return Result{Outcome: OutcomeExecutionFailed, State: state, Detail: "dispatch 오류: " + derr.Error()}
 	}
