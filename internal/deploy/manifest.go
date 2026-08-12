@@ -59,14 +59,39 @@ func validSHA256Digest(d string) bool {
 	return true
 }
 
-// valid는 대상이 닫힌 배포 집합에 속하는지 본다(DO-20 v0.5 — 정확히 넷).
-func (t Target) valid() bool {
+// Valid는 대상이 닫힌 배포 집합에 속하는지 본다(DO-20 v0.5 — 정확히 넷). 노출하는 것은
+// 이 집합이 배포 밖(게이트 2의 repo↔target allowlist)에서도 필요하고, 거기서 다시 열거하면
+// 정본이 둘이 되기 때문이다 — 대상 집합의 단일 출처는 이 패키지다.
+func (t Target) Valid() bool {
 	switch t {
 	case TargetCore, TargetSettlement, TargetLedger, TargetGateway:
 		return true
 	default:
 		return false
 	}
+}
+
+// ValidTargets는 닫힌 배포 대상 집합을 열거한다(진단 메시지·설정 검증용). 순서는 DO-20
+// v0.5의 열거 순서다.
+func ValidTargets() []Target {
+	return []Target{TargetCore, TargetSettlement, TargetLedger, TargetGateway}
+}
+
+// TargetOf는 서명·인증된 body에서 target 필드 **하나만** 부분 디코드한다. 진입 층의
+// repo↔target 결박 대조(게이트 2가 판정한 허용 target과의 대조)가 멱등 선점 이전에
+// 서야 하는데, 그 자리에서 manifest 완전성까지 검증하면 검증의 정본이 둘이 된다 —
+// 완전성·digest·requestId 일치는 여전히 VerifyManifest가 소유한다(단일 출처).
+//
+// 반환값은 검증되지 않은 원시 target이다(닫힌 집합 여부를 여기서 보지 않는다) —
+// 호출자가 허용 target과 대조하며, 그 대조가 닫힌 집합 밖 값도 함께 걸러낸다.
+func TargetOf(body []byte) (Target, error) {
+	var probe struct {
+		Target Target `json:"target"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return "", ErrManifestMalformed
+	}
+	return probe.Target, nil
 }
 
 // ParseManifest는 서명·인증된 body를 manifest로 디코드하고 대상만 확인한다. 대상은
@@ -77,7 +102,7 @@ func ParseManifest(body []byte) (Manifest, error) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return Manifest{}, ErrManifestMalformed
 	}
-	if !m.Target.valid() {
+	if !m.Target.Valid() {
 		return Manifest{}, ErrManifestTarget
 	}
 	return m, nil
@@ -88,7 +113,7 @@ func ParseManifest(body []byte) (Manifest, error) {
 // ⑷ manifest의 requestId가 서명된 envelope requestId와 일치(DO-10 ⑴ — 서명 밖의 값은
 // 판정에 쓰지 않는다). 어느 하나라도 어긋나면 거절한다 — 통과 없이 실행하지 않는다.
 func VerifyManifest(m Manifest, signedRequestID string) error {
-	if !m.Target.valid() {
+	if !m.Target.Valid() {
 		return ErrManifestTarget
 	}
 	if m.CommitSHA == "" || m.ImageDigest == "" || m.ComposeRevision == "" || m.ConfigVersion == "" || m.RequestID == "" {

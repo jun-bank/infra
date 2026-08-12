@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/jun-bank/infra/internal/deploy"
 )
 
 // fakeTokenVerifier는 서명 검증을 대체한다 — 미리 정한 claim(또는 오류)을 곧바로
@@ -29,17 +31,36 @@ func (f fakeTokenVerifier) VerifyToken(context.Context, string) (Claims, error) 
 	return f.claims, f.err
 }
 
-// basePolicy는 baseClaims와 정확히 맞는 기대값이다.
-func basePolicy() OIDCPolicy {
-	return OIDCPolicy{
-		Issuer:         "https://token.actions.githubusercontent.com",
-		Audience:       "https://deploy.jun-bank.example",
+// mustAllowlist는 테스트 픽스처용 allowlist를 만든다. 여기서의 오류는 테스트 자체가
+// 잘못 쓰인 것(픽스처 프로그래밍 오류)이므로 요란하게 멈춘다.
+func mustAllowlist(entries ...OIDCAllowEntry) OIDCAllowlist {
+	list, err := NewOIDCAllowlist(entries)
+	if err != nil {
+		panic("테스트 allowlist 픽스처가 잘못됐다: " + err.Error())
+	}
+	return list
+}
+
+// baseEntry는 baseClaims의 저장소에 해당하는 allowlist 항목이다(허용 target = core).
+func baseEntry() OIDCAllowEntry {
+	return OIDCAllowEntry{
 		Repository:     "jun-bank/infra",
 		RepositoryID:   "123456",
-		OwnerID:        "654321",
-		RefAllowlist:   []string{"refs/heads/main"},
 		JobWorkflowRef: "jun-bank/infra/.github/workflows/deploy.yml@refs/heads/main",
-		Skew:           DefaultClockSkew,
+		Target:         deploy.TargetCore,
+	}
+}
+
+// basePolicy는 baseClaims와 정확히 맞는 기대값이다. 저장소 세 칸은 allowlist 항목이
+// 소유하고, 나머지 칸(iss·aud·owner_id·ref·skew)만 전역 공통이다(design D2).
+func basePolicy() OIDCPolicy {
+	return OIDCPolicy{
+		Issuer:       "https://token.actions.githubusercontent.com",
+		Audience:     "https://deploy.jun-bank.example",
+		OwnerID:      "654321",
+		RefAllowlist: []string{"refs/heads/main"},
+		Allowlist:    mustAllowlist(baseEntry()),
+		Skew:         DefaultClockSkew,
 	}
 }
 
@@ -84,8 +105,8 @@ func TestClaimMismatchRejected(t *testing.T) {
 		{"iss 불일치", func(c *Claims) { c.Issuer = "https://evil.example" }},
 		{"aud 불일치(플랫폼 기본값)", func(c *Claims) { c.Audience = []string{"https://github.com/jun-bank"} }},
 		{"aud 부재", func(c *Claims) { c.Audience = nil }},
-		{"repository 불일치", func(c *Claims) { c.Repository = "jun-bank/other" }},
-		{"repository_id 불일치(이름 재사용)", func(c *Claims) { c.RepositoryID = "999999" }},
+		{"repository 이름 불일치(개명 감지)", func(c *Claims) { c.Repository = "jun-bank/other" }},
+		{"미등재 repository_id(이름 재사용)", func(c *Claims) { c.RepositoryID = "999999" }},
 		{"repository_owner_id 불일치", func(c *Claims) { c.OwnerID = "111111" }},
 		{"ref 허용목록 밖", func(c *Claims) { c.Ref = "refs/heads/feature-x" }},
 		{"태그 ref 허용목록 밖", func(c *Claims) { c.Ref = "refs/tags/v1.0.0" }},
@@ -233,6 +254,121 @@ func TestValidTokenAcceptedSelfReport(t *testing.T) {
 	}
 	if !dec.SelfReport {
 		t.Error("운영 승인이 자기 신고인데 SelfReport가 false다 (잔여-5 — 이력에 남겨야 한다)")
+	}
+	if dec.AllowedTarget != deploy.TargetCore {
+		t.Errorf("허용 target이 실려 오지 않았다: %q, 기대 = core (결박의 입력 — A2)", dec.AllowedTarget)
+	}
+}
+
+// --- allowlist 매칭(게이트 2 확장 — design D2) --------------------------------
+
+// twoEntryPolicy는 저장소 둘이 등재된 정책이다(core repo → core · gateway repo →
+// gateway). 대상이 넷이 된 뒤의 실제 형태이며, 항목이 하나뿐이면 "엉뚱한 항목의 target을
+// 실어 보내는" 결함을 잡을 수 없다.
+func twoEntryPolicy() OIDCPolicy {
+	p := basePolicy()
+	p.Allowlist = mustAllowlist(baseEntry(), OIDCAllowEntry{
+		Repository:     "jun-bank/gateway",
+		RepositoryID:   "777777",
+		JobWorkflowRef: "jun-bank/gateway/.github/workflows/deploy.yml@refs/heads/main",
+		Target:         deploy.TargetGateway,
+	})
+	return p
+}
+
+// TestAllowlistMatchCarriesEntryTarget은 등재된 저장소가 통과하고 **자기 항목의** target을
+// 실어 오는지 확인한다 — 두 항목 중 두 번째 저장소의 토큰이 첫 항목의 target을 받으면
+// 결박이 뒤바뀐다(gateway 워크플로가 core를 배포하게 된다).
+func TestAllowlistMatchCarriesEntryTarget(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	claims := baseClaims(now)
+	claims.Repository = "jun-bank/gateway"
+	claims.RepositoryID = "777777"
+	claims.JobWorkflowRef = "jun-bank/gateway/.github/workflows/deploy.yml@refs/heads/main"
+
+	v, err := NewOIDCVerifier(fakeTokenVerifier{claims: claims}, twoEntryPolicy(), fixedClock{now: now})
+	if err != nil {
+		t.Fatalf("NewOIDCVerifier 오류: %v", err)
+	}
+	dec := v.Verify(context.Background(), "raw-token")
+	if !dec.Accepted {
+		t.Fatalf("등재된 저장소가 거절됐다: %s", dec.Reason)
+	}
+	if dec.AllowedTarget != deploy.TargetGateway {
+		t.Errorf("허용 target = %q, 기대 = gateway (자기 항목의 target이어야 한다)", dec.AllowedTarget)
+	}
+}
+
+// TestAllowlistRejectionReasons는 저장소 판정의 거절 사유가 넷으로 구분되는지 확인한다.
+// 사유가 뭉개지면 거절 기록만 보고는 오설정(개명 후 allowlist 미갱신)과 침입(탈취 토큰)을
+// 가를 수 없다 — RL-8의 기록은 사후 판단의 유일한 근거다.
+func TestAllowlistRejectionReasons(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name       string
+		mutate     func(*Claims)
+		wantReason string // 사유에 담겨야 할 조각
+	}{
+		{"미등재 저장소", func(c *Claims) { c.RepositoryID = "999999" }, "미등재"},
+		{"ID는 등재·이름 다름(개명)", func(c *Claims) { c.Repository = "jun-bank/renamed" }, "이름 불일치"},
+		{"등재 저장소의 다른 워크플로", func(c *Claims) {
+			c.JobWorkflowRef = "jun-bank/infra/.github/workflows/release.yml@refs/heads/main"
+		}, "job_workflow_ref"},
+		{"등재 저장소의 허용 밖 ref", func(c *Claims) { c.Ref = "refs/heads/hotfix" }, "ref 허용목록"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := baseClaims(now)
+			tc.mutate(&claims)
+			v := newOIDCVerifier(t, claims, now)
+
+			dec := v.Verify(context.Background(), "raw-token")
+			if dec.Accepted {
+				t.Fatalf("%s: 수락됐다 (거절 기대)", tc.name)
+			}
+			if !strings.Contains(dec.Reason, tc.wantReason) {
+				t.Errorf("사유 = %q, %q를 담아야 한다 (사유 4종 구분)", dec.Reason, tc.wantReason)
+			}
+			if dec.AllowedTarget != "" {
+				t.Errorf("거절인데 허용 target이 실렸다: %q (거절에 결박 정보를 실어 보내지 않는다)", dec.AllowedTarget)
+			}
+		})
+	}
+}
+
+// TestAllowlistRepositoryNameCaseInsensitive는 저장소 이름 대조가 ASCII 대소문자를
+// 무시하는지 확인한다 — GitHub 저장소 이름은 대소문자를 보존하되 구분하지 않으므로,
+// 대소문자 차이로 정상 배포가 막히면 안 된다(과잉 거절도 결함이다).
+func TestAllowlistRepositoryNameCaseInsensitive(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	claims := baseClaims(now)
+	claims.Repository = "Jun-Bank/INFRA" // 등재값은 jun-bank/infra
+	v := newOIDCVerifier(t, claims, now)
+
+	dec := v.Verify(context.Background(), "raw-token")
+	if !dec.Accepted {
+		t.Fatalf("대소문자만 다른 저장소 이름이 거절됐다: %s", dec.Reason)
+	}
+	if dec.AllowedTarget != deploy.TargetCore {
+		t.Errorf("허용 target = %q, 기대 = core", dec.AllowedTarget)
+	}
+}
+
+// TestEmptyAllowlistRejectsEverything은 구성자를 거치지 않은 제로값 allowlist로는 어떤
+// 요청도 통과하지 못함을 못박는다 — 정책 로딩이 어떤 이유로든 allowlist를 채우지 못한
+// 채 verifier가 세워지면, 그 문은 열린 문이 아니라 닫힌 문이어야 한다(fail-closed).
+func TestEmptyAllowlistRejectsEverything(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	p := basePolicy()
+	p.Allowlist = OIDCAllowlist{} // 제로값 — 항목 0개
+	v, err := NewOIDCVerifier(fakeTokenVerifier{claims: baseClaims(now)}, p, fixedClock{now: now})
+	if err != nil {
+		t.Fatalf("NewOIDCVerifier 오류: %v", err)
+	}
+
+	dec := v.Verify(context.Background(), "raw-token")
+	if dec.Accepted {
+		t.Fatal("빈 allowlist로 요청이 통과했다 (fail-closed 기대)")
 	}
 }
 

@@ -31,6 +31,11 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	// 배포 대상의 닫힌 집합(deploy.Target)은 deploy 패키지가 정본이다 — allowlist가 그
+	// 집합을 다시 열거하면 정본이 둘이 되어 조용히 갈라진다. deploy는 auth를 import하지
+	// 않으므로(deploy → store 방향뿐) 이 방향에 순환은 없다.
+	"github.com/jun-bank/infra/internal/deploy"
 )
 
 // Claims는 게이트 2가 판정에 쓰는 GitHub Actions OIDC 토큰의 claim들이다. 서명이
@@ -59,15 +64,18 @@ type Claims struct {
 
 // OIDCPolicy는 claim 행렬이 대조하는 기대값들이다. 전부 식별자이며 시크릿은 아니지만
 // 환경마다 다르므로 코드가 아니라 환경에서 온다(OIDC_* — .env.example 참조).
+//
+// 저장소에 관한 세 칸(repository·repository_id·job_workflow_ref)은 전역 기대값이 아니라
+// Allowlist의 항목별 값이다 — 배포 대상이 여럿이 되면서 "우리 저장소 하나"라는 기대가
+// "등재된 저장소들 중 하나"로 바뀌었기 때문이다(design D2). 나머지 칸(iss·aud·owner_id·
+// ref·시간)은 전역 공통 그대로다(A5).
 type OIDCPolicy struct {
-	Issuer         string        // 기대 iss(발급자 하나)
-	Audience       string        // 기대 aud(우리 전용값)
-	Repository     string        // 기대 repository(owner/repo)
-	RepositoryID   string        // 기대 repository_id(수치 ID)
-	OwnerID        string        // 기대 repository_owner_id(수치 ID)
-	RefAllowlist   []string      // 배포 가능 ref 허용목록(기본 = 기본 브랜치)
-	JobWorkflowRef string        // 기대 job_workflow_ref(배포 워크플로 하나)
-	Skew           time.Duration // exp/nbf/iat 판정 허용 시계 편차([구현 검증])
+	Issuer       string        // 기대 iss(발급자 하나)
+	Audience     string        // 기대 aud(우리 전용값)
+	OwnerID      string        // 기대 repository_owner_id(수치 ID — 조직 전역 공통)
+	RefAllowlist []string      // 배포 가능 ref 허용목록(기본 = 기본 브랜치)
+	Allowlist    OIDCAllowlist // 등재 저장소 → 허용 target(A1·A2 — oidc_allowlist.go)
+	Skew         time.Duration // exp/nbf/iat 판정 허용 시계 편차([구현 검증])
 }
 
 // OIDCDecision은 게이트 2의 결과다. 거절 사유(RL-8 기록 의무)와, 통과 시 선점할 jti,
@@ -76,6 +84,11 @@ type OIDCDecision struct {
 	Accepted bool
 	Reason   string // Accepted=false일 때 영속화할 거절 사유(RL-8)
 	JTI      string // 검증된 토큰의 jti — 부작용 전 선점에 쓴다(DO-10 ⑶)
+	// AllowedTarget은 이 신원이 배포할 수 있는 대상 하나다(allowlist 항목의 target).
+	// Accepted=true일 때만 의미가 있으며, 진입 층이 요청 manifest의 target과 대조해
+	// repo↔target 결박을 세운다(A2 · design rev.2 변경 ①). 신원 판정의 산출물이므로
+	// 하류는 이것을 재해석·재파싱하지 않는다.
+	AllowedTarget deploy.Target
 	// SelfReport는 이 요청이 "우리 파이프라인에서 왔다"까지만 기계 증명되고 "운영
 	// 승인됐다"는 자기 신고임을 나타낸다(DO-11 ⑵ / 잔여-5 — environment 결박이
 	// 플랫폼에서 서는지는 [구현 검증]). 판정 전까지 통과 요청은 이 표식을 이력에 남긴다.
@@ -252,82 +265,94 @@ func (v *OIDCVerifier) Verify(ctx context.Context, rawToken string) OIDCDecision
 	if err != nil {
 		return OIDCDecision{Accepted: false, Reason: "OIDC 서명 검증 실패"}
 	}
-	if reason := v.checkClaims(claims, v.clock.Now()); reason != "" {
+	target, reason := v.checkClaims(claims, v.clock.Now())
+	if reason != "" {
 		// jti는 담아 둔다 — 감사 기록이 어떤 토큰이 거절됐는지 알 수 있게(신뢰값 아님).
 		return OIDCDecision{Accepted: false, Reason: reason, JTI: claims.JTI}
 	}
 	// 통과 — "우리 파이프라인에서 왔다"까지 기계 증명. "운영 승인됐다"는 environment
-	// 결박이 플랫폼에서 서는지 판정되기 전까지 자기 신고다(잔여-5 · IV-37).
-	return OIDCDecision{Accepted: true, JTI: claims.JTI, SelfReport: true}
+	// 결박이 플랫폼에서 서는지 판정되기 전까지 자기 신고다(잔여-5 · IV-37). 허용 target을
+	// 함께 실어 보내 진입 층이 요청 대상과 결박하게 한다(A2).
+	return OIDCDecision{Accepted: true, JTI: claims.JTI, SelfReport: true, AllowedTarget: target}
 }
 
 // checkClaims는 DO-11 행렬이다. 각 칸이 하나의 침입 경로를 닫으며, 불일치는 그 칸을
-// 짚는 거절 사유가 된다(""는 통과). 순서는 값 대조(싼 것) → 시간 → jti 선점 필수다.
+// 짚는 거절 사유가 된다(사유 ""가 통과이며, 그때 첫 반환값이 이 신원의 허용 target이다).
+// 순서는 값 대조(싼 것) → 시간 → jti 선점 필수다.
+//
+// 저장소 세 칸은 단일 기대값 대조가 아니라 allowlist 매칭이다(design D2): 수치 ID로
+// 항목을 찾고(A1), 그 항목의 이름·워크플로가 전부 일치해야 통과한다. 거절 사유는 넷을
+// 구분한다 — 미등재 / 이름 불일치(개명·이전 감지) / 워크플로 불일치 / (진입 층이 판정하는)
+// target 불일치. 사유가 뭉개지면 거절 기록만 보고는 오설정과 침입을 가를 수 없다.
 //
 // ★ sub는 검사하지 않는다(DO-11 각주). claims.Subject는 위 칸들의 합성일 뿐이라
 // 대조하면 형식 변화에 조용히 무너진다 — 구성 요소를 각각 본 것으로 판정이 끝난다.
-func (v *OIDCVerifier) checkClaims(c Claims, now time.Time) string {
+func (v *OIDCVerifier) checkClaims(c Claims, now time.Time) (deploy.Target, string) {
 	if c.Issuer != v.policy.Issuer {
-		return "iss 불일치 (다른 발급자)"
+		return "", "iss 불일치 (다른 발급자)"
 	}
 	// aud는 정확히 우리 audience 하나여야 한다 — 포함(contains) 검사면 우리값에 다른
 	// audience가 섞인 다중 aud 토큰도 통과한다. DO-11의 "전용" 문언은 단일값 기대이므로,
 	// 배열이면 원소가 1개이고 그 값이 우리 audience와 같아야 한다(정확 일치).
 	if len(c.Audience) != 1 || c.Audience[0] != v.policy.Audience {
-		return "aud 불일치 (우리 배포 전용 audience 정확히 하나 아님)"
+		return "", "aud 불일치 (우리 배포 전용 audience 정확히 하나 아님)"
 	}
-	if c.Repository != v.policy.Repository {
-		return "repository 불일치"
+	// ★ allowlist의 키는 수치 ID다 — 이름은 이전·삭제 후 재생성으로 재사용되지만 수치
+	// ID는 재사용되지 않는다(A1). 이름은 아래에서 부가 대조한다.
+	entry, listed := v.policy.Allowlist.lookup(c.RepositoryID)
+	if !listed {
+		return "", "미등재 저장소 (repository_id가 allowlist에 없다 — 배포 권한 없음)"
 	}
-	// ★ 이름이 맞아도 수치 ID를 함께 본다 — 이름은 이전·삭제 후 재생성으로 재사용된다.
-	if c.RepositoryID != v.policy.RepositoryID {
-		return "repository_id 불일치 (이름 재사용 방어 — 수치 ID)"
+	// ID는 등재됐는데 이름이 다르다 = 저장소 개명·이전이거나 토큰 위조 시도다. 어느 쪽이든
+	// allowlist가 현실과 어긋난 상태이므로 통과시키지 않고 사유를 구분해 남긴다.
+	if !asciiEqualFold(c.Repository, entry.Repository) {
+		return "", "repository 이름 불일치 (등재 ID의 이름은 " + entry.Repository + " — 개명·이전 감지)"
 	}
 	if c.OwnerID != v.policy.OwnerID {
-		return "repository_owner_id 불일치 (수치 ID)"
+		return "", "repository_owner_id 불일치 (수치 ID)"
 	}
 	// ★ repository_owner(이름)·ref_type을 별도 칸으로 보지 않는 것은 무음 누락이 아니라
 	// 의도된 대체다 — owner는 위 수치 repository_owner_id(이름 재사용에 강함)로, ref_type은
 	// 아래 완전 ref 허용목록(refs/heads/main 등 ref 전체 대조)으로 각각 더 강하게 판정한다
 	// (DO-11 문언의 이름·ref_type 검사보다 강한 검사로 대체).
 	if !contains(v.policy.RefAllowlist, c.Ref) {
-		return "ref 허용목록 밖 (임의 브랜치·태그 배포 금지)"
+		return "", "ref 허용목록 밖 (임의 브랜치·태그 배포 금지)"
 	}
-	if c.JobWorkflowRef != v.policy.JobWorkflowRef {
-		return "job_workflow_ref 불일치 (같은 저장소의 다른 워크플로)"
+	if c.JobWorkflowRef != entry.JobWorkflowRef {
+		return "", "job_workflow_ref 불일치 (같은 저장소의 다른 워크플로)"
 	}
 
 	// 시간 — exp/nbf/iat. 게이트 1의 신선도와 같은 축이며 허용 skew를 함께 본다.
 	// 값이 존재하나 형식이 깨진 시간 claim은 무음 스킵하지 않고 거절한다(absent와 invalid를
 	// 구분: 없으면 아래 필수 여부로, 있는데 형식 오류면 여기서 거절).
 	if c.malformedTime != "" {
-		return "시간 claim 형식 오류 (" + c.malformedTime + " 값이 수치 아님 — 무음 스킵 금지)"
+		return "", "시간 claim 형식 오류 (" + c.malformedTime + " 값이 수치 아님 — 무음 스킵 금지)"
 	}
 	if c.ExpiresAt == 0 || c.IssuedAt == 0 {
-		return "시간 claim 부재 (exp/iat)"
+		return "", "시간 claim 부재 (exp/iat)"
 	}
 	skew := v.policy.Skew
 	exp := time.Unix(c.ExpiresAt, 0)
 	if now.After(exp.Add(skew)) {
-		return "토큰 만료 (exp 경과)"
+		return "", "토큰 만료 (exp 경과)"
 	}
 	iat := time.Unix(c.IssuedAt, 0)
 	if iat.After(now.Add(skew)) {
-		return "iat 미래 (아직 발급되지 않은 토큰)"
+		return "", "iat 미래 (아직 발급되지 않은 토큰)"
 	}
 	if c.NotBefore != 0 {
 		nbf := time.Unix(c.NotBefore, 0)
 		if now.Add(skew).Before(nbf) {
-			return "nbf 미도래 (아직 유효하지 않은 토큰)"
+			return "", "nbf 미도래 (아직 유효하지 않은 토큰)"
 		}
 	}
 
 	// jti는 부작용 전에 선점해야 재전송을 막는다(DO-10 ⑶) — 비어 있으면 선점할 키가
 	// 없으므로 거절한다.
 	if strings.TrimSpace(c.JTI) == "" {
-		return "jti 부재 (일회성 선점 불가 — 재전송 방어)"
+		return "", "jti 부재 (일회성 선점 불가 — 재전송 방어)"
 	}
-	return ""
+	return entry.Target, ""
 }
 
 // contains는 s에 target이 있는지 본다(정확 일치 — 부분·프리픽스 대조가 아니다).
@@ -343,20 +368,25 @@ func contains(s []string, target string) bool {
 // LoadOIDCPolicy는 환경에서 게이트 2 정책을 읽는다. 필수 식별자가 하나라도 없으면
 // 오류를 반환해 게이트를 열지 않는다(fail-closed — claim을 대조할 기대값이 없으면
 // 검증이 성립하지 않는다). skew는 게이트 1과 같은 AGENT_CLOCK_SKEW를 쓴다.
+//
+// 저장소별 allowlist는 loadOIDCAllowlist가 소유한다(파일 모드 · 단일 env 세트 정규화 ·
+// 각각의 기동 거부 가지 — oidc_allowlist.go). 로딩은 기동 시 1회이며 갱신은 재기동이다.
 func LoadOIDCPolicy() (OIDCPolicy, error) {
 	p := OIDCPolicy{
-		Issuer:         os.Getenv("OIDC_ISSUER"),
-		Audience:       os.Getenv("OIDC_AUDIENCE"),
-		Repository:     os.Getenv("OIDC_REPOSITORY"),
-		RepositoryID:   os.Getenv("OIDC_REPOSITORY_ID"),
-		OwnerID:        os.Getenv("OIDC_OWNER_ID"),
-		JobWorkflowRef: os.Getenv("OIDC_JOB_WORKFLOW_REF"),
-		RefAllowlist:   splitAllowlist(os.Getenv("OIDC_REF_ALLOWLIST")),
+		Issuer:       os.Getenv("OIDC_ISSUER"),
+		Audience:     os.Getenv("OIDC_AUDIENCE"),
+		OwnerID:      os.Getenv("OIDC_OWNER_ID"),
+		RefAllowlist: splitAllowlist(os.Getenv("OIDC_REF_ALLOWLIST")),
 	}
-	if p.Issuer == "" || p.Audience == "" || p.Repository == "" || p.RepositoryID == "" ||
-		p.OwnerID == "" || p.JobWorkflowRef == "" || len(p.RefAllowlist) == 0 {
+	if p.Issuer == "" || p.Audience == "" || p.OwnerID == "" || len(p.RefAllowlist) == 0 {
 		return OIDCPolicy{}, ErrOIDCPolicyIncomplete
 	}
+
+	allowlist, err := loadOIDCAllowlist()
+	if err != nil {
+		return OIDCPolicy{}, err
+	}
+	p.Allowlist = allowlist
 
 	// skew는 게이트 1과 단일 출처를 공유한다 — 명시적 0s(엄격)를 존중하고, 미설정이면
 	// 안전한 기본값으로 채운다.
