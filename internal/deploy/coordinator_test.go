@@ -420,6 +420,35 @@ func TestOrchestrate_DispatchError_ExecutionFailed(t *testing.T) {
 	}
 }
 
+// 모순 조합 (COMPLETED, err)은 완료로도 실행 실패로도 기록하지 않고 UNKNOWN으로 접는다.
+// 그대로 두면 이력에는 COMPLETED가 남고 응답은 실패가 나가, 재전송이 REPORT(이미 완료)로
+// 답하면서 최초 응답과 durable 상태가 영구히 어긋난다(모르면 재시도하지 않는다 — DO-16 ⑵).
+func TestOrchestrate_CompletedWithError_NormalizedToUnknown(t *testing.T) {
+	d, l, h := baseDeps()
+	d.Dispatcher = fakeDispatcher{state: StateCompleted, err: errors.New("전환 후 구 slot down 실패")}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome == OutcomeCompleted || res.Outcome == OutcomeExecutionFailed {
+		t.Fatalf("모순 조합(COMPLETED,err): outcome=%v — 완료로도 실행 실패로도 확정해서는 안 된다", res.Outcome)
+	}
+	if res.Outcome != OutcomeUnknown || res.State != StateUnknown {
+		t.Fatalf("모순 조합: outcome=%v state=%v, UNKNOWN 기대", res.Outcome, res.State)
+	}
+	if l.released != 0 {
+		t.Fatalf("UNKNOWN으로 접혔으면 락을 유지해야 한다: released=%d", l.released)
+	}
+	// 이력도 UNKNOWN이어야 재전송이 REPORT(완료)로 새지 않고 에스컬레이션된다.
+	if h.last().EventType != string(OutcomeUnknown) || h.last().Result != string(StateUnknown) {
+		t.Fatalf("모순 조합 이력=%+v, UNKNOWN 기대(재전송이 완료로 답하면 안 된다)", h.last())
+	}
+	if a := ClassifyReplay(h.last()); a != ResumeEscalate {
+		t.Fatalf("모순 조합 재전송 분류=%v, ESCALATE 기대", a)
+	}
+	// 왜 UNKNOWN인지가 남아야 한다 — 모순이라는 사실과 원래 오류 양쪽.
+	if !strings.Contains(res.Detail, "모순") || !strings.Contains(res.Detail, "구 slot down 실패") {
+		t.Fatalf("모순 사유·원인이 Detail에 없다: %q", res.Detail)
+	}
+}
+
 // 회귀(#20): 인프라 축 fail-closed(모드 판정·락 오류·mode version·fencing)는 여전히
 // FAIL_CLOSED다 — 실행 실패 Outcome 신설이 이 의미를 가져가지 않는다.
 func TestOrchestrate_InfraFailClosedStaysFailClosed(t *testing.T) {
