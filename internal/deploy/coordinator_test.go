@@ -390,6 +390,62 @@ func TestOrchestrate_UnknownWithError_KeepsLock(t *testing.T) {
 	}
 }
 
+// dispatch가 (UNEXECUTED, err)를 내면 = 실행 계층이 배포를 수행하다 실패했다(pull 실패·up/헬스
+// 실패 후 green 정리 — CD-4 ② 정상 배포 거절). 저장 접근·검증 불가(FAIL_CLOSED · DO-17 ⑷)와
+// 구별되는 전용 Outcome이어야 DO-6 관제가 두 범주를 가른다(#20). 부작용 net-0이므로 락은 푼다.
+func TestOrchestrate_DispatchError_ExecutionFailed(t *testing.T) {
+	d, l, h := baseDeps()
+	d.Dispatcher = fakeDispatcher{state: StateUnexecuted, err: errors.New("이미지 pull 실패(부작용 0 · CD-4 ②)")}
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: validManifest("req-1")})
+	if res.Outcome == OutcomeFailClosed {
+		t.Fatalf("실행 실패가 FAIL_CLOSED로 접혔다 — 저장 접근 불가(DO-17 ⑷)와 같은 코드로 뭉뚱그려진다(#20)")
+	}
+	if res.Outcome != OutcomeExecutionFailed || res.State != StateUnexecuted {
+		t.Fatalf("dispatch 오류: outcome=%v state=%v, EXECUTION_FAILED·UNEXECUTED 기대", res.Outcome, res.State)
+	}
+	// 사유는 응답에 남는다(정보 손실 금지 — 워크플로 로그의 유일한 단서다).
+	if !strings.Contains(res.Detail, "이미지 pull 실패") {
+		t.Fatalf("실행 실패 사유가 Detail에 없다: %q", res.Detail)
+	}
+	if l.released != 1 {
+		t.Fatalf("실행 실패(net-0)는 락을 해제해야 한다: released=%d", l.released)
+	}
+	// 이력 기록은 그대로다 — STEP_RESULT(UNEXECUTED) + 사유. 재전송 재개 분류(REEXECUTE)의
+	// 근거이므로 Outcome 신설이 이 축을 바꿔서는 안 된다.
+	if h.last().EventType != "STEP_RESULT" || h.last().Result != string(StateUnexecuted) {
+		t.Fatalf("실행 실패가 이력에 남지 않았다: %+v", h.last())
+	}
+	if !strings.Contains(h.last().Detail, "이미지 pull 실패") {
+		t.Fatalf("이력 detail에 실행 실패 사유가 없다: %+v", h.last())
+	}
+}
+
+// 회귀(#20): 인프라 축 fail-closed(모드 판정·락 오류·mode version·fencing)는 여전히
+// FAIL_CLOSED다 — 실행 실패 Outcome 신설이 이 의미를 가져가지 않는다.
+func TestOrchestrate_InfraFailClosedStaysFailClosed(t *testing.T) {
+	t.Run("모드 판정", func(t *testing.T) {
+		d, _, _ := baseDeps()
+		d.Mode = &seqModeReader{resp: []modeResp{{err: errors.New("db 접근 불가")}}}
+		if res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "r", Body: validManifest("r")}); res.Outcome != OutcomeFailClosed {
+			t.Fatalf("모드 판정 실패: outcome=%v, FAIL_CLOSED 유지 기대", res.Outcome)
+		}
+	})
+	t.Run("락 오류", func(t *testing.T) {
+		d, l, _ := baseDeps()
+		l.acquireErr = errors.New("락 테이블 접근 불가")
+		if res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "r", Body: validManifest("r")}); res.Outcome != OutcomeFailClosed {
+			t.Fatalf("락 오류: outcome=%v, FAIL_CLOSED 유지 기대", res.Outcome)
+		}
+	})
+	t.Run("fencing 상실", func(t *testing.T) {
+		d, l, _ := baseDeps()
+		l.renewOK = false
+		if res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "r", Body: validManifest("r")}); res.Outcome != OutcomeFailClosed {
+			t.Fatalf("fencing 상실: outcome=%v, FAIL_CLOSED 유지 기대", res.Outcome)
+		}
+	})
+}
+
 // dispatch 이력 쓰기가 실패하면 COMPLETED를 반환하지 않는다 — 이력은 재개 분류의 유일한
 // durable 근거이므로, durable하게 남기지 못한 완료는 UNKNOWN(락 유지·사람에게)으로 접는다
 // (fail-closed). 근거가 없으니 재전송은 재실행하지 않는다(ClassifyReplay: 이력 없음→REPORT).

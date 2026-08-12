@@ -70,7 +70,15 @@ const (
 	// OutcomeModeChanged는 적용 직전 mode version이 바뀐 것이다(토글-요청 race — DO-17 ⑵).
 	OutcomeModeChanged Outcome = "MODE_CHANGED"
 	// OutcomeFailClosed는 저장 접근·검증 불가로 자동 배포를 시작하지 않은 것이다(DO-17 ⑷).
+	// 이 층의 **인프라 축** 거절이다 — 모드 판정 실패·락 획득 오류·mode version 검증 실패·
+	// dispatch 직전 fencing 재확인 실패가 여기 온다. 전부 "우리가 상태를 읽거나 지킬 수 없어
+	// 시작하지 않았다"이며 실행 계층은 아직 아무 일도 하지 않았다.
 	OutcomeFailClosed Outcome = "FAIL_CLOSED"
+	// OutcomeExecutionFailed는 실행 계층(dispatch)이 배포를 수행하다 실패한 것이다 —
+	// pull 실패(이미지 not found)·up/헬스 실패 후 green 정리 완료 같은 **정상 배포 거절**이며,
+	// CD-4 ②의 "거절·기록·락 해제" 전이 그대로다. FAIL_CLOSED(저장 접근·검증 불가 — DO-17 ⑷)와
+	// 같은 코드로 뭉치면 DO-6 관제가 "인프라가 막았다"와 "배포가 실패했다"를 구별하지 못한다.
+	OutcomeExecutionFailed Outcome = "EXECUTION_FAILED"
 	// OutcomeCompleted는 실행이 완료됐음을(또는 재전송 시 이미 완료됐음을) 뜻한다(DO-16 ⓑ).
 	OutcomeCompleted Outcome = "COMPLETED"
 	// OutcomeUnknown은 실행 상태가 UNKNOWN이라 사람 개입이 필요함을 뜻한다(DO-16 ⓒ · 락 유지).
@@ -249,8 +257,15 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 		}
 		return Result{Outcome: OutcomeUnknown, State: state, Detail: detail}
 	}
+	// dispatch가 오류를 냈다 = 실행 계층이 배포를 수행하다 실패했다(pull 실패·up/헬스 실패 후
+	// green 정리 등 — CD-4 ②의 정상 배포 거절). 여기서 FAIL_CLOSED로 접으면 "저장 접근·검증
+	// 불가"(DO-17 ⑷)와 같은 코드가 되어 DO-6 관제가 두 범주를 뭉뚱그린다 — 실행 실패 전용
+	// Outcome으로 사상한다. 인프라 축 fail-closed(모드·락·mode version·fencing)는 위쪽
+	// 분기들이 그대로 FAIL_CLOSED로 닫는다(의미 보존).
+	// UNKNOWN은 위에서 이미 반환됐으므로 여기 도달하는 state는 UNEXECUTED(정리 완료·net-0)
+	// 이거나, 이론적으로 (COMPLETED, err)다 — 후자도 완료로 보고하지 않고 실행 실패로 닫는다.
 	if derr != nil {
-		return Result{Outcome: OutcomeFailClosed, State: state, Detail: "dispatch 오류: " + derr.Error()}
+		return Result{Outcome: OutcomeExecutionFailed, State: state, Detail: "dispatch 오류: " + derr.Error()}
 	}
 	switch state {
 	case StateCompleted:
