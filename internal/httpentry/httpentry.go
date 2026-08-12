@@ -533,7 +533,14 @@ func writeOutcome(w http.ResponseWriter, res deploy.Result) {
 	case deploy.OutcomeModeChanged:
 		http.Error(w, "적용 직전 모드 토글 — 요청 거절(토글-요청 race)", http.StatusConflict)
 	case deploy.OutcomeFailClosed:
+		// 503 — 인프라 축(저장 접근·락·mode version·fencing)이 막았다. "지금은 받을 수 없다"다.
 		http.Error(w, "fail-closed: "+res.Detail, http.StatusServiceUnavailable)
+	case deploy.OutcomeExecutionFailed:
+		// 502 — 실행 계층(dispatch: pull·up·헬스)이 실패했다. 우리가 위임한 하류(docker·레지스트리·
+		// 배포 대상 프로세스)가 요청을 완수하지 못한 것이므로 Bad Gateway가 의미상 맞고, 503(인프라
+		// fail-closed — 우리가 시작조차 못 했다)과 코드로 갈려야 워크플로 로그·DO-6 관제에서 두
+		// 범주가 구별된다. Detail은 그대로 싣는다(어느 단계가 왜 실패했는지가 유일한 단서다).
+		http.Error(w, "배포 실행 실패: "+res.Detail, http.StatusBadGateway)
 	case deploy.OutcomeCompleted:
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "배포 완료\n")

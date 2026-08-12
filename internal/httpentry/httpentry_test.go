@@ -248,11 +248,29 @@ type devMode struct{}
 
 func (devMode) Current(context.Context, string) (string, uint64, error) { return "dev", 1, nil }
 
-// stateDispatcher는 고정 상태를 내는 실행 지점이다(완료·UNKNOWN 사상 배선 테스트용).
-type stateDispatcher struct{ state deploy.RemoteState }
+// stateDispatcher는 고정 상태(와 선택적 오류)를 내는 실행 지점이다(완료·UNKNOWN·실행 실패
+// 사상 배선 테스트용).
+type stateDispatcher struct {
+	state deploy.RemoteState
+	err   error // 설정 시 그 상태와 함께 오류를 낸다(실행 실패 — pull 실패 등)
+}
 
 func (d stateDispatcher) Dispatch(context.Context, deploy.Manifest, store.FencingToken) (deploy.RemoteState, error) {
-	return d.state, nil
+	return d.state, d.err
+}
+
+// failClosedLock은 락 획득 자체가 오류인 배포 창 락이다(인프라 축 fail-closed 흉내 —
+// 저장 접근 불가). 실행 실패(502)와 인프라 fail-closed(503)가 코드로 갈리는지 본다.
+type failClosedLock struct{}
+
+func (failClosedLock) Acquire(context.Context, store.HolderKind, string, time.Duration) (store.FencingToken, bool, error) {
+	return 0, false, errors.New("배포 창 락 테이블 접근 불가")
+}
+func (failClosedLock) Renew(context.Context, store.HolderKind, string, store.FencingToken, time.Duration) (bool, error) {
+	return false, errors.New("배포 창 락 테이블 접근 불가")
+}
+func (failClosedLock) Release(context.Context, store.HolderKind, string, store.FencingToken) (bool, error) {
+	return false, errors.New("배포 창 락 테이블 접근 불가")
 }
 
 // --- 테스트 하네스 ------------------------------------------------------------
@@ -948,6 +966,49 @@ func TestUnknownStateEscalates(t *testing.T) {
 	h.ServeHTTP(rec2, second)
 	if rec2.Code != http.StatusConflict {
 		t.Fatalf("UNKNOWN 재전송: 코드 = %d, 기대 = 409(재시도 금지·사람 개입)", rec2.Code)
+	}
+}
+
+// --- 실행 실패 vs 인프라 fail-closed 코드 분리(#20) ---------------------------
+
+// 실행 계층 실패(pull 실패 등 — dispatch가 (UNEXECUTED, err))는 502다. 인프라 fail-closed
+// (503 — 저장 접근·검증 불가)와 코드로 갈려야 워크플로 로그·DO-6 관제가 "배포가 실패했다"와
+// "우리가 시작조차 못 했다"를 구별한다. 사유(Detail)는 응답 본문에 그대로 실린다.
+func TestExecutionFailureReturns502(t *testing.T) {
+	disp := stateDispatcher{state: deploy.StateUnexecuted, err: errors.New("이미지 pull 실패(부작용 0 · CD-4 ②)")}
+	deps, hist := testDepsWith(t, acceptingOIDC("jti-execfail", deploy.TargetCore), disp)
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+	iat, exp := freshWindow()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest("core", "req-execfail", iat, exp))
+
+	if rec.Code == http.StatusServiceUnavailable {
+		t.Fatalf("실행 실패가 503(인프라 fail-closed)으로 응답됐다 — 두 범주가 코드로 갈리지 않는다(#20)")
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("실행 실패: 코드 = %d, 기대 = 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "이미지 pull 실패") {
+		t.Fatalf("실행 실패 사유가 응답에 없다: %q", rec.Body.String())
+	}
+	// 이력 기록은 유지된다 — 실행 상태(STEP_RESULT/UNEXECUTED)가 남아야 재전송 재개 분류가 선다.
+	if n := hist.countType("req-execfail", "STEP_RESULT"); n != 1 {
+		t.Fatalf("실행 실패 이력 STEP_RESULT 행 수 = %d, 기대 = 1", n)
+	}
+}
+
+// 회귀(#20): 인프라 축 fail-closed(락 획득 오류 — 저장 접근 불가)는 여전히 503이다.
+func TestInfraFailClosedStillReturns503(t *testing.T) {
+	deps, _ := testDepsWithLock(t, acceptingOIDC("jti-failclosed", deploy.TargetCore), deploy.StubDispatcher{}, failClosedLock{})
+	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
+	iat, exp := freshWindow()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest("core", "req-failclosed", iat, exp))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("인프라 fail-closed: 코드 = %d, 기대 = 503(실행 실패 502와 구별)", rec.Code)
 	}
 }
 
