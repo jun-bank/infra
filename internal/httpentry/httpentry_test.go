@@ -43,21 +43,31 @@ func (fixedClock) Now() time.Time { return testNow }
 // reserves는 호출 횟수다 — 결박 거절이 **선점 이전**임을 증명하려면 "거절됐다"만으로는
 // 부족하고 "원장을 건드리지 않았다"를 직접 봐야 한다(부작용 0).
 type fakeLedger struct {
-	mu       sync.Mutex
-	digest   map[string]string // requestID -> body digest
-	jtis     map[string]bool
-	reserves int
+	mu        sync.Mutex
+	digest    map[string]string // requestID -> body digest
+	jtis      map[string]bool
+	reserves  int // 선점 시도 수
+	reserveOK int // 선점 성공 수(신규 판정 — 멱등의 정의)
 }
 
 func newFakeLedger() *fakeLedger {
 	return &fakeLedger{digest: map[string]string{}, jtis: map[string]bool{}}
 }
 
-// reserveCount는 지금까지의 선점 시도 횟수다.
+// reserveCount는 지금까지의 선점 **시도** 횟수다.
 func (f *fakeLedger) reserveCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.reserves
+}
+
+// reserveSuccessCount는 선점에 **성공**한(= 신규로 판정된) 횟수다. 시도 수와 갈라 두는
+// 이유는 동시성 때문이다: 같은 요청이 겹쳐 들어오면 시도는 여럿이어도 성공은 하나여야
+// 하며, 그 "하나"가 곧 멱등의 정의다(시도 수만 세면 이 불변식이 검증되지 않는다).
+func (f *fakeLedger) reserveSuccessCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reserveOK
 }
 
 // jtiUsed는 jti가 소모(선점)됐는지 본다.
@@ -87,6 +97,7 @@ func (f *fakeLedger) Reserve(_ context.Context, requestID, jti, bodyDigest strin
 	if jti != "" {
 		f.jtis[jti] = true
 	}
+	f.reserveOK++
 	return nil
 }
 
@@ -189,6 +200,20 @@ func (f *fakeHistory) count(requestID string) int {
 	return len(f.events[requestID])
 }
 
+// countType은 requestID의 이력에서 주어진 event_type의 행 수다(예약이 정확히 한 번만
+// 기록됐는지 같은 "정확히 N" 단언용 — 존재 여부만으로는 중복 예약을 잡지 못한다).
+func (f *fakeHistory) countType(requestID, eventType string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, ev := range f.events[requestID] {
+		if ev.EventType == eventType {
+			n++
+		}
+	}
+	return n
+}
+
 // find는 requestID의 이력에서 주어진 event_type의 첫 이벤트를 찾는다(예약 이벤트가 최신이
 // 아닐 수 있으므로 — 오케스트레이션이 뒤에 STEP_RESULT를 덧붙인다).
 func (f *fakeHistory) find(requestID, eventType string) (store.HistoryEvent, bool) {
@@ -255,6 +280,14 @@ func testDepsWithOIDC(t *testing.T, oidc OIDCGate) (Deps, *fakeHistory) {
 // 하기 때문이다.
 func testDepsWith(t *testing.T, oidc OIDCGate, dispatcher deploy.Dispatcher) (Deps, *fakeHistory) {
 	t.Helper()
+	return testDepsWithLock(t, oidc, dispatcher, grantLock{})
+}
+
+// testDepsWithLock은 배포 창 락까지 지정한다. 기본 grantLock은 항상 획득을 허용하므로
+// "실행이 락 안에서 일어나는가"를 볼 수 없다 — 동시성 테스트는 직렬화하는 락을 물려
+// 그 계약을 관측한다(CD-3·BG-4: dispatch는 락 보유 단계다).
+func testDepsWithLock(t *testing.T, oidc OIDCGate, dispatcher deploy.Dispatcher, lock deploy.WindowLock) (Deps, *fakeHistory) {
+	t.Helper()
 	skew := auth.DefaultClockSkew
 	v, err := auth.NewVerifier(auth.Config{Key: testHMACKey, Skew: &skew}, fixedClock{})
 	if err != nil {
@@ -263,7 +296,7 @@ func testDepsWith(t *testing.T, oidc OIDCGate, dispatcher deploy.Dispatcher) (De
 	hist := newFakeHistory()
 	coord := deploy.NewCoordinator(deploy.Deps{
 		Mode:       devMode{},
-		Lock:       grantLock{},
+		Lock:       lock,
 		History:    hist,
 		Dispatcher: dispatcher,
 		HolderID:   "deploy-test",

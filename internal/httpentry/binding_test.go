@@ -128,16 +128,37 @@ func serve(h http.Handler, r *http.Request) *httptest.ResponseRecorder {
 	return rec
 }
 
-// countingDispatcher는 실행 횟수를 세는 실행 지점이다(동시성에서 "실행 ≤1" 확인용).
+// countingDispatcher는 실행 횟수와 **동시 실행 최대치**를 세는 실행 지점이다.
+//
+// maxActive가 필요한 이유: 호출 횟수만 세면 "두 번 실행됐다"와 "두 번 겹쳐 실행됐다"가
+// 구분되지 않는다. 앞의 것은 설계상 허용된다(미실행 상태의 재전송은 재개된다 — 부작용 0
+// 증명 위에 선 #9 계약). 금지된 것은 뒤의 것 — 같은 배포가 동시에 두 번 도는 것이며,
+// 그것을 막는 것은 배포 창 락이다(CD-3·BG-4: dispatch는 락 보유 단계). hold는 그 겹침이
+// 관측 가능하도록 실행이 잠시 머무는 시간이다.
 type countingDispatcher struct {
-	mu    sync.Mutex
-	calls int
-	state deploy.RemoteState
+	mu        sync.Mutex
+	calls     int
+	active    int
+	maxActive int
+	state     deploy.RemoteState
+	hold      time.Duration
 }
 
 func (d *countingDispatcher) Dispatch(context.Context, deploy.Manifest, store.FencingToken) (deploy.RemoteState, error) {
 	d.mu.Lock()
 	d.calls++
+	d.active++
+	if d.active > d.maxActive {
+		d.maxActive = d.active
+	}
+	d.mu.Unlock()
+
+	if d.hold > 0 {
+		time.Sleep(d.hold)
+	}
+
+	d.mu.Lock()
+	d.active--
 	d.mu.Unlock()
 	return d.state, nil
 }
@@ -146,6 +167,44 @@ func (d *countingDispatcher) count() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.calls
+}
+
+// maxConcurrent는 동시에 실행 중이었던 dispatch의 최대 수다.
+func (d *countingDispatcher) maxConcurrent() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.maxActive
+}
+
+// serializingLock은 한 번에 하나만 잡히는 배포 창 락이다(실 락의 상호배제 계약을 흉내낸다).
+// 보유 중 다른 주체의 획득은 실패하며(획득 실패 = 경합 → 409), 해제하면 다시 잡힌다.
+// grantLock(항상 획득)으로는 "실행이 락 밖에서 일어나도" 아무도 눈치채지 못한다.
+type serializingLock struct {
+	mu    sync.Mutex
+	held  bool
+	token store.FencingToken
+}
+
+func (l *serializingLock) Acquire(context.Context, store.HolderKind, string, time.Duration) (store.FencingToken, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.held {
+		return 0, false, nil
+	}
+	l.held = true
+	l.token++
+	return l.token, true, nil
+}
+
+func (l *serializingLock) Renew(context.Context, store.HolderKind, string, store.FencingToken, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (l *serializingLock) Release(context.Context, store.HolderKind, string, store.FencingToken) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.held = false
+	return true, nil
 }
 
 // --- 실 정책 → HTTP (U8·I1) ---------------------------------------------------
@@ -471,40 +530,76 @@ func TestNonTargetManifestErrorReachesOrchestration(t *testing.T) {
 
 // --- 동시성 (I15·I16·I18) -----------------------------------------------------
 
-// TestConcurrentSameRequestID는 동일 requestId 2건이 겹쳐 들어와도 선점이 하나뿐이고
-// 실행이 하나뿐인지 본다(I15). 겹치는 순간 둘 다 신규로 판정되면 같은 배포가 두 번 실행된다.
+// TestConcurrentSameRequestID는 동일 requestId 2건이 겹쳐 들어올 때의 불변식을 본다(I15).
+//
+// ★ 무엇이 불변식이고 무엇이 아닌가(단언을 공허하게 만들지 않으려면 이 구분이 먼저다):
+//
+//	불변식 ⑴ 선점 **성공**은 정확히 1 — 둘 다 신규로 판정되면 멱등이 무너진다.
+//	불변식 ⑵ 예약(RESERVED) 이력도 정확히 1행 — 성공 하나당 한 행이다.
+//	불변식 ⑶ dispatch 호출 수 == 501 응답 수 — 501은 "실행 지점 도달"의 뜻이므로, 실행
+//	         없이 501을 내거나(거짓 보고) 501 없이 실행하는(무음 실행) 쪽 다 걸린다.
+//	불변식 ⑷ 동시 실행 최대 1 — 같은 배포가 **겹쳐** 돌지 않는다(배포 창 락이 세우는 계약).
+//
+//	불변식이 아닌 것: "501이 정확히 1개". 선점에 실패한 쪽은 재전송으로 분류되는데, 그
+//	분류는 그 시점의 이력에 달렸다(ClassifyReplay) — 아직 아무 행도 없으면 상태 반환(200),
+//	RESERVED·UNEXECUTED가 보이면 재개(501)다. 재개는 설계상 허용된 결과이므로(#9 갭 차단 ·
+//	미실행 = 부작용 0 증명) 501 개수를 1로 못박으면 테스트가 타이밍에 따라 깨진다.
+//	그래서 개수 대신 ⑶의 **결합**을 단언한다 — 실행과 보고가 어긋나는 것이 진짜 결함이다.
 func TestConcurrentSameRequestID(t *testing.T) {
-	disp := &countingDispatcher{state: deploy.StateUnexecuted}
-	deps, _ := realGateDeps(t, disp)
+	// hold를 주어 겹침이 관측 가능하게 하고, 직렬화하는 락으로 실행이 락 안에서 일어나는지
+	// 본다(항상 획득하는 grantLock으로는 ⑷가 페이크에 가려 검증되지 않는다).
+	disp := &countingDispatcher{state: deploy.StateUnexecuted, hold: 20 * time.Millisecond}
+	claims := map[string]auth.Claims{coreToken: realClaims(coreRepo, coreRepoID, coreWFRef, "jti-core")}
+	deps, hist := testDepsWithLock(t, realGate(t, twoRepoPolicy(t), claims), disp, &serializingLock{})
 	ledger := ledgerOf(t, deps)
 	h := NewHandler(testConfig(DefaultMaxBodyBytes), deps)
 	iat, exp := freshWindow()
 
+	const concurrent = 2
 	var wg sync.WaitGroup
-	codes := make([]int, 2)
+	codes := make([]int, concurrent)
 	for i := range codes {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			rec := serve(h, withToken(signedRequest("core", "req-concurrent", iat, exp), coreToken))
-			codes[i] = rec.Code
+			codes[i] = serve(h, withToken(signedRequest("core", "req-concurrent", iat, exp), coreToken)).Code
 		}(i)
 	}
 	wg.Wait()
 
-	// 둘 다 게이트·결박을 통과하므로 각각 선점을 시도한다 — 성공은 하나뿐이어야 한다.
-	if disp.count() > 2 {
-		t.Errorf("dispatch 호출 = %d회 (동일 requestId 동시 2건에서 과다 실행)", disp.count())
+	// ⑴ 둘 다 게이트·결박을 통과해 각각 선점을 시도하지만, 신규는 하나뿐이다.
+	if n := ledger.reserveCount(); n != concurrent {
+		t.Errorf("선점 시도 = %d, 기대 = %d (둘 다 원장에 닿는다)", n, concurrent)
 	}
+	if n := ledger.reserveSuccessCount(); n != 1 {
+		t.Fatalf("선점 성공 = %d, 기대 = 1 (동시 2건이 둘 다 신규가 되면 같은 배포가 두 번 열린다)", n)
+	}
+	// ⑵ 예약 이력도 정확히 한 행이다.
+	if n := hist.countType("req-concurrent", "RESERVED"); n != 1 {
+		t.Errorf("RESERVED 이력 = %d행, 기대 = 1", n)
+	}
+
+	// ⑶ 실행 횟수와 "실행 지점 도달(501)" 보고 수가 정확히 맞아야 한다.
+	reached := 0
 	for _, c := range codes {
 		switch c {
-		case http.StatusNotImplemented, http.StatusOK, http.StatusConflict:
+		case http.StatusNotImplemented:
+			reached++
+		case http.StatusOK, http.StatusConflict:
+			// 상태 반환(아직 이력이 없어 완료로 분류) · 락 경합 — 둘 다 허용된 결과다.
 		default:
-			t.Errorf("예상 밖 코드 = %d (501 재개·200 상태 반환·409 중 하나여야 한다)", c)
+			t.Errorf("예상 밖 코드 = %d (501 재개 · 200 상태 반환 · 409 경합 중 하나여야 한다)", c)
 		}
 	}
-	if n := ledger.reserveCount(); n != 2 {
-		t.Errorf("선점 시도 = %d, 기대 = 2 (둘 다 시도하고 하나만 성공한다)", n)
+	if reached < 1 {
+		t.Errorf("501이 하나도 없다 — 선점에 성공한 쪽은 반드시 실행 지점에 닿아야 한다 (codes=%v)", codes)
+	}
+	if disp.count() != reached {
+		t.Errorf("dispatch 호출 = %d회 · 501 응답 = %d건 — 실행과 보고가 어긋난다(무음 실행 또는 거짓 보고)", disp.count(), reached)
+	}
+	// ⑷ 겹쳐 돌지 않는다 — 락이 실행 구간을 감싼다.
+	if n := disp.maxConcurrent(); n != 1 {
+		t.Errorf("동시 실행 최대 = %d, 기대 = 1 (같은 배포가 겹쳐 돌았다 — dispatch가 락 밖에서 실행된다)", n)
 	}
 }
 
