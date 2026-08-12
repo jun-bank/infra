@@ -7,10 +7,16 @@ import (
 	"context"
 	"errors"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	// 계약 횡단 테스트에서만 실 구현을 끌어온다 — 프로덕션 코드의 import 방향은 그대로
+	// 닫혀 있다(deploy는 dispatch를 import하지 않는다 · IA-5).
+	// (별칭: 이 파일에는 dispatch라는 헬퍼 함수가 이미 있다)
+	dispatchpkg "github.com/jun-bank/infra/internal/dispatch"
 	"github.com/jun-bank/infra/internal/store"
 )
 
@@ -524,6 +530,54 @@ func TestDispatchBlueGreenRolledBackCleanupFailUnknown(t *testing.T) {
 	st, err := r.run(t)
 	if st != StateUnknown || err == nil {
 		t.Fatalf("ROLLED_BACK·정리 실패: state=%v, UNKNOWN 기대", st)
+	}
+}
+
+// P1a(계약 횡단): 실제 게이트웨이 클라이언트를 끼워 ⑤ 실패가 상태 코드까지 포함해 옳게
+// 갈리는지 본다 — 페이크 오류로는 "어떤 응답이 보증이 되는가"를 검증할 수 없다. 500만
+// state를 싣는 계약이므로, 502가 ROLLED_BACK 본문을 갖고 와도 정리로 이어지면 안 된다.
+func TestDispatchBlueGreenSwitchFailureThroughRealClient(t *testing.T) {
+	const rolledBack = `{"error":"switch failed","state":"ROLLED_BACK"}`
+	cases := []struct {
+		name      string
+		status    int
+		wantState RemoteState
+		wantDowns int
+	}{
+		{"500 ROLLED_BACK = 미전환 보증", 500, StateUnexecuted, 1},
+		{"502 ROLLED_BACK = 계약 밖 = 보증 없음", 502, StateUnknown, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					_, _ = w.Write([]byte(`{"service":"core","activeSlot":"blue"}`))
+					return
+				}
+				w.WriteHeader(c.status)
+				_, _ = w.Write([]byte(rolledBack))
+			}))
+			defer srv.Close()
+
+			gw, err := dispatchpkg.NewGatewayClient(srv.URL, 2*time.Second)
+			if err != nil {
+				t.Fatalf("게이트웨이 클라이언트 조립 실패: %v", err)
+			}
+			r := newBGRig(SlotBlue)
+			d := r.dispatcher()
+			d.Gateway = gw
+
+			st, derr := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(7))
+			if st != c.wantState || derr == nil {
+				t.Fatalf("%s: state=%v err=%v, %v·err 기대", c.name, st, derr, c.wantState)
+			}
+			if r.green.downs != c.wantDowns {
+				t.Fatalf("%s: green 정리 down=%d, %d 기대(보증 없는 실패에서 내리면 트래픽이 가는 쪽을 끊는다)", c.name, r.green.downs, c.wantDowns)
+			}
+			if r.blue.downs != 0 {
+				t.Fatalf("%s: 구 active(blue) down=%d, 0 기대", c.name, r.blue.downs)
+			}
+		})
 	}
 }
 

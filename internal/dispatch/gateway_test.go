@@ -195,6 +195,49 @@ func TestGatewaySwitchCarriesFailureState(t *testing.T) {
 	}
 }
 
+// P1a: state를 신뢰하는 코드는 500뿐이다 — 계약 밖 상태 코드(202·400·502…)가 ROLLED_BACK
+// body를 갖고 와도 보증으로 승격되면 안 된다. 승격되면 호출자가 그것을 근거로 idle slot을
+// down하고, 라우트가 실제로 옮겨진 뒤였다면 트래픽이 가는 쪽을 끊는다(엣지·프록시 위조).
+func TestGatewaySwitchTrustsStateOnlyFrom500(t *testing.T) {
+	const rolledBackBody = `{"error":"switch failed","state":"ROLLED_BACK"}`
+	cases := []struct {
+		status int
+		want   string
+	}{
+		{http.StatusInternalServerError, SwitchStateRolledBack}, // 계약 안 — 보증 성립
+		{http.StatusAccepted, ""},                               // 계약 밖 — 보증 없음
+		{http.StatusBadRequest, ""},
+		{http.StatusBadGateway, ""}, // 프록시가 만든 응답
+		{http.StatusServiceUnavailable, ""},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(rolledBackBody))
+			}))
+			err := c.Switch(context.Background(), "green", 7)
+			var se *SwitchError
+			if !errors.As(err, &se) {
+				t.Fatalf("HTTP %d: err=%v, *SwitchError 기대", tc.status, err)
+			}
+			if se.SwitchState() != tc.want {
+				t.Fatalf("HTTP %d + ROLLED_BACK 본문: state=%q, %q 기대(계약상 state는 500만 싣는다)", tc.status, se.SwitchState(), tc.want)
+			}
+		})
+	}
+	// 409는 그대로다 — 상태 코드 자체가 미전환 보증이고, stale 갈래가 먼저 가져간다.
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"stale fencing token"}`))
+	}))
+	err := c.Switch(context.Background(), "green", 7)
+	var se *SwitchError
+	if !errors.As(err, &se) || !se.StaleToken() || se.SwitchState() != SwitchStateNotAttempted {
+		t.Fatalf("409: err=%v, stale·NOT_ATTEMPTED 기대(기존 처리 유지)", err)
+	}
+}
+
 // 전송 실패(응답 없음)는 "전환되지 않았다"를 증명하지 못한다 — 보증 없음("")으로 남겨야
 // 호출자가 정리(down)를 하지 않고 사람에게 넘긴다.
 func TestGatewaySwitchTransportFailureHasNoGuarantee(t *testing.T) {
