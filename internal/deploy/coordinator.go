@@ -214,12 +214,28 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 		state = StateUnknown
 	}
 
+	// dispatch 오류 메시지는 UNKNOWN의 유일한 단서다 — "사람 개입 필요"인데 근거가 없으면
+	// 개입할 사람이 처음부터 다시 파야 한다(통합에서 실측 — troubleshooting-false-unknown.md).
+	// 이력 detail과 반환 Detail 양쪽에 싣는다(무음 금지).
+	dispatchDetail := ""
+	if derr != nil {
+		dispatchDetail = derr.Error()
+	}
+
 	// 실행 상태를 이력에 남긴다(DO-16). 이 이력은 재전송 재개 분류(ClassifyReplay)의 유일한
 	// durable 근거다 — 쓰기가 실패하면 COMPLETED/미실행을 durable하게 증명할 수 없으므로,
 	// 완료로 보고해서는 안 된다. UNKNOWN으로 접어 락을 유지하고 사람에게 올린다(fail-closed).
 	// 근거가 남지 않았으니 재전송은 재실행하지 않는다(이력 없음 → REPORT).
-	if herr := c.recordDispatch(ctx, req, m, hold.Token(), state); herr != nil {
+	if herr := c.recordDispatch(ctx, req, m, hold.Token(), state, dispatchDetail); herr != nil {
 		state = StateUnknown
+		// 이력 쓰기 실패로 UNKNOWN이 된 경로 — durable persist는 불가하지만(그 쓰기가 실패했다),
+		// 반환 Detail·로그에는 herr을 실어 "왜 UNKNOWN인가"의 단서를 남긴다(리뷰 P2 — 무음 금지).
+		// derr이 이미 있으면 이어 붙인다(둘 다 원인일 수 있다).
+		if dispatchDetail != "" {
+			dispatchDetail += " · 이력 기록 실패: " + herr.Error()
+		} else {
+			dispatchDetail = "이력 기록 실패: " + herr.Error()
+		}
 	}
 
 	// state==UNKNOWN을 err 유무보다 먼저 판정한다 — dispatch가 (UNKNOWN, err)를 낼 수 있고,
@@ -227,7 +243,11 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	// 불명)은 err가 있어도 오류로 접지 않고 락을 유지한 채 사람에게 올린다(DO-16 ⑵ · CD-4).
 	if state == StateUnknown {
 		releaseLock = false
-		return Result{Outcome: OutcomeUnknown, State: state, Detail: "원격 실행 UNKNOWN — 사람 개입·락 유지"}
+		detail := "원격 실행 UNKNOWN — 사람 개입·락 유지"
+		if dispatchDetail != "" {
+			detail += ": " + dispatchDetail
+		}
+		return Result{Outcome: OutcomeUnknown, State: state, Detail: detail}
 	}
 	if derr != nil {
 		return Result{Outcome: OutcomeFailClosed, State: state, Detail: "dispatch 오류: " + derr.Error()}
@@ -309,7 +329,7 @@ func (c coordinator) reject(ctx context.Context, requestID, target, commit strin
 // recordDispatch는 실행 지점의 상태를 이력에 남긴다(DO-16 3상태 기록). event_type은 상태에
 // 따라 갈라 재전송 분류(ClassifyReplay)가 최신 이력만으로 판정 가능하게 한다. 쓰기 오류를
 // 반환하며(무음 삼킴 금지), 호출자는 그 실패를 COMPLETED로 보고하지 않고 UNKNOWN으로 접는다.
-func (c coordinator) recordDispatch(ctx context.Context, req Request, m Manifest, token store.FencingToken, state RemoteState) error {
+func (c coordinator) recordDispatch(ctx context.Context, req Request, m Manifest, token store.FencingToken, state RemoteState, detail string) error {
 	ev := store.HistoryEvent{
 		RequestID:      req.RequestID,
 		Target:         string(m.Target),
@@ -317,6 +337,7 @@ func (c coordinator) recordDispatch(ctx context.Context, req Request, m Manifest
 		ManifestDigest: m.ImageDigest,
 		Step:           "dispatch",
 		Result:         string(state),
+		Detail:         detail,
 		FencingToken:   token,
 	}
 	switch state {

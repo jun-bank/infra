@@ -450,7 +450,12 @@ func writeOutcome(w http.ResponseWriter, res deploy.Result) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "배포 완료\n")
 	case deploy.OutcomeUnknown:
-		http.Error(w, "원격 실행 UNKNOWN — 사람 개입 필요(락 유지)", http.StatusConflict)
+		// Detail에 dispatch 오류 단서를 실어 보낸다 — 워크플로 로그에서 바로 원인이 보이게(무음 금지).
+		msg := "원격 실행 UNKNOWN — 사람 개입 필요(락 유지)"
+		if res.Detail != "" {
+			msg = res.Detail
+		}
+		http.Error(w, msg, http.StatusConflict)
 	default:
 		http.Error(w, "알 수 없는 오케스트레이션 결과", http.StatusInternalServerError)
 	}

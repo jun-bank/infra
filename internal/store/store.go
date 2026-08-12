@@ -18,6 +18,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -160,6 +161,25 @@ type ModeStore interface {
 	AppendMode(ctx context.Context, target, mode, actor string) error
 }
 
+// detailJSON은 자유 형식 detail 문자열을 JSON 컬럼(deploy_history.detail JSON)에 넣을 수 있는
+// 유효한 JSON 값으로 인코딩한다. 평문을 그대로 바인딩하면 MySQL이 "Invalid JSON text"로 INSERT
+// 전체를 거부해, 하필 UNKNOWN 이력이 통째로 유실되고(durable 근거 소실) 재전송이 재실행될 수
+// 있다(리뷰 P1 · .9 CAST 실측). 문자열을 JSON 문자열 값으로 감싼다 — json.Marshal(string)은
+// 실패하지 않으므로 항상 유효 JSON이며, 만에 하나 실패해도 NULL로 두어 INSERT 자체는 살린다.
+//
+// ⚠️ 비 UTF-8 바이트(실행기 stdout/stderr 원시 바이트가 섞일 수 있다 — 드묾)는 json.Marshal이
+// U+FFFD로 치환한다(오류가 아니라 치환 — INSERT는 여전히 성공). detail은 바이트 정밀 기록이
+// 아니라 사람이 읽는 진단 단서이므로 이 손실은 수용한다(리뷰 P3): INSERT 안전(P1의 핵심)을
+// 지키는 것이 우선이고, docker/compose 출력은 사실상 UTF-8이다. 바이트 무손실이 필요해지면
+// base64 등 가역 표현으로 바꾼다(현재는 불필요 — 오버킬).
+func detailJSON(s string) any {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+
 // HistoryEvent는 배포 이력에 대한 하나의 append다.
 type HistoryEvent struct {
 	RequestID      string
@@ -170,6 +190,7 @@ type HistoryEvent struct {
 	Step           string
 	Result         string // 예: UNEXECUTED / DONE / UNKNOWN (ADR-027 DO-16)
 	RejectReason   string // RL-8: 기록된 거부 사유
+	Detail         string // dispatch 오류 등 진단 단서 — 특히 UNKNOWN은 사람 개입의 근거가 된다(무음 금지)
 	FencingToken   FencingToken
 }
 
@@ -472,7 +493,7 @@ func (s *SQLStore) AppendMode(ctx context.Context, target, mode, actor string) e
 // — 특히 target은 ENUM이라 빈 문자열이 들어가면 삽입이 실패하므로, 빈 값을 NULL로 접는 것이
 // 조용한 실패가 아니라 스키마 계약(NULL 허용)에 맞춘 정합이다.
 func (s *SQLStore) AppendEvent(ctx context.Context, ev HistoryEvent) error {
-	var target, commit, digest, step, result, reason, token any
+	var target, commit, digest, step, result, reason, detail, token any
 	if ev.Target != "" {
 		target = ev.Target
 	}
@@ -491,14 +512,17 @@ func (s *SQLStore) AppendEvent(ctx context.Context, ev HistoryEvent) error {
 	if ev.RejectReason != "" {
 		reason = ev.RejectReason
 	}
+	if ev.Detail != "" {
+		detail = detailJSON(ev.Detail)
+	}
 	if ev.FencingToken != 0 {
 		token = uint64(ev.FencingToken)
 	}
 	_, err := s.db.ExecContext(ctx,
 		"INSERT INTO `deploy_history` "+
-			"(`request_id`, `event_type`, `target`, `commit_sha`, `manifest_digest`, `step`, `result`, `reject_reason`, `fencing_token`) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		ev.RequestID, ev.EventType, target, commit, digest, step, result, reason, token)
+			"(`request_id`, `event_type`, `target`, `commit_sha`, `manifest_digest`, `step`, `result`, `reject_reason`, `detail`, `fencing_token`) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		ev.RequestID, ev.EventType, target, commit, digest, step, result, reason, detail, token)
 	return err
 }
 
