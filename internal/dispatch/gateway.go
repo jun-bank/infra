@@ -196,7 +196,8 @@ func (g *GatewayClient) ActiveSlot(ctx context.Context) (string, error) {
 //
 //	409          → Stale=true(소유권 상실 · 미전환) · errors.Is(err, ErrStaleFencingToken)
 //	500 + state  → State=ROLLED_BACK(미전환 보증) 또는 INDETERMINATE(보증 없음)
-//	그 밖·전송 실패 → State=""(보증 없음)
+//	그 밖·전송 실패 → State=""(보증 없음) — 계약상 state를 싣는 코드는 500뿐이므로
+//	                  다른 코드의 body는 읽지 않는다(위조된 ROLLED_BACK 승격 차단)
 //
 // ⚠️ 전송 실패(타임아웃·연결 끊김)는 "전환되지 않았다"를 증명하지 못한다 — 요청이 닿아
 // 처리됐는데 응답만 유실됐을 수 있다. 그래서 이 클라이언트는 그런 실패에 아무 보증도 싣지
@@ -246,7 +247,15 @@ func (g *GatewayClient) Switch(ctx context.Context, targetSlot string, fencingTo
 			Err:    ErrStaleFencingToken,
 		}
 	default:
-		state := parseSwitchState(body)
+		// state를 신뢰하는 상태 코드는 **정확히 500**뿐이다(계약: 500만 state를 싣는다).
+		// 그 밖의 코드에서 body를 읽으면, 엣지·프록시·오작동이 만든 202·400·502 응답에
+		// ROLLED_BACK이 실려 오는 것만으로 "미전환 보증"으로 승격되고, 호출자는 그 보증을
+		// 근거로 idle slot을 down한다 — 라우트가 실제로 옮겨졌다면 트래픽이 가는 쪽을 끊는다.
+		// 계약 밖 코드는 전부 보증 없음("")으로 접는다(호출자는 정리 없이 UNKNOWN).
+		state := ""
+		if resp.StatusCode == http.StatusInternalServerError {
+			state = parseSwitchState(body)
+		}
 		return &SwitchError{
 			Msg:    fmt.Sprintf("dispatch: 전환 거절 — HTTP %d(200만 성공이다) (slot=%s token=%d · state=%q · 본문=%s)", resp.StatusCode, targetSlot, fencingToken, state, snippet(body)),
 			Status: resp.StatusCode,
