@@ -31,8 +31,11 @@ type goldenVector struct {
 }
 
 // canonical-v1 골든 벡터 3케이스(GET 조회 / POST 전환 / 빈-body 경계). ⚠️ 이 값들은
-// gateway repo의 골든 테스트와 **바이트 동일**해야 한다 — 한쪽을 바꾸면 다른 쪽도 바꿔야
-// 계약이 성립한다(단일 규격 canonical-v1).
+// **설계 design.md rev.2.1(R5)의 canonical-v1 규격값**이며 규격의 단일 출처는 그 문서다.
+// gateway repo의 InternalCanonicalV1GoldenTest와 **바이트 동일**해야 한다 — 두 구현(Go·Kotlin)이
+// 언어 경계로 갈려 있어 진짜 단일 컴파일 단위가 아니므로, 규격 문서 + 양쪽 독립 재현 + 아래
+// 상수 공유로 계약을 닫는다. (Go 바이너리→Kotlin 실행의 완전 자동 교차는 언어 경계라 잔여다 —
+// 대신 InternalAuthGoldenInteropTest가 Go 산출 hex를 Kotlin 필터에 먹여 통과를 실증한다.)
 var goldenVectors = []goldenVector{
 	{
 		name:       "GET status (empty body)",
@@ -109,13 +112,16 @@ func TestCanonicalV1Shape(t *testing.T) {
 	}
 }
 
-// signer는 키 없이 만들어지지 않는다(fail-closed · 무서명 폴백 제거).
+// signer는 키 없이 만들어지지 않는다(fail-closed · 무서명 폴백 제거). C4: 공백뿐인 키도 거부.
 func TestNewInternalSignerRejectsEmptyKey(t *testing.T) {
-	if _, err := NewInternalSigner(nil); err == nil {
-		t.Fatal("nil 키인데 signer가 만들어졌다(fail-closed 위반)")
+	for _, k := range [][]byte{nil, {}, []byte("   "), []byte("\t\n"), []byte(" \t ")} {
+		if _, err := NewInternalSigner(k); err == nil {
+			t.Fatalf("키=%q인데 signer가 만들어졌다(fail-closed 위반 — 공백뿐 키는 키 없음과 동일)", k)
+		}
 	}
-	if _, err := NewInternalSigner([]byte{}); err == nil {
-		t.Fatal("빈 키인데 signer가 만들어졌다(fail-closed 위반)")
+	// 앞뒤 공백이 있어도 실제 내용이 있으면 수락하고 키 바이트는 원문 그대로 유지한다.
+	if _, err := NewInternalSigner([]byte("  k  ")); err != nil {
+		t.Fatalf("내용 있는 키인데 거부: %v", err)
 	}
 }
 

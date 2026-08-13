@@ -171,13 +171,16 @@ func NewGatewayClient(base string, timeout time.Duration, opts ...GatewayOption)
 }
 
 // signInternal은 요청에 canonical-v1 서명·타임스탬프 헤더를 붙인다(signer 미배선이면 no-op).
-// body는 raw 요청 바이트(GET은 nil)다. 서명 대상 path는 게이트웨이가 실제로 받는 경로와
-// 바이트 동일해야 하므로 req.URL.Path(쿼리 제외)를 그대로 쓴다.
+// body는 raw 요청 바이트(GET은 nil)다. 서명 대상 path는 게이트웨이 검증기가 쓰는 값과
+// **계약 일치**해야 한다: 설계 N4는 "path=raw"이고 Kotlin 검증기는 요청 URI의 rawPath(인코드
+// 형태)를 쓴다. 그래서 여기서도 EscapedPath()(전송선상 raw 경로 · 쿼리 제외)를 쓴다 — Path
+// (디코드된 경로)를 쓰면 %인코딩 경로에서 서명이 갈린다(고정 ASCII 경로는 무버그지만 계약
+// 비대칭을 남기지 않는다).
 func (g *GatewayClient) signInternal(req *http.Request, body []byte) {
 	if g.signer == nil {
 		return
 	}
-	sig, ts := g.signer.headersFor(req.Method, req.URL.Path, body, time.Now().Unix())
+	sig, ts := g.signer.headersFor(req.Method, req.URL.EscapedPath(), body, time.Now().Unix())
 	req.Header.Set(HeaderInternalSignature, sig)
 	req.Header.Set(HeaderInternalTimestamp, ts)
 }

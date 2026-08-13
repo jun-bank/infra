@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -52,9 +53,11 @@ type InternalSigner struct {
 	key []byte
 }
 
-// NewInternalSigner는 raw 키 바이트로 signer를 만든다. 키가 비면 오류다(fail-closed).
+// NewInternalSigner는 raw 키 바이트로 signer를 만든다. 키가 비었거나 공백뿐이면 오류다
+// (fail-closed · C4 — 길이만 보면 "   " 공백 키가 유효로 샌다). 키 바이트 자체는 변형하지
+// 않고(원문 유지) 판정만 한다.
 func NewInternalSigner(key []byte) (*InternalSigner, error) {
-	if len(key) == 0 {
+	if len(bytes.TrimSpace(key)) == 0 {
 		return nil, ErrNoInternalKey
 	}
 	k := make([]byte, len(key))
