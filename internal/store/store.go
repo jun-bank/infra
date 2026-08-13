@@ -434,6 +434,32 @@ func (s *SQLStore) Read(ctx context.Context) (LockState, error) {
 	return ls, nil
 }
 
+// FencingLeaseHeld는 락 행이 **DB 시각 기준**으로 (holderID+token)에게 여전히 살아
+// 있는지 한 문장으로 판정한다(infra#37 조각 B · G-4 — 위성 fence-confirm의 근거). 새
+// 프로시저 없이 grant된 SELECT만 쓰며, 만료 비교를 **DB의 NOW(6)로** 한다 — Go 프로세스
+// 시계로 lease_expires_at을 비교하면 main↔DB 시계 편차만큼 만료된 lease를 유효로 오인해,
+// 락을 잃은 위성이 mutation을 계속하는 창이 열린다. EXISTS는 0/1만 내므로(NULL 없음)
+// 판정이 삼값으로 새지 않는다.
+//
+//	holder_kind='AGENT' AND holder_id=? AND fencing_token=? AND lease_expires_at >= NOW(6)
+//
+// held=true는 "같은 token·같은 main holder·DB시각 기준 살아있는 lease"를 뜻한다 —
+// 만료시각의 동일성이 아니라 **지금 살아있는가**다. 행부재·holder 불일치·token 불일치·
+// lease 만료·NULL lease는 전부 held=false다(확인 실패 = fence deny). 연결·권한 오류만
+// err로 올린다 — 호출자(fence 핸들러)는 err도 held=false와 같이 fail-closed로 접는다.
+func (s *SQLStore) FencingLeaseHeld(ctx context.Context, holderID string, token FencingToken) (bool, error) {
+	var held bool
+	err := s.db.QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM `deploy_window_lock` "+
+			"WHERE `lock_id` = 1 AND `holder_kind` = 'AGENT' AND `holder_id` = ? "+
+			"AND `fencing_token` = ? AND `lease_expires_at` >= NOW(6))",
+		holderID, uint64(token)).Scan(&held)
+	if err != nil {
+		return false, err
+	}
+	return held, nil
+}
+
 // Reserve는 append-only 원장에 예약 행 하나를 INSERT한다(DO-10 ⑶). grant는 이
 // 테이블에 SELECT+INSERT만 주므로(03_grants — UPDATE/DELETE 없음) 재생 방어를 writer가
 // 되돌릴 수 없다. jti가 비면 NULL로 넣는다 — UNIQUE 제약은 NULL을 충돌로 보지 않으므로

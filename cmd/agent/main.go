@@ -52,6 +52,27 @@ import (
 // lease 6분이 4분+slack을 덮고, 4분은 위성 기본 exec budget(≈220s)을 넉넉히 감싼다.
 const defaultRPCTimeout = 4 * time.Minute
 
+// defaultFenceTimeout은 위성→main fence-confirm 한 번의 상한이다(infra#37 조각 B · G-6 ·
+// AGENT_FENCE_TIMEOUT으로 덮어쓴다). 각 mutation 직전 이 시간 안에 확인이 왕복해야 하며,
+// 부모 up/down 단계 예산(phaseBudget·CleanupTimeout)보다 짧아야 한다(runAgent가 강제). ⚠️
+// [구현 검증]: main↔위성 왕복 실측으로 정한다 — 짧으면 정상 확인이 spurious deny되고, 길면
+// 단계 예산을 잠식한다.
+const defaultFenceTimeout = 15 * time.Second
+
+// fenceMutationRoundTrips는 위성 단일 경로 배포에서 fence가 gate하는 mutation 수다(G-6 최악
+// 직렬 fence 대기): compose up 하나와 실패 시 cleanup down 하나 — 둘이 직렬 최악이다. 위성
+// exec budget에 이 수 × fenceTimeout을 더해, 확인 대기가 배포를 예산 밖으로 밀어내지 않게 한다.
+const fenceMutationRoundTrips = 2
+
+// defaultFenceSkew는 main fence 리스너가 받는 요청의 신선도 허용 창이다(AGENT_FENCE_SKEW로
+// 덮어쓴다 · defaultRPCSkew와 같은 축). 가로챈 유효 fence 요청의 락 만료 후 재생을 완화한다.
+const defaultFenceSkew = 60 * time.Second
+
+// defaultFenceListenAddr는 main의 **별도** fence-confirm LAN 리스너 기본 주소다(G-5 · CI
+// /deploy와 분리 · AGENT_FENCE_LISTEN_ADDR로 덮어쓴다). loopback 기본은 통합/로컬용이며 실
+// 배선(#36)은 .9 LAN literal을 준다. private-literal만 허용된다(ValidateListenAddr).
+const defaultFenceListenAddr = "127.0.0.1:9443"
+
 // defaultRPCSkew는 위성이 받는 RPC timestamp 신선도 허용 창이다(C4 · AGENT_RPC_SKEW로 덮어쓴다).
 // ⚠️ [구현 검증]: main↔위성 시계 편차 실측으로 정한다 — 짧으면 정상 요청이 편차로 거절되고,
 // 길면 가로챈 유효 요청의 재생 창이 넓어진다(게이트1 DefaultClockSkew와 같은 축).
@@ -208,7 +229,7 @@ func runMain() error {
 		return fmt.Errorf("설정 로딩 실패: %w", err)
 	}
 
-	deps, err := buildDeps()
+	deps, st, err := buildDeps()
 	if err != nil {
 		return fmt.Errorf("게이트 1·store 조립 실패: %w", err)
 	}
@@ -217,6 +238,15 @@ func runMain() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           httpentry.NewHandler(cfg, deps),
 		ReadHeaderTimeout: 10 * time.Second, // slowloris 완화 — timeout 값은 [구현 검증](DO-15 ⑷)
+	}
+
+	// infra#37 조각 B — 위성 fence-confirm 수신 리스너(G-5). CI /deploy(cfg.ListenAddr)에 합치지
+	// 않고 **별도 private-literal LAN 리스너**에 붙인다. 설정되면 이 리스너가 위성의 mutation
+	// 직전 fence 확인을 받아 자기 store로 lease를 판정·서명한다. 미설정이면 fencing 없이 CI
+	// 수신만 뜬다(원격 위성 없는 dev — 그때 위성 배포 자체가 라우터에서 fail-closed된다).
+	fenceSrv, fenceLn, err := buildFenceListener(st)
+	if err != nil {
+		return fmt.Errorf("fence 리스너 조립: %w", err)
 	}
 
 	// SIGINT/SIGTERM에 우아하게 종료한다.
@@ -232,6 +262,16 @@ func runMain() error {
 		}
 		errCh <- nil
 	}()
+	if fenceSrv != nil {
+		go func() {
+			fmt.Println("jun-bank deploy-agent · fence-confirm listen:", fenceLn.Addr())
+			if err := fenceSrv.Serve(fenceLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+				return
+			}
+			errCh <- nil
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -239,8 +279,99 @@ func runMain() error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if fenceSrv != nil {
+			_ = fenceSrv.Shutdown(shutdownCtx)
+		}
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+// buildFenceListener는 main의 별도 fence-confirm LAN 리스너를 조립한다(infra#37 조각 B · G-5).
+// AGENT_FENCE_LISTEN_ADDR가 없으면 (nil, nil, nil)을 내 fencing 없이 기동한다(원격 위성 없는
+// dev). 설정되면:
+//   - 리스너 주소는 private-literal LAN만 허용하고(ValidateListenAddr), bind 후 실제 주소를
+//     한 번 더 검증한다(공개 bind 누수 방지 · CI 수신과 분리).
+//   - 위성별 키는 AGENT_RPC_KEY_SETTLEMENT/LEDGER에서 온다(main이 위성에 명령할 때 쓰는 키와
+//     같음 — 신뢰 경계 재사용). 최소 하나 필수(fail-closed).
+//   - holderID는 buildCoordinator와 같은 os.Hostname()이다 — 위성은 token만 보내고 main은 자기
+//     holderID로 "이 lock이 여전히 내 것인가"를 판정한다(G-4).
+//   - 출발지 제한(.158/.164)은 AGENT_FENCE_SOURCE_ALLOW(콤마 구분 IP)로 선택 설정한다(G-5 ·
+//     방화벽이 1차 방어 · "가능 범위"). 미설정이면 경고만 남기고 키·서명·신선도로 방어한다.
+func buildFenceListener(st *store.SQLStore) (*http.Server, net.Listener, error) {
+	rawAddr := strings.TrimSpace(os.Getenv("AGENT_FENCE_LISTEN_ADDR"))
+	// 리스너 주소가 없고 위성 키도 하나도 없으면 fencing 미배선(dev) — 조용히 건너뛴다.
+	settleKey := os.Getenv("AGENT_RPC_KEY_SETTLEMENT")
+	ledgerKey := os.Getenv("AGENT_RPC_KEY_LEDGER")
+	if rawAddr == "" && strings.TrimSpace(settleKey) == "" && strings.TrimSpace(ledgerKey) == "" {
+		fmt.Println("경고: AGENT_FENCE_LISTEN_ADDR·위성 키 미설정 — fence-confirm 리스너 미기동(원격 위성 배포는 라우터에서 fail-closed). 원격 위성을 쓰면 조각 B fence 리스너를 배선한다")
+		return nil, nil, nil
+	}
+	if rawAddr == "" {
+		rawAddr = defaultFenceListenAddr
+	}
+	addr, err := agentrpc.ValidateListenAddr(rawAddr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	keys := map[deploy.Target][]byte{}
+	if strings.TrimSpace(settleKey) != "" {
+		keys[deploy.TargetSettlement] = []byte(settleKey)
+	}
+	if strings.TrimSpace(ledgerKey) != "" {
+		keys[deploy.TargetLedger] = []byte(ledgerKey)
+	}
+	if len(keys) == 0 {
+		return nil, nil, errors.New("AGENT_FENCE_LISTEN_ADDR이 설정되면 AGENT_RPC_KEY_SETTLEMENT·AGENT_RPC_KEY_LEDGER 중 최소 하나가 필요하다(위성 서명 검증 키 · fail-closed)")
+	}
+
+	holderID, err := os.Hostname()
+	if err != nil || holderID == "" {
+		return nil, nil, errors.New("fence holderID 확정 불가(hostname) — buildCoordinator와 같은 값이어야 한다")
+	}
+
+	skew, err := envDuration("AGENT_FENCE_SKEW", defaultFenceSkew)
+	if err != nil {
+		return nil, nil, err
+	}
+	if skew <= 0 {
+		return nil, nil, fmt.Errorf("AGENT_FENCE_SKEW은 >0 이어야 한다(신선도 창 · fail-closed): %s", skew)
+	}
+
+	var allowed map[string]bool
+	if raw := strings.TrimSpace(os.Getenv("AGENT_FENCE_SOURCE_ALLOW")); raw != "" {
+		allowed = map[string]bool{}
+		for _, ip := range strings.Split(raw, ",") {
+			if ip = strings.TrimSpace(ip); ip != "" {
+				allowed[ip] = true
+			}
+		}
+	} else {
+		fmt.Println("경고: AGENT_FENCE_SOURCE_ALLOW 미설정 — fence 출발지 IP 제한 없음(방화벽이 1차 방어). 위성 IP(.158/.164)를 두면 애플리케이션 계층 2차 방어가 켜진다(G-5)")
+	}
+
+	handler, err := agentrpc.NewFenceHandler(agentrpc.FenceHandlerConfig{
+		Keys: keys, Lease: st, HolderID: holderID, Skew: skew, AllowedSources: allowed,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fence 리스너 LAN bind 실패(%s): %w", addr, err)
+	}
+	// bind 후 실제 주소가 LAN literal private인지 한 번 더 확인한다(G-5 · 공개 bind 누수 방지).
+	if _, verr := agentrpc.ValidateListenAddr(ln.Addr().String()); verr != nil {
+		_ = ln.Close()
+		return nil, nil, fmt.Errorf("fence 리스너 실제 주소가 LAN literal이 아니다(%s): %w", ln.Addr(), verr)
+	}
+	fenceSrv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       agentReadTimeout,
+	}
+	return fenceSrv, ln, nil
 }
 
 // buildDeps는 진입 층이 판정을 위임할 협력자들을 환경에서 조립한다: 게이트 1
@@ -248,14 +379,14 @@ func runMain() error {
 // 오류를 반환해 기동을 막는다(fail-closed — 검증 못 하거나 원장에 쓸 수 없는 채로
 // 배포 수신을 열지 않는다, DO-17 ⑷). DB 핸들은 지연 연결이며(sql.Open은 접속하지
 // 않는다) 실제 접속 실패는 요청 시점에 fail-closed로 드러난다.
-func buildDeps() (httpentry.Deps, error) {
+func buildDeps() (httpentry.Deps, *store.SQLStore, error) {
 	authCfg, err := auth.LoadConfig()
 	if err != nil {
-		return httpentry.Deps{}, fmt.Errorf("게이트 1 설정: %w", err)
+		return httpentry.Deps{}, nil, fmt.Errorf("게이트 1 설정: %w", err)
 	}
 	verifier, err := auth.NewVerifier(authCfg, nil) // 기본 벽시계
 	if err != nil {
-		return httpentry.Deps{}, fmt.Errorf("게이트 1 verifier: %w", err)
+		return httpentry.Deps{}, nil, fmt.Errorf("게이트 1 verifier: %w", err)
 	}
 
 	// 게이트 2(OIDC claim 행렬 — DO-11). 정책(기대 claim 값)은 환경에서 오고, 서명
@@ -264,19 +395,19 @@ func buildDeps() (httpentry.Deps, error) {
 	// LoadOIDCPolicy가 이미 필수로 강제한다(미설정이면 여기서 오류로 기동 거부).
 	oidcPolicy, err := auth.LoadOIDCPolicy()
 	if err != nil {
-		return httpentry.Deps{}, fmt.Errorf("게이트 2 정책: %w", err)
+		return httpentry.Deps{}, nil, fmt.Errorf("게이트 2 정책: %w", err)
 	}
 	jwksTTL, err := envDuration("OIDC_JWKS_CACHE_TTL", defaultJWKSCacheTTL)
 	if err != nil {
-		return httpentry.Deps{}, err
+		return httpentry.Deps{}, nil, err
 	}
 	keySet, err := auth.NewHTTPKeySet(oidcPolicy.Issuer, jwksTTL)
 	if err != nil {
-		return httpentry.Deps{}, fmt.Errorf("게이트 2 JWKS 페치기(https·TTL 검증 — fail-closed): %w", err)
+		return httpentry.Deps{}, nil, fmt.Errorf("게이트 2 JWKS 페치기(https·TTL 검증 — fail-closed): %w", err)
 	}
 	oidcGate, err := auth.NewOIDCVerifier(auth.NewJWKSTokenVerifier(keySet), oidcPolicy, nil)
 	if err != nil {
-		return httpentry.Deps{}, fmt.Errorf("게이트 2 verifier: %w", err)
+		return httpentry.Deps{}, nil, fmt.Errorf("게이트 2 verifier: %w", err)
 	}
 	// 적재된 항목 수를 기동 로그에 남긴다 — .9 이관(파일 배치 + 단일 env 제거) 뒤 재기동이
 	// 실제로 새 allowlist를 읽었는지, 몇 저장소가 등재됐는지가 로그 한 줄로 보여야 한다.
@@ -285,20 +416,22 @@ func buildDeps() (httpentry.Deps, error) {
 
 	dsn := os.Getenv("DEPLOY_DB_DSN")
 	if dsn == "" {
-		return httpentry.Deps{}, errors.New("DEPLOY_DB_DSN 미설정 (배포 스키마 접속은 .env에서 온다)")
+		return httpentry.Deps{}, nil, errors.New("DEPLOY_DB_DSN 미설정 (배포 스키마 접속은 .env에서 온다)")
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return httpentry.Deps{}, fmt.Errorf("배포 DB 열기: %w", err)
+		return httpentry.Deps{}, nil, fmt.Errorf("배포 DB 열기: %w", err)
 	}
 	st := store.New(db)
 
 	coord, err := buildCoordinator(st)
 	if err != nil {
-		return httpentry.Deps{}, fmt.Errorf("오케스트레이터 조립: %w", err)
+		return httpentry.Deps{}, nil, fmt.Errorf("오케스트레이터 조립: %w", err)
 	}
 
-	return httpentry.Deps{Verifier: verifier, OIDC: oidcGate, Ledger: st, History: st, Deploy: coord}, nil
+	// st를 함께 반환한다 — runMain이 fence 리스너(G-5)의 DB시각 lease 판정기(FencingLeaseHeld)로
+	// 같은 store를 쓴다. httpentry.Deps의 Ledger/History는 인터페이스라 그 판정 메서드가 없다.
+	return httpentry.Deps{Verifier: verifier, OIDC: oidcGate, Ledger: st, History: st, Deploy: coord}, st, nil
 }
 
 // buildCoordinator는 상태 있는 오케스트레이션 층을 조립한다(IA-4 ⑵). 모드·락·이력은
@@ -417,6 +550,20 @@ func buildRoutingDispatcher(local deploy.Dispatcher) (disp deploy.Dispatcher, re
 // CD-3 하한식의 원격 축). coordinator는 락 보유 중 RemoteDispatcher.Dispatch에서 최대 RPC_TIMEOUT
 // 까지 블로킹하므로 lease ≥ RPC_TIMEOUT + slack이어야 반환 전 락 만료가 없다. 미달이면 오류(boot
 // fail-closed). ⚠️ 이 보증은 slack이 락 획득~Dispatch 진입 오버헤드를 덮는다는 전제 위에 선다.
+//
+// ⚠️ 조각 B(fence) 하한 계약 — G-6:
+//   - 위성은 각 mutation(up·down) 직전 main에 fence 확인을 왕복하는데, 그 왕복은 전부 위성이
+//     main의 /agent/deploy 응답을 만드는 **RPC_TIMEOUT 창 안**에서 일어난다(coordinator가 그
+//     창 동안 Dispatch에 블로킹하며 락을 쥔다). 그래서 fence 왕복은 RPC_TIMEOUT에 이미 포함돼
+//     있고, lease ≥ RPC_TIMEOUT + slack이 위성 mutation+fence 총예산을 전이적으로 덮는다 —
+//     단, RPC_TIMEOUT이 위성 exec budget(pull+up+헬스+cleanup+fence 왕복)을 감싸도록 sizing된
+//     전제 위에서다(defaultRPCTimeout 4분이 위성 기본 exec budget ≈220s + fence 왕복을 감싼다).
+//     위성 exec budget은 위성 자기 설정이라 main이 정확히 알 수 없으므로, 이 커버리지는
+//     [구현 검증]이며 강제되는 불변식은 lease ≥ RPC_TIMEOUT + slack이다.
+//   - fsync는 상한을 둘 수 없다(디스크가 임의로 느릴 수 있다). 그래서 계약을 정직하게 하향한다:
+//     위성 응답이 RPC_TIMEOUT을 넘으면 main은 dial-후 timeout으로 **UNKNOWN**을 받아 락을
+//     유지하고(사람 개입), 그 뒤 위성의 늦은 mutation은 lease 만료 후엔 fence 확인이 STALE을
+//     내어 sticky guard가 막는다 — "늦은 응답 = main timeout UNKNOWN · 이후 mutation 없음".
 func leaseCoversRemote(lease, rpcTimeout time.Duration) error {
 	if rpcTimeout <= 0 || rpcTimeout > maxDispatchDuration {
 		return fmt.Errorf("AGENT_RPC_TIMEOUT은 (0, %s] 범위여야 한다(fail-closed · overflow 방지): %s", maxDispatchDuration, rpcTimeout)
@@ -844,18 +991,51 @@ func runAgent() error {
 		return fmt.Errorf("AGENT_RPC_SKEW은 >0 이어야 한다(신선도 창 · fail-closed): %s", skew)
 	}
 
+	// infra#37 조각 B — 위성 fencing guard. main으로의 역방향 fence-confirm 클라이언트를 만들고
+	// 로컬 실행기를 guard로 감싼다(G-2·G-3 · B1·B3). 위성은 각 compose up/down 직전에 main에
+	// lease 소유(token·holder·DB시각)를 재확인해, stale이면 변이를 멈추고 UNKNOWN으로 접는다.
+	// fence URL이 없으면 기동 거부(fail-closed — 확인 경로 없이 원격 mutation을 실행하지 않는다).
+	fenceURL := strings.TrimSpace(os.Getenv("AGENT_FENCE_CONFIRM_URL"))
+	if fenceURL == "" {
+		return errors.New("AGENT_FENCE_CONFIRM_URL 미설정 — 위성은 각 mutation 직전 main에 fence 확인을 해야 한다(조각 B · B1). 확인 경로 없이 원격 배포를 실행하지 않는다(fail-closed). main의 별도 fence 리스너 주소(예: http://10.0.0.9:9443)를 준다")
+	}
+	fenceTimeout, err := envDuration("AGENT_FENCE_TIMEOUT", defaultFenceTimeout)
+	if err != nil {
+		return err
+	}
+	// G-6 — fence RPC는 부모 up/down deadline 잔여 안에 들어야 한다: phaseBudget(up)·CleanupTimeout
+	// (down)보다 짧게 강제해, 한 번의 확인이 그 단계 예산을 통째로 먹지 않게 한다(fail-closed).
+	if fenceTimeout <= 0 || fenceTimeout >= b.phaseBudget || fenceTimeout >= deploy.CleanupTimeout {
+		return fmt.Errorf("AGENT_FENCE_TIMEOUT은 (0, min(phaseBudget=%s, cleanup=%s)) 범위여야 한다(fence RPC가 부모 단계 예산 안에 들도록 · G-6 · fail-closed): %s", b.phaseBudget, deploy.CleanupTimeout, fenceTimeout)
+	}
+	fenceClient, err := agentrpc.NewFenceClient(fenceURL, []byte(key), fenceTimeout)
+	if err != nil {
+		return fmt.Errorf("위성 fence-confirm 클라이언트 조립: %w", err)
+	}
+	// 로컬 dispatcher의 실행기를 전부 guard로 감싼다(G-3 동적 binder decoration 포함 — Exec·SlotExec·
+	// Compose.Bind 반환·bindActive). 위성은 단일 경로 LocalDispatcher이므로 concrete로 꺼내 decorate
+	// 한다 — **위성 조립에만** 적용하고 main 로컬 dispatch는 이 경로를 거치지 않는다(G-3).
+	local, ok := b.disp.(deploy.LocalDispatcher)
+	if !ok {
+		return fmt.Errorf("위성 로컬 dispatcher가 LocalDispatcher가 아니다(fencing decoration 불가 · fail-closed): %T", b.disp)
+	}
+	guarded := agentrpc.GuardLocalDispatcher(local)
+
 	// background 실행 상한(R7) — 요청 ctx와 분리된 dispatch가 한 배포를 넉넉히 덮게 한다:
-	// pull+up(phaseBudget) + 헬스(D) + 실패 시 cleanup + slack. lease가 아니라 이 예산이 위성
-	// 실행을 감싼다(위성엔 배포 창 락이 없다 — 그건 main coordinator 소유).
-	execBudget := b.phaseBudget + b.healthDeadline + deploy.CleanupTimeout + dispatchLeaseSlack
+	// pull+up(phaseBudget) + 헬스(D) + 실패 시 cleanup + slack에, 각 mutation 직전 fence 왕복
+	// 대기(G-6 최악 직렬 fence 대기)를 더한다 — 단일 경로의 gated mutation은 up + cleanup down
+	// 둘이므로 fenceMutationRoundTrips(2) × fenceTimeout을 예산에 포함한다. lease가 아니라 이
+	// 예산이 위성 실행을 감싼다(위성엔 배포 창 락이 없다 — 그건 main coordinator 소유).
+	execBudget := b.phaseBudget + b.healthDeadline + deploy.CleanupTimeout + dispatchLeaseSlack + fenceMutationRoundTrips*fenceTimeout
 
 	srvObj, err := agentrpc.NewServer(agentrpc.ServerConfig{
 		Target:     deploy.Target(target),
 		Key:        []byte(key),
-		Dispatcher: b.disp,
+		Dispatcher: guarded,
 		Ledger:     ledger,
 		ExecBudget: execBudget,
 		Skew:       skew,
+		Fence:      fenceClient,
 	})
 	if err != nil {
 		return fmt.Errorf("위성 RPC 서버 조립: %w", err)

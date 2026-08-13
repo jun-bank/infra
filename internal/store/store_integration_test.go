@@ -413,6 +413,55 @@ func TestLockRawDMLDenied(t *testing.T) {
 	}
 }
 
+// TestFencingLeaseHeldContract는 위성 fence-confirm의 DB시각 판정(G-4 · FencingLeaseHeld)을
+// 실 MySQL로 검증한다: 같은 holder+token은 살아있을 때만 held=true이고, token 불일치·holder
+// 불일치·lease 만료·미점유는 전부 held=false다(확인 실패 = fence deny). 만료 판정을 **DB의
+// NOW(6)로** 하는 것(Go 시계 아님)이 핵심이라, 짧은 lease를 만료시킨 뒤 held=false를 본다.
+func TestFencingLeaseHeldContract(t *testing.T) {
+	host, port := startMySQL(t)
+	st := openStore(t, host, port, "deploy_agent")
+	ctx := context.Background()
+
+	// 미점유 — 어떤 token도 held=false.
+	if held, err := st.FencingLeaseHeld(ctx, "main-1", 1); err != nil || held {
+		t.Fatalf("미점유 락은 held=false여야 한다: held=%v err=%v", held, err)
+	}
+
+	// 점유(넉넉한 lease) — 같은 holder+token만 held=true.
+	tok, ok, err := st.Acquire(ctx, HolderAgent, "main-1", 60*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("Acquire 실패: ok=%v err=%v", ok, err)
+	}
+	if held, err := st.FencingLeaseHeld(ctx, "main-1", tok); err != nil || !held {
+		t.Fatalf("현 holder+token은 held=true여야 한다: held=%v err=%v", held, err)
+	}
+	// token 불일치 → false.
+	if held, _ := st.FencingLeaseHeld(ctx, "main-1", tok+1); held {
+		t.Fatal("token 불일치인데 held=true — fencing 판정 실패")
+	}
+	// holder 불일치 → false(main holder가 다르면 내 lock이 아니다).
+	if held, _ := st.FencingLeaseHeld(ctx, "other-main", tok); held {
+		t.Fatal("holder 불일치인데 held=true — 판정 실패")
+	}
+	if ok, _ := st.Release(ctx, HolderAgent, "main-1", tok); !ok {
+		t.Fatal("정리 Release 실패")
+	}
+
+	// lease 만료 — DB시각 기준으로 held=false여야 한다(Go 시계 편차와 무관). lease 정밀도는
+	// 정수 초라 1초로 잡고 여유 있게 기다린다.
+	tok2, ok, err := st.Acquire(ctx, HolderAgent, "main-1", 1*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("짧은 lease 획득 실패: ok=%v err=%v", ok, err)
+	}
+	if held, err := st.FencingLeaseHeld(ctx, "main-1", tok2); err != nil || !held {
+		t.Fatalf("만료 전에는 held=true여야 한다: held=%v err=%v", held, err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if held, err := st.FencingLeaseHeld(ctx, "main-1", tok2); err != nil || held {
+		t.Fatalf("lease 만료 후에는 held=false여야 한다(DB시각 판정): held=%v err=%v", held, err)
+	}
+}
+
 // --- S2-1 보안 회귀 + 동시성 -------------------------------------------------
 
 // TestLockCrossAccountReleaseDenied는 반대 계정이 남의 락을 해제할 수 없음을 실 MySQL로

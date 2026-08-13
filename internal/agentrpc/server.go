@@ -38,7 +38,14 @@ type ServerConfig struct {
 	Skew time.Duration
 	// MaxBodyBytes는 수신 body 상한이다(C7 · slow-body/거대 body DoS 방어). ≤0이면 기본값.
 	MaxBodyBytes int64
-	now          func() time.Time
+	// Fence는 각 mutation 직전 fence 확인을 하는 역방향 확인기다(infra#37 조각 B). 설정되면
+	// handleDeploy가 dispatch별 GuardSession을 만들어 execCtx에 실어 넘긴다 — 그 세션을 위성
+	// 조립이 GuardLocalDispatcher로 감싼 실행기들이 mutation 직전에 소비한다(G-2·G-3). nil이면
+	// fencing 없음(조각 A 동작 그대로 — 세션을 주입하지 않고 실행기도 decorate되지 않는다).
+	// 위성 조립은 Fence 주입과 dispatcher decoration을 **함께** 하고, 둘이 어긋나면 decorate된
+	// 실행기가 guard context 누락으로 fail-closed된다(G-2).
+	Fence FenceConfirmer
+	now   func() time.Time
 }
 
 // Server는 위성 실행자다. HTTP 핸들러(ServeHTTP)와 in-flight 실행 배수(WaitInFlight)를 함께
@@ -232,6 +239,14 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	// WithoutCancel로 취소 축만 끊고 ExecBudget으로 상한한다.
 	execCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.cfg.ExecBudget)
 	defer cancel()
+	// infra#37 조각 B — fencing이 배선됐으면 이 dispatch의 sticky GuardSession을 만들어 execCtx에
+	// 싣는다(G-2). decorate된 실행기들이 각 up/down 직전에 이 세션을 꺼내 fence 확인을 한다.
+	// 세션은 dispatch 하나에 결박되며, cleanupAfterFailure의 WithoutCancel 파생도 값(세션)을
+	// 보존하므로 첫 실패 뒤 cleanup down까지 같은 세션이 막는다.
+	if s.cfg.Fence != nil {
+		session := NewGuardSession(s.cfg.Fence, s.cfg.Target, requestID, env.FencingToken)
+		execCtx = withGuardSession(execCtx, session)
+	}
 	state, derr := s.cfg.Dispatcher.Dispatch(execCtx, m, store.FencingToken(env.FencingToken))
 
 	// C2 — 모순 조합 정규화(coordinator.go:265와 동일 규칙). (COMPLETED, err≠nil)은 완료와 실패를
@@ -286,34 +301,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, requestID, emptyDigest, ActionStatus, string(state), "원장 상태 조회(조회만 · 재개 없음)")
 }
 
-// freshOK는 RPC timestamp를 엄격 파싱해 신선도 창 안인지 본다(C4). 엄격 10진(재직렬화 일치)이며,
-// 파싱 실패·창 밖은 거절이다. |now - ts| ≤ Skew.
-//
-// ⚠️ overflow 안전(C4): 유효 unix 타임스탬프는 현 epoch에서 **양수**이므로 sec ≤ 0을 먼저
-// 거절한다 — 이렇게 하면 now·sec가 둘 다 양수라 now−sec·sec−now가 int64 overflow하지 않는다
-// (반대로 sec=MinInt64를 허용하면 now−sec가 wrap해 음수 diff가 되어 stale이 창 안으로 위장된다).
-// 비교는 초 단위 int64로 하고 time.Duration 곱셈을 쓰지 않는다(거대 diff × time.Second overflow 회피).
+// freshOK는 RPC timestamp를 엄격 파싱해 신선도 창 안인지 본다(C4). 로직은 freshTimestampOK
+// 단일 출처에 있다(fence 핸들러와 공유 — overflow-safe: 엄격 10진·sec≤0 선거절·초 단위 int64
+// 비교). |now - ts| ≤ Skew.
 func (s *Server) freshOK(ts string) bool {
-	sec, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil {
-		return false
-	}
-	// 엄격 10진 — 앞자리 0·부호·공백 등 canonical과 어긋나는 표기를 거른다(재직렬화 정확 일치).
-	if strconv.FormatInt(sec, 10) != ts {
-		return false
-	}
-	if sec <= 0 {
-		return false // 유효 unix 타임스탬프는 양수 — 음수·0·MinInt64를 여기서 차단(overflow 방어의 뿌리)
-	}
-	now := s.cfg.now().Unix() // 현 벽시계도 양수
-	var diff int64
-	if now >= sec {
-		diff = now - sec // 양수 − 양수(now≥sec) → overflow 없음
-	} else {
-		diff = sec - now // 양수 − 양수(sec>now) → overflow 없음
-	}
-	skewSec := int64(s.cfg.Skew / time.Second) // 초 단위 비교(Duration 곱셈 없음)
-	return diff <= skewSec
+	return freshTimestampOK(s.cfg.now(), ts, s.cfg.Skew)
 }
 
 // respond는 서명된 응답을 쓴다(R1). 모든 인증된 응답은 HTTP 200이며 실제 결과는 state 필드가
