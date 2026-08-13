@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -83,6 +84,12 @@ const (
 	OutcomeCompleted Outcome = "COMPLETED"
 	// OutcomeUnknown은 실행 상태가 UNKNOWN이라 사람 개입이 필요함을 뜻한다(DO-16 ⓒ · 락 유지).
 	OutcomeUnknown Outcome = "UNKNOWN"
+	// OutcomeStorageIntegrity는 동봉 compose의 candidate 기록·재해시가 어긋난 것이다(G-14).
+	// **요청자의 잘못이 아니다** — 바이트는 검증을 통과했고 이 호스트의 저장 계층이 잘못했다.
+	// MANIFEST_INVALID(422)로 접으면 CI가 자기 산출물을 의심하며 재발행을 반복하고,
+	// EXECUTION_FAILED(502)로 접으면 배포 대상 프로세스의 문제로 오인된다 — 어느 쪽도
+	// 사람을 이 호스트의 디스크로 데려가지 않는다. 그래서 별도 코드로 500을 낸다.
+	OutcomeStorageIntegrity Outcome = "STORAGE_INTEGRITY_ERROR"
 )
 
 // Result는 종단 결과와 사람이 읽는 사유다.
@@ -192,6 +199,16 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	}
 
 	// 5. manifest 검증(DO-18) — 실행 직전 완전성·digest 고정·서명 requestId 일치.
+	//    ⑴ 엄격 재파싱: 여기서부터 실행에 쓰이는 manifest는 관용 파서(1단계)가 아니라 엄격
+	//    파서가 낸 값이다. 1단계는 락 이전의 target 추출 전용이고, 실행 결박은 미지 필드·
+	//    중복 키·후행 데이터·동봉 2분법을 전부 거절하는 파서가 소유한다(infra#19 R5).
+	//    조용히 무시된 필드는 곧 조용히 무시된 결박이다.
+	sm, serr := ParseManifestStrict(req.Body)
+	if serr != nil {
+		c.reject(ctx, req.RequestID, target, m.CommitSHA, hold.Token(), "manifest 엄격 검증: "+serr.Error())
+		return Result{Outcome: OutcomeManifestInvalid, Detail: serr.Error()}
+	}
+	m = sm
 	if err := VerifyManifest(m, req.RequestID); err != nil {
 		c.reject(ctx, req.RequestID, target, m.CommitSHA, hold.Token(), "manifest 검증: "+err.Error())
 		return Result{Outcome: OutcomeManifestInvalid, Detail: err.Error()}
@@ -225,9 +242,11 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	// dispatch 오류 메시지는 UNKNOWN의 유일한 단서다 — "사람 개입 필요"인데 근거가 없으면
 	// 개입할 사람이 처음부터 다시 파야 한다(통합에서 실측 — troubleshooting-false-unknown.md).
 	// 이력 detail과 반환 Detail 양쪽에 싣는다(무음 금지).
-	dispatchDetail := ""
+	// 요청마다 **어느 compose 경로로 배포됐는지**를 이력에 남긴다(G-11 · B5' — 조용한 폴백
+	// 금지). 이 표기가 있어야 "legacy 표기 급증"이라는 이관 순서 위반의 관측 신호가 성립한다.
+	dispatchDetail := "composePath=" + m.ComposePathCode()
 	if derr != nil {
-		dispatchDetail = derr.Error()
+		dispatchDetail += " · " + derr.Error()
 	}
 
 	// 모순 조합 정규화 — **이력 기록 전에** 한다. (COMPLETED, err≠nil)은 "완료했다"와 "실패했다"를
@@ -277,6 +296,19 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	// 모순 조합 (COMPLETED, err)은 그 전에 UNKNOWN으로 정규화됐다(완료 주장과 오류가 함께 온
 	// 결과를 실행 실패로도, 완료로도 기록하지 않는다).
 	if derr != nil {
+		// 동봉 결박(infra#19)의 거절은 실행 계층 실패와 범주가 다르다 — 어느 것도 "docker가
+		// 배포를 완수하지 못했다"가 아니므로 502로 뭉치면 관제가 원인을 잘못 짚는다.
+		//   ⑴ 무동봉·구조 위반·CP-3 불일치·주입값 부재 = 요청/설정이 계약을 어겼다 → 422
+		//   ⑵ 저장 무결성 장애 = 이 호스트의 디스크가 잘못했다 → 500(별도 코드)
+		// 전부 부작용 0이거나(preflight) 잔류 candidate뿐이라(기록 후) 락은 그대로 해제된다.
+		switch {
+		case errors.Is(derr, ErrComposeStorage):
+			return Result{Outcome: OutcomeStorageIntegrity, State: state, Detail: derr.Error()}
+		case errors.Is(derr, ErrManifestComposeRequired), errors.Is(derr, ErrComposePreflight),
+			errors.Is(derr, ErrManifestComposeRevision), errors.Is(derr, ErrManifestComposeEncoding),
+			errors.Is(derr, ErrManifestComposeHash), errors.Is(derr, ErrManifestComposeMix):
+			return Result{Outcome: OutcomeManifestInvalid, State: state, Detail: derr.Error()}
+		}
 		return Result{Outcome: OutcomeExecutionFailed, State: state, Detail: "dispatch 오류: " + derr.Error()}
 	}
 	switch state {

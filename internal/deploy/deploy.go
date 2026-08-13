@@ -43,6 +43,18 @@ type Manifest struct {
 	ComposeRevision string `json:"composeRevision"` // 부팅 정의의 불변 식별자(DO-18 ⑷)
 	ConfigVersion   string `json:"configVersion"`   // 애플리케이션 설정 스키마/버전(DO-18 ⑸)
 	RequestID       string `json:"requestId"`       // DO-10; 시퀀스 전체를 통해 운반됨
+
+	// --- 동봉(infra#19 · ADR-030 CP-1/CP-3). 아래 둘은 **함께 있거나 함께 없다**(2분법):
+	// 둘 다 있으면 embedded(compose 내용이 서명 안에 있다), 둘 다 없으면 legacy(과도기 —
+	// 호스트 compose 파일을 쓴다). 부분 조합은 거절이다(ParseManifestStrict).
+
+	// ComposeContent는 compose 원문(UTF-8)의 표준 base64다. base64인 이유는 JSON 문자열
+	// 안전(개행·따옴표)과 CI/agent 양쪽의 바이트 동일성이다 — ComposeRevision은 이 문자열이
+	// 아니라 **디코드된 원문**의 sha256이므로, base64 표현 차이에 결박이 흔들리지 않는다.
+	ComposeContent string `json:"composeContent,omitempty"`
+	// AppService는 이 배포의 대상 compose 서비스명이다(CP-3). manifest·compose 정의·호스트
+	// env DEPLOY_APP_SERVICE 3자가 일치해야 실행된다 — 서명값과 호스트 배선의 상호 검증이다.
+	AppService string `json:"appService,omitempty"`
 }
 
 // Orchestrator는 하나의 manifest에 대해 CD-4 적용 시퀀스를 실행한다. 순서가 곧

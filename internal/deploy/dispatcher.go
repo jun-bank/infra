@@ -7,6 +7,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/jun-bank/infra/internal/compose"
 	"github.com/jun-bank/infra/internal/store"
 )
 
@@ -129,6 +130,11 @@ type LocalDispatcher struct {
 	// 그때까지 이 값은 "이 시간이면 in-flight가 끝난다"는 가정이며, 가정이 틀리면
 	// 진행 중 요청이 down에서 절단된다(대기값을 늘리는 것이 유일한 완화다).
 	DrainWait time.Duration
+
+	// Compose는 동봉 compose 실행 배선이다(infra#19). 설정되면 동봉 manifest는 검증→
+	// candidate 기록→그 candidate로만 up 하고, 무동봉 manifest는 AllowLegacy일 때만
+	// 기존 호스트 compose 경로로 흐른다. nil이면 동봉 배포를 수행할 수 없다(과도기 호스트).
+	Compose *ComposeRuntime
 }
 
 // 컴파일 타임 계약 확인 — LocalDispatcher는 Dispatcher다.
@@ -159,11 +165,19 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, token store.F
 		return StateUnexecuted, err
 	}
 
+	// 동봉 결박의 preflight(infra#19 · CP-1/CP-3/CP-7) — 해시 선대조·구조 allowlist·3자 일치·
+	// 주입값 존재를 여기서 전부 본다. **파일을 하나도 쓰지 않는다**(부작용 0 거절 · B4').
+	// legacy(무동봉)는 nil 계획으로 통과하며, 그 수락 자체가 REQUIRE 게이트를 지난 것이다.
+	plan, err := d.composePreflight(m)
+	if err != nil {
+		return StateUnexecuted, err
+	}
+
 	switch {
 	// 게이트웨이 미설정 = 전환 단계가 없는 기존 단일 경로 그대로다(하위호환) — 이 호스트의
 	// 배포 대상이 무엇이든 자기 슬롯 없이 pull→up→대조→헬스로 끝난다.
 	case d.Gateway == nil:
-		return d.runGreenPhases(ctx, imageRef, d.Exec, d.Health)
+		return d.runSinglePath(ctx, imageRef, plan)
 
 	// 블루-그린 전환은 **core 대상에만** 성립한다. 슬롯 배선(SlotExec·SlotHealth)과
 	// 게이트웨이 라우트는 core 라우트 하나에 결박돼 있다 — 게이트웨이 클라이언트가 보는
@@ -171,12 +185,12 @@ func (d LocalDispatcher) Dispatch(ctx context.Context, m Manifest, token store.F
 	// 그래서 대상을 보지 않고 이 경로로 들어오면 settlement/ledger 이미지가 core의 슬롯을
 	// 덮어쓰고, 그 위에 core 라우트가 전환된다(대상 뒤바뀜 — 치명).
 	case m.Target == TargetCore:
-		return d.dispatchBlueGreen(ctx, imageRef, token)
+		return d.dispatchBlueGreen(ctx, imageRef, token, plan)
 
 	// target=gateway는 단일 경로다 — 게이트웨이는 전환 수단의 소유자라 자기 블루-그린을
 	// 자기가 전환할 수 없다(자기 참조). v1은 재기동 교체다(DO-20 ⓐ · 짧은 중단 수용).
 	case m.Target == TargetGateway:
-		return d.runGreenPhases(ctx, imageRef, d.Exec, d.Health)
+		return d.runSinglePath(ctx, imageRef, plan)
 
 	// 나머지(settlement·ledger)는 이 호스트의 배포 대상이 아니다. 조용히 core 슬롯으로
 	// 흘려보내지 않고 시작 전에 요란하게 거절한다(부작용 0 · fail-closed).
@@ -200,16 +214,38 @@ func (d LocalDispatcher) imageRef(m Manifest) (string, error) {
 	return repo + "@" + m.ImageDigest, nil
 }
 
+// runSinglePath는 전환 단계가 없는 경로(게이트웨이 미설정 · target=gateway)를 수행한다.
+// 동봉 계획이 있으면 실행기·헬스를 **이번 서명 바이트로 만든 candidate에 결박**해 새로
+// 만들고, 성공 후 승격까지 마친다. 계획이 없으면(legacy) 기존 배선 그대로다.
+func (d LocalDispatcher) runSinglePath(ctx context.Context, imageRef string, plan *composePlan) (RemoteState, error) {
+	exec, health := d.Exec, d.Health
+	var injected map[string]string
+	if plan != nil {
+		var err error
+		exec, health, injected, err = plan.bind(compose.SlotSingle)
+		if err != nil {
+			return StateUnexecuted, err
+		}
+	}
+	st, err := d.runGreenPhases(ctx, imageRef, exec, health)
+	if st == StateCompleted && plan != nil {
+		plan.promote(compose.SlotSingle, injected)
+	}
+	return st, err
+}
+
 // runGreenPhases는 새 버전을 올리는 ②③④를 한 실행기·한 헬스 대상으로 수행한다:
 // pull → up → 이미지 무결성 대조 → CD-1 헬스. 통과면 COMPLETED, 실패면 green을 정리해
 // 미전환(UNEXECUTED)으로 되돌리고 정리마저 실패하면 UNKNOWN이다.
 //
-// ⚠️ [구현 검증]/후속 — P2(DO-18 ⑴⑶ 갭): manifest의 ComposeRevision·ConfigVersion이
-// 서명됐지만 아직 실행에 결박되지 않는다. 호스트의 compose 파일이 낡거나 변조된 revision
-// 이어도 이미지 digest만 맞으면 COMPLETED가 난다("이미지만 되돌리면 되돌린 것이 아니다").
-// 이번에 닫지 않는다 — 호스트 compose provisioning 방식이 확정되면 up 전에 호스트 compose가
-// m.ComposeRevision·m.ConfigVersion과 일치하는지 결박한다. 그 전까지 호스트 compose 파일은
-// 신뢰 설정으로 취급된다.
+// compose 결박(P2 · DO-18 ⑴ 갭)은 #19가 닫았다: 동봉 경로에서 exec·health는 이번 서명
+// 바이트로 만든 candidate에 결박된 것이 넘어오므로, 호스트 compose 파일이 낡거나 변조돼
+// 있어도 실행에 닿지 않는다. **legacy 경로(DEPLOY_ALLOW_LEGACY_COMPOSE=1)에는 그 갭이
+// 그대로 남는다** — 호스트 compose 파일이 여전히 신뢰 설정이며, 그래서 그 경로는 명시
+// opt-in이고 요청마다 이력에 표기된다.
+//
+// ⚠️ 남은 갭: ConfigVersion(DO-18 ⑸)은 아직 실행에 결박되지 않는다 — 애플리케이션 설정
+// 스키마 버전을 무엇과 대조할지가 미정이다(후속).
 func (d LocalDispatcher) runGreenPhases(ctx context.Context, imageRef string, exec HostExecutor, health HealthChecker) (RemoteState, error) {
 	// 배선 부재는 실행 전이므로 부작용 0이다 — 조용히 건너뛰지 않고 요란하게 거절한다
 	// (예: 게이트웨이 모드에서 target=gateway가 왔는데 단일 경로 설정이 없는 경우).
@@ -266,7 +302,12 @@ func (d LocalDispatcher) runGreenPhases(ctx context.Context, imageRef string, ex
 //     stale(409) = 정리 없이 UNKNOWN / ROLLED_BACK = green 정리 후 UNEXECUTED /
 //     그 밖(INDETERMINATE·전송 실패·보증 없음) = 정리 없이 UNKNOWN.
 //   - ⑤ 성공 후 ⑥⑨ 실패 = 라우트는 이미 옮겨졌다 = UNKNOWN(락 유지·사람) + 단계 명시.
-func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string, token store.FencingToken) (RemoteState, error) {
+//
+// 동봉 계획(plan)이 있으면 idle 슬롯의 실행기·헬스는 **그 슬롯의 candidate에 결박된 것**으로
+// 새로 만든다(active 슬롯의 실행기는 down에만 쓰이므로 기존 배선 그대로다 — 이미 떠 있는
+// 프로젝트를 끄는 데 새 compose 파일이 필요하지 않고, 오히려 새 정의로 끄면 이번 배포의
+// 정의로 남의 컨테이너를 다루게 된다).
+func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string, token store.FencingToken, plan *composePlan) (RemoteState, error) {
 	// 0. 배선·설정 확인(실행 전 — 부작용 0). DrainWait이 0 이하면 드레인이 실질적으로
 	//    사라져 in-flight를 절단한다 — 조용히 0으로 돌지 않고 거절한다(무음 축소 금지).
 	if d.DrainWait <= 0 {
@@ -296,6 +337,18 @@ func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string,
 	activeExec := d.SlotExec[active]
 	if idleExec == nil || idleHealth == nil || activeExec == nil {
 		return StateUnexecuted, fmt.Errorf("슬롯 배선 부재(active=%s idle=%s) — compose file·project·헬스 URL이 슬롯마다 있어야 한다(부작용 0 · fail-closed)", active, idle)
+	}
+
+	// 1-b. 동봉 경로라면 여기서 idle 슬롯의 candidate를 기록하고 실행기를 그 경로에 결박한다.
+	//      슬롯이 정해진 뒤에야 기록할 수 있으므로(경로가 슬롯별이다) preflight와 갈라져 있다.
+	//      실패해도 승격은 없으므로 잔류 candidate는 무해하다(GC 대상 · B4' 재기술).
+	var injected map[string]string
+	if plan != nil {
+		var berr error
+		idleExec, idleHealth, injected, berr = plan.bind(string(idle))
+		if berr != nil {
+			return StateUnexecuted, berr
+		}
 	}
 
 	// 2. ②③④ — 새 버전을 idle slot에 올리고 CD-1 헬스까지 통과시킨다. 여기까지의 실패는
@@ -329,6 +382,11 @@ func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string,
 		return StateUnknown, fmt.Errorf("⑨ 구 active slot(%s) compose down 실패 — ⑤ 라우트 전환은 성공했다(라우트=%s) · 신·구 두 프로세스 생존 가능(잔존 프로세스 · UNKNOWN · 락 유지·사람 개입): %w", active, idle, err)
 	}
 
+	// BG 완주 후에만 승격한다(B4') — 여기 도달했다는 것은 헬스·전환·드레인·구 slot 종료가
+	// 전부 끝났다는 뜻이고, 그때의 정의만이 "마지막 정상본"으로 복원 재료가 될 자격이 있다.
+	if plan != nil {
+		plan.promote(string(idle), injected)
+	}
 	return StateCompleted, nil
 }
 

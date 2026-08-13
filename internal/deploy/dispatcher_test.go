@@ -119,9 +119,16 @@ func repos() map[Target]string {
 	return map[Target]string{TargetCore: "registry.example/core"}
 }
 
+// legacyCompose는 **과도기(무동봉) 경로**를 명시적으로 켠 배선이다. 신 agent의 기본값은
+// 동봉 필수(REQUIRE=1)이므로, 호스트 compose 파일로 도는 아래 시나리오들은 이 opt-in을
+// 함께 들고 있어야 성립한다 — 그 필요 자체가 R7의 기본값이 살아 있다는 증거다.
+func legacyCompose() *ComposeRuntime {
+	return &ComposeRuntime{AllowLegacy: true}
+}
+
 func dispatch(t *testing.T, x *fakeExec, h fakeHealth, m Manifest) (RemoteState, error) {
 	t.Helper()
-	d := LocalDispatcher{Exec: x, Health: h, Repos: repos(), PhaseBudget: time.Minute}
+	d := LocalDispatcher{Exec: x, Health: h, Repos: repos(), PhaseBudget: time.Minute, Compose: legacyCompose()}
 	return d.Dispatch(context.Background(), m, store.FencingToken(1))
 }
 
@@ -144,7 +151,7 @@ func TestDispatchCompleted(t *testing.T) {
 // repo 미설정 = 부작용 0 = UNEXECUTED. pull도 부르지 않는다.
 func TestDispatchRepoMissing(t *testing.T) {
 	x := &fakeExec{}
-	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: map[Target]string{}, PhaseBudget: time.Minute}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: map[Target]string{}, PhaseBudget: time.Minute, Compose: legacyCompose()}
 	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
 	if st != StateUnexecuted || err == nil {
 		t.Fatalf("repo 미설정: state=%v err=%v, UNEXECUTED·err 기대", st, err)
@@ -278,7 +285,7 @@ func TestDispatchCleanupDownUsesDetachedCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 요청 ctx를 미리 취소한다.
 	x := &fakeExec{upErr: errors.New("up 실패")}
-	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: time.Minute}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: time.Minute, Compose: legacyCompose()}
 	st, err := d.Dispatch(ctx, manifest(validDigest), store.FencingToken(1))
 	if st != StateUnexecuted || err == nil {
 		t.Fatalf("취소 ctx·up 실패·down 성공: state=%v, UNEXECUTED 기대(정리 완주)", st)
@@ -296,7 +303,7 @@ func TestDispatchCleanupDownUsesDetachedCtx(t *testing.T) {
 // 이로써 상한 없는 up이 lease 마진을 무한정 넘겨 락이 만료되는 일이 구조적으로 막힌다.
 func TestDispatchPhaseBudgetTimeoutUpCleanup(t *testing.T) {
 	x := &fakeExec{blockUp: true}
-	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: 10 * time.Millisecond}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: 10 * time.Millisecond, Compose: legacyCompose()}
 	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
 	if st != StateUnexecuted || err == nil {
 		t.Fatalf("phase budget 초과 up: state=%v err=%v, UNEXECUTED 기대(정리 완주)", st, err)
@@ -317,7 +324,7 @@ func TestDispatchPhaseBudgetTimeoutUpCleanup(t *testing.T) {
 // 접히고, 정리 down은 detached ctx로 완주해야 한다.
 func TestDispatchPhaseBudgetTimeoutVerifyCleanup(t *testing.T) {
 	x := &fakeExec{blockVerify: true}
-	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: 10 * time.Millisecond}
+	d := LocalDispatcher{Exec: x, Health: fakeHealth{}, Repos: repos(), PhaseBudget: 10 * time.Millisecond, Compose: legacyCompose()}
 	st, err := d.Dispatch(context.Background(), manifest(validDigest), store.FencingToken(1))
 	if err == nil || (st != StateUnexecuted && st != StateUnknown) {
 		t.Fatalf("phase budget 초과 verify: state=%v err=%v, UNEXECUTED/UNKNOWN 기대", st, err)
@@ -404,6 +411,7 @@ func (r *bgRig) dispatcher() LocalDispatcher {
 		SlotExec:    map[Slot]HostExecutor{SlotBlue: r.blue, SlotGreen: r.green},
 		SlotHealth:  map[Slot]HealthChecker{SlotBlue: r.blueH, SlotGreen: r.greenH},
 		DrainWait:   testDrainWait,
+		Compose:     legacyCompose(),
 	}
 }
 
