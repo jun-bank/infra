@@ -532,7 +532,19 @@ func buildDispatcher() (dispatcherBuild, error) {
 		}
 	}
 
-	gw, err := dispatch.NewGatewayClient(gatewayURL, gwTimeout)
+	// R4: /internal 관리 표면 서명 키. DEPLOY_GATEWAY_URL이 설정되면(= 이 블루-그린 경로)
+	// 키 없이 기동하지 않는다 — 무서명 폴백을 제거해, agent가 서명을 못 붙인 채 전환을
+	// 호출하는 경로를 만들지 않는다(fail-closed). 배포 게이트 1 AGENT_HMAC_KEY와 **별도 키**다.
+	internalKey := os.Getenv("GATEWAY_INTERNAL_HMAC_KEY")
+	if internalKey == "" {
+		return b, errors.New("DEPLOY_GATEWAY_URL이 설정되면 GATEWAY_INTERNAL_HMAC_KEY가 필수다 — 이 키 없이는 agent가 /internal 라우트 전환에 canonical-v1 서명을 붙일 수 없다(무서명 폴백 제거 · fail-closed). 배포 게이트 1의 AGENT_HMAC_KEY와는 별도 키다(다른 신뢰 경계)")
+	}
+	internalSigner, serr := dispatch.NewInternalSigner([]byte(internalKey))
+	if serr != nil {
+		return b, fmt.Errorf("게이트웨이 /internal 서명자 조립(fail-closed): %w", serr)
+	}
+
+	gw, err := dispatch.NewGatewayClient(gatewayURL, gwTimeout, dispatch.WithInternalSigner(internalSigner))
 	if err != nil {
 		return b, fmt.Errorf("게이트웨이 라우트 클라이언트 조립(fail-closed): %w", err)
 	}

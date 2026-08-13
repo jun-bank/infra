@@ -121,8 +121,18 @@ func parseSwitchState(body []byte) string {
 // GatewayClient는 게이트웨이 라우트 API의 HTTP 클라이언트다. deploy.SlotGateway를
 // 만족한다(ActiveSlot·Switch).
 type GatewayClient struct {
-	base *url.URL
-	http httpDoer
+	base   *url.URL
+	http   httpDoer
+	signer *InternalSigner // nil이면 무서명(테스트 전용) — 운영은 main이 항상 주입한다(R4)
+}
+
+// GatewayOption은 GatewayClient 조립 옵션이다.
+type GatewayOption func(*GatewayClient)
+
+// WithInternalSigner는 /internal 관리 표면 요청에 canonical-v1 HMAC 서명을 붙이는 signer를
+// 배선한다. 운영 경로(DEPLOY_GATEWAY_URL 설정)에서는 필수다 — 키 없이 조립하지 않는다(R4).
+func WithInternalSigner(s *InternalSigner) GatewayOption {
+	return func(g *GatewayClient) { g.signer = s }
 }
 
 // routeState는 GET 응답이다(게이트웨이 계약 그대로).
@@ -142,7 +152,7 @@ type switchRequest struct {
 // NewGatewayClient는 base URL(예: http://127.0.0.1:8090)로 클라이언트를 만든다. timeout은
 // 각 요청의 상한이며 lease 하한식의 입력이다(전환 단계가 무한정 늘어지면 락이 만료된다).
 // base가 절대 http(s) URL이 아니거나 timeout이 0 이하면 조립 시점에 거부한다(fail-closed).
-func NewGatewayClient(base string, timeout time.Duration) (*GatewayClient, error) {
+func NewGatewayClient(base string, timeout time.Duration, opts ...GatewayOption) (*GatewayClient, error) {
 	if timeout <= 0 {
 		return nil, fmt.Errorf("dispatch: 게이트웨이 요청 타임아웃은 >0 이어야 한다: %s", timeout)
 	}
@@ -153,7 +163,23 @@ func NewGatewayClient(base string, timeout time.Duration) (*GatewayClient, error
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("dispatch: 게이트웨이 URL은 절대 http(s) URL이어야 한다: %q", base)
 	}
-	return &GatewayClient{base: u, http: &http.Client{Timeout: timeout}}, nil
+	g := &GatewayClient{base: u, http: &http.Client{Timeout: timeout}}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g, nil
+}
+
+// signInternal은 요청에 canonical-v1 서명·타임스탬프 헤더를 붙인다(signer 미배선이면 no-op).
+// body는 raw 요청 바이트(GET은 nil)다. 서명 대상 path는 게이트웨이가 실제로 받는 경로와
+// 바이트 동일해야 하므로 req.URL.Path(쿼리 제외)를 그대로 쓴다.
+func (g *GatewayClient) signInternal(req *http.Request, body []byte) {
+	if g.signer == nil {
+		return
+	}
+	sig, ts := g.signer.headersFor(req.Method, req.URL.Path, body, time.Now().Unix())
+	req.Header.Set(HeaderInternalSignature, sig)
+	req.Header.Set(HeaderInternalTimestamp, ts)
 }
 
 // routeURL은 라우트 엔드포인트 URL을 만든다(suffix는 "" 또는 "/switch").
@@ -169,6 +195,7 @@ func (g *GatewayClient) ActiveSlot(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("dispatch: 라우트 조회 요청 조립 실패: %w", err)
 	}
+	g.signInternal(req, nil) // GET은 body 없음 — 빈-body digest로 서명 범위에 든다
 	resp, err := g.http.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("dispatch: 라우트 조회 실패(게이트웨이 미응답): %w", err)
@@ -219,6 +246,7 @@ func (g *GatewayClient) Switch(ctx context.Context, targetSlot string, fencingTo
 		return &SwitchError{Msg: fmt.Sprintf("dispatch: 전환 요청 조립 실패(요청 미전송): %v", err), State: SwitchStateNotAttempted, Err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	g.signInternal(req, payload) // 서명은 전송하는 바로 그 raw 본문 바이트를 덮는다
 	resp, err := g.http.Do(req)
 	if err != nil {
 		// 응답을 받지 못했다 = 실상태 보증 없음(State 비움) — 요청이 닿았을 수 있다.
