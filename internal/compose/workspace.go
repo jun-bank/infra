@@ -208,10 +208,15 @@ func (w *Workspace) WriteCandidate(target, slot, revHex string, content []byte) 
 	return cand, nil
 }
 
-// snapshotDir는 실행 중 잠깐만 사는 파일들이 모이는 자리다(세대·인덱스와 분리). 이 격리가
+// SnapshotDir는 실행 중 잠깐만 사는 파일들이 모이는 자리다(세대·인덱스와 분리). 이 격리가
 // 필요한 이유: 세대 파일은 "내용이 곧 이름"이고 applied 인덱스는 "성공한 것만"인데, 스냅샷은
 // 둘 다 아니다 — 같은 디렉터리에 섞으면 GC와 복원 재료 판정이 임시 파일을 세게 된다.
-const snapshotDir = "tmp"
+// exported인 이유: 이 디렉터리가 compose의 실행 기준 디렉터리(--project-directory)가 되므로
+// 호출자가 그 자리의 `.env` 부재를 확인해야 한다.
+const SnapshotDir = "tmp"
+
+// snapshotPrefix는 down 스냅샷 파일명의 접두사다(회수 대상 판별에 쓴다).
+const snapshotPrefix = "down-"
 
 // WriteSnapshot은 **이미 검증된 바이트 버퍼**를 실행 전용 임시 파일로 고정한다.
 //
@@ -229,7 +234,7 @@ func (w *Workspace) WriteSnapshot(target, name string, content []byte) (string, 
 	if name == "" || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
 		return "", errf(CodeWorkspace, "스냅샷 이름이 안전하지 않다: %q", name)
 	}
-	dir := filepath.Join(w.root, target, snapshotDir)
+	dir := filepath.Join(w.root, target, SnapshotDir)
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return "", errf(CodeStorageIntegrity, "스냅샷 디렉터리 생성 실패: %q: %v", dir, err)
 	}
@@ -255,7 +260,18 @@ func (w *Workspace) WriteSnapshot(target, name string, content []byte) (string, 
 			return "", serr
 		}
 	case errors.Is(err, os.ErrExist):
-		// 중단된 앞선 시도의 잔재 — 내용이 같을 때만 재사용한다.
+		// 중단된 앞선 시도의 잔재 — 내용이 같을 때만 재사용한다. 다만 **무엇을 재사용하는지**
+		// 부터 확인한다: os.ReadFile은 심볼릭 링크를 따라가므로, 같은 이름의 링크가 놓여 있으면
+		// "내용이 같다"는 대조를 통과하면서도 compose가 여는 것은 링크가 가리키는 파일이다
+		// (그 대상은 언제든 바뀔 수 있어 결박이 통째로 무의미해진다). Lstat으로 링크를 따라가지
+		// 않고 본다 — 정규 파일이 아니면 재사용하지 않는다.
+		fi, lerr := os.Lstat(path)
+		if lerr != nil {
+			return "", errf(CodeStorageIntegrity, "기존 스냅샷 확인 실패: %q: %v", path, lerr)
+		}
+		if !fi.Mode().IsRegular() {
+			return "", errf(CodeStorageIntegrity, "기존 스냅샷이 정규 파일이 아니다: %q(mode=%s) — 심볼릭 링크·특수 파일은 재사용하지 않는다", path, fi.Mode())
+		}
 	default:
 		return "", errf(CodeStorageIntegrity, "스냅샷 생성 실패: %q: %v", path, err)
 	}
@@ -268,6 +284,44 @@ func (w *Workspace) WriteSnapshot(target, name string, content []byte) (string, 
 		return "", errf(CodeStorageIntegrity, "기록된 스냅샷이 검증 바이트와 다르다: %q — 저장 무결성 장애", path)
 	}
 	return path, nil
+}
+
+// SweepStaleSnapshots는 오래된 스냅샷 잔재를 회수한다. 프로세스가 down 도중 죽거나 삭제가
+// 실패하면 tmp에 파일이 남는데, GC는 이 디렉터리를 통째로 건너뛰므로(세대가 아니다) 아무도
+// 치우지 않으면 영구 누적된다.
+//
+// 이것은 **무결성 장치가 아니라 위생 장치**다: 남은 파일은 tmp에 격리돼 아무 판정에도 들지
+// 않고, 같은 이름의 재사용은 내용 대조와 정규 파일 검사를 그대로 받는다. 그래서 삭제 실패는
+// 오류로 올리지 않고 몇 건 실패했는지만 돌려준다 — 청소가 안 됐다고 배포를 막을 이유가 없다.
+//
+// maxAge보다 오래된 것만 지운다. 지금 도는 배포의 스냅샷을 지우지 않으려면 이 값이 배포 한
+// 사이클보다 넉넉히 커야 한다(호출자가 그 여유를 정한다).
+func (w *Workspace) SweepStaleSnapshots(target string, maxAge time.Duration) (removed, failed int) {
+	dir := filepath.Join(w.root, target, SnapshotDir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0 // 디렉터리가 아직 없다 = 치울 것도 없다
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), snapshotPrefix) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			failed++
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if rerr := os.Remove(filepath.Join(dir, e.Name())); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			failed++
+			continue
+		}
+		removed++
+	}
+	return removed, failed
 }
 
 // RemoveSnapshot은 실행이 끝난 스냅샷을 지운다(성공·실패 무관). 실패해도 오류를 올리지
@@ -597,7 +651,7 @@ func (w *Workspace) GC(target string, pinned []string) error {
 		}
 		// 스냅샷 디렉터리는 세대 회전 밖이다 — 실행 중 잠깐 사는 파일이라 pin·잔여 상한의
 		// 대상이 아니고, 여기 섞이면 GC가 임시 파일을 세대로 세게 된다.
-		if slotEnt.Name() == snapshotDir {
+		if slotEnt.Name() == SnapshotDir {
 			continue
 		}
 		slotDir := filepath.Join(targetDir, slotEnt.Name())
