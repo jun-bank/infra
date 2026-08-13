@@ -70,8 +70,9 @@ func (s LedgerState) terminal() bool {
 // errLedgerPoisoned는 원장이 내구 기록 실패로 오염됐을 때 Accept가 싣는 오류다(실행자 중단).
 var errLedgerPoisoned = errors.New("agentrpc: 원장 오염(이전 내구 기록 실패) — 새 실행을 받지 않는다(fail-closed)")
 
-// syncDir는 디렉터리 엔트리를 fsync한다(C5 · 최초 원장 생성 시 부모 디렉터리 내구성). 패키지
-// 변수로 둔 것은 테스트가 "최초 생성 시에만 호출"을 관측하기 위해서다.
+// syncDir는 디렉터리 엔트리를 fsync한다(C5 · 부모 디렉터리 내구성). **매 OpenLedger마다** 부른다
+// (멱등) — 최초 생성에만 하면 생성 시 fsync 실패가 한 번의 재시작으로 우회되기 때문이다. 패키지
+// 변수로 둔 것은 테스트가 호출을 관측하기 위해서다.
 var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -115,30 +116,41 @@ func OpenLedger(journalPath, lockPath string) (*Ledger, error) {
 		return nil, fmt.Errorf("agentrpc: 원장 락 획득 실패 — 같은 target의 다른 실행자가 이미 쥐고 있다(target당 하나 · fail-closed): %w", err)
 	}
 
-	// 2. journal 열기 + 최초 생성이면 부모 디렉터리 fsync(C5 — 디렉터리 엔트리 유실 방지).
-	newlyCreated := false
-	if _, statErr := os.Stat(journalPath); errors.Is(statErr, os.ErrNotExist) {
-		newlyCreated = true
-	}
+	// 2. journal 열기 + **매 open 시** 부모 디렉터리 fsync(C5). 최초 생성에만 fsync하면, 생성 시
+	//    fsync가 실패한 채 journal 파일만 남을 경우 다음 재기동에서 newlyCreated=false로 건너뛰어
+	//    한 번의 재시작으로 실패가 우회된다 — dir fsync는 멱등하므로 존재 여부와 무관하게 매번 한다.
 	// O_APPEND: 모든 쓰기가 파일 끝에 붙는다(부분 쓰기 중 재기동에도 이전 줄은 온전).
 	jf, err := os.OpenFile(journalPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		_ = lf.Close()
 		return nil, fmt.Errorf("agentrpc: 원장 journal 열기 실패(fail-closed): %w", err)
 	}
-	if newlyCreated {
-		if err := syncDir(filepath.Dir(journalPath)); err != nil {
-			_ = jf.Close()
-			_ = lf.Close()
-			return nil, fmt.Errorf("agentrpc: 원장 부모 디렉터리 fsync 실패(디렉터리 엔트리 내구성 미보장 — 전원 장애 시 빈 원장 재생성·중복 실행 위험 · fail-closed): %w", err)
-		}
+	if err := syncDir(filepath.Dir(journalPath)); err != nil {
+		_ = jf.Close()
+		_ = lf.Close()
+		return nil, fmt.Errorf("agentrpc: 원장 부모 디렉터리 fsync 실패(디렉터리 엔트리 내구성 미보장 — 전원 장애 시 빈 원장 재생성·중복 실행 위험 · fail-closed): %w", err)
 	}
 
-	records, err := replay(jf)
+	records, truncateTo, err := replay(jf)
 	if err != nil {
 		_ = jf.Close()
 		_ = lf.Close()
 		return nil, fmt.Errorf("agentrpc: 원장 replay 실패(중간 손상 — fail-closed): %w", err)
+	}
+	// C6 — torn tail을 발견했으면 파일을 **마지막 정상 개행 오프셋까지 truncate + fsync**한 뒤 serve.
+	// 이렇게 하지 않으면 이후 O_APPEND write가 찢어진 조각 뒤에 붙어, 다음 재기동에서 그 조각이
+	// "개행종료 완전 줄"이 되어 치명적 중간 손상으로 뒤집힌다.
+	if truncateTo >= 0 {
+		if err := jf.Truncate(truncateTo); err != nil {
+			_ = jf.Close()
+			_ = lf.Close()
+			return nil, fmt.Errorf("agentrpc: torn tail truncate 실패(fail-closed): %w", err)
+		}
+		if err := jf.Sync(); err != nil {
+			_ = jf.Close()
+			_ = lf.Close()
+			return nil, fmt.Errorf("agentrpc: torn tail truncate 후 fsync 실패(fail-closed): %w", err)
+		}
 	}
 	return &Ledger{journal: jf, lock: lf, records: records, now: time.Now}, nil
 }
@@ -148,17 +160,20 @@ func OpenLedger(journalPath, lockPath string) (*Ledger, error) {
 // 그 줄을 버리고 진행한다. 그 requestId는 이전 ACCEPTED 레코드가 남아 UNKNOWN으로 회복된다.
 // 개행으로 끝난 완전한 줄이 손상됐거나(디스크 비트 손상) **중간** 줄이 손상되면 치명(기동 거부)
 // — append-only 단일 writer에서 torn은 언제나 맨 끝에만 생기므로, 그 밖의 손상은 진짜 오염이다.
-func replay(f *os.File) (map[string]record, error) {
+//
+// 두 번째 반환값 truncateTo는 torn tail을 버렸을 때 **파일을 잘라야 할 오프셋**이다(마지막 정상
+// 개행 직후 = 완전한 줄들의 총 바이트). torn tail이 없으면 -1이다(truncate 불필요).
+func replay(f *os.File) (map[string]record, int64, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+		return nil, -1, err
 	}
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return nil, err
+		return nil, -1, err
 	}
 	out := map[string]record{}
 	if len(data) == 0 {
-		return out, nil
+		return out, -1, nil
 	}
 	endsNL := data[len(data)-1] == '\n'
 	parts := bytes.Split(data, []byte{'\n'})
@@ -173,14 +188,15 @@ func replay(f *os.File) (map[string]record, error) {
 		if err := json.Unmarshal(line, &r); err != nil || r.RequestID == "" {
 			isLast := i == len(parts)-1
 			if isLast && !endsNL {
-				// torn tail — 마지막 줄이 개행 없이 잘렸다(정상 crash) → 버리고 진행.
-				break
+				// torn tail — 마지막 줄이 개행 없이 잘렸다(정상 crash) → 버리고 truncate 오프셋을 낸다.
+				// 오프셋 = 전체 - 찢어진 조각 길이 = 마지막 정상 개행 직후(선행 개행이 없으면 0).
+				return out, int64(len(data) - len(parts[i])), nil
 			}
-			return nil, fmt.Errorf("journal 손상(치명): 줄 %d 파싱 불가(개행종료=%v · 마지막=%v)", i, endsNL, isLast)
+			return nil, -1, fmt.Errorf("journal 손상(치명): 줄 %d 파싱 불가(개행종료=%v · 마지막=%v)", i, endsNL, isLast)
 		}
 		out[r.RequestID] = r
 	}
-	return out, nil
+	return out, -1, nil
 }
 
 // Close는 journal·lock 파일을 닫는다(flock도 해제된다).
