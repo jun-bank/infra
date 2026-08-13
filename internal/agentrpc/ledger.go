@@ -156,13 +156,22 @@ func OpenLedger(journalPath, lockPath string) (*Ledger, error) {
 }
 
 // replay는 journal을 처음부터 읽어 requestId별 최신 레코드를 복원한다(마지막 줄이 이긴다).
-// torn tail 관용(C6): **마지막 줄이 개행 없이 잘린 경우**(정상 crash 결과 — append 도중 종료)만
-// 그 줄을 버리고 진행한다. 그 requestId는 이전 ACCEPTED 레코드가 남아 UNKNOWN으로 회복된다.
-// 개행으로 끝난 완전한 줄이 손상됐거나(디스크 비트 손상) **중간** 줄이 손상되면 치명(기동 거부)
-// — append-only 단일 writer에서 torn은 언제나 맨 끝에만 생기므로, 그 밖의 손상은 진짜 오염이다.
 //
-// 두 번째 반환값 truncateTo는 torn tail을 버렸을 때 **파일을 잘라야 할 오프셋**이다(마지막 정상
-// 개행 직후 = 완전한 줄들의 총 바이트). torn tail이 없으면 -1이다(truncate 불필요).
+// torn tail 판정 근본화(C6): 정상 원장은 **항상 개행으로 끝난다**(매 레코드가 line+"\n" append).
+// 따라서 파일이 개행으로 끝나지 않으면(!endsNL) 마지막 write가 미완이라는 신호이며, 그 마지막
+// 조각은 **파싱 성공 여부와 무관하게** 버린다 — 완전한 JSON까지 다 써지고 trailing "\n"만 유실된
+// 경우(fsync 반환 직전 crash의 흔한 형태)도 여기 포함된다. 파싱 성공만으로 남기면 이후 O_APPEND가
+// 그 뒤에 붙어 "}{"가 되어 다음 재기동에서 중간 손상 치명이 된다.
+//
+// 마지막 조각을 버려도 안전한 근거: 개행 없이 끝난 조각은 **fsync 완료 전**이라 그 requestId는
+// 애초에 durable하지 않다(클라이언트도 응답을 받지 못했다). 위성 관점에서 그 배포는 ABSENT이고
+// main은 UNKNOWN으로 받아 사람에게 올린다 — 버림이 상태를 되감지 않는다(부작용 오인 없음).
+//
+// 개행으로 끝난 **완전한** 줄이 파싱 실패하거나(디스크 비트 손상) **중간** 줄이 손상되면 치명
+// (기동 거부) — append-only 단일 writer에서 미완은 언제나 맨 끝에만 생기므로 그 밖은 진짜 오염이다.
+//
+// 두 번째 반환값 truncateTo는 마지막 미완 조각을 버렸을 때 **파일을 잘라야 할 오프셋**이다(마지막
+// 정상 개행 직후 = 완전한 줄들의 총 바이트). 파일이 개행으로 끝나면 -1이다(truncate 불필요).
 func replay(f *os.File) (map[string]record, int64, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, -1, err
@@ -177,26 +186,28 @@ func replay(f *os.File) (map[string]record, int64, error) {
 	}
 	endsNL := data[len(data)-1] == '\n'
 	parts := bytes.Split(data, []byte{'\n'})
+	truncateTo := int64(-1)
 	if endsNL {
-		parts = parts[:len(parts)-1] // 마지막 개행 뒤 빈 조각 제거(깔끔한 끝)
+		parts = parts[:len(parts)-1] // 마지막 개행 뒤 빈 조각 제거(깔끔한 끝 · truncate 불필요)
+	} else {
+		// 파일이 개행으로 끝나지 않음 = 마지막 write 미완(fsync 전) = torn tail. 마지막 조각을
+		// **파싱 여부와 무관하게** 버리고 last-good 개행 오프셋(= 전체 - 마지막 조각 길이)까지 truncate.
+		last := parts[len(parts)-1]
+		truncateTo = int64(len(data) - len(last))
+		parts = parts[:len(parts)-1]
 	}
+	// 여기 남은 parts는 전부 개행으로 종료된 완전한 줄이다 — 그중 파싱 실패는 진짜 오염(치명)이다.
 	for i, line := range parts {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var r record
 		if err := json.Unmarshal(line, &r); err != nil || r.RequestID == "" {
-			isLast := i == len(parts)-1
-			if isLast && !endsNL {
-				// torn tail — 마지막 줄이 개행 없이 잘렸다(정상 crash) → 버리고 truncate 오프셋을 낸다.
-				// 오프셋 = 전체 - 찢어진 조각 길이 = 마지막 정상 개행 직후(선행 개행이 없으면 0).
-				return out, int64(len(data) - len(parts[i])), nil
-			}
-			return nil, -1, fmt.Errorf("journal 손상(치명): 줄 %d 파싱 불가(개행종료=%v · 마지막=%v)", i, endsNL, isLast)
+			return nil, -1, fmt.Errorf("journal 손상(치명): 개행 종료된 완전한 줄 %d 파싱 불가(중간·완전줄 손상은 torn tail이 아니다)", i)
 		}
 		out[r.RequestID] = r
 	}
-	return out, -1, nil
+	return out, truncateTo, nil
 }
 
 // Close는 journal·lock 파일을 닫는다(flock도 해제된다).
