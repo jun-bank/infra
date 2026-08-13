@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -253,9 +255,16 @@ func (p *composePlan) promote(ctx context.Context, slot string, injected map[str
 // 그 record가 곧 "그 슬롯이 지금 돌리고 있는 것"이다. injected·이미지 placeholder도 그 record의
 // 문맥으로 넣는다(이번 배포의 주입값을 쓰면 남의 컨테이너를 우리 값으로 해석하게 된다).
 //
-// 과도기 fallback은 **record가 없을 때뿐**이다(아직 동봉으로 뜬 적 없는 슬롯). applied가
-// 손상됐을 때는 fallback하지 않는다 — 그때는 "record가 없다"가 아니라 "알 수 없다"이고,
-// 알 수 없는 채로 옛 파일을 들고 down하는 것이 정확히 막으려는 동작이다.
+// 호스트 compose 파일로의 폴백은 **legacy opt-in이 켜져 있을 때만** 허용한다. 그 경로가
+// 필요한 상황은 하나뿐이다 — 이관 중 첫 동봉 배포에서 구 컨테이너가 아직 legacy로 떠 있는
+// 때. 그 창을 opt-in으로 막지 않으면, 동봉 배포가 **서명되지 않은 호스트 파일로 down하는**
+// fail-open이 상시로 열려 있게 된다(결박의 목적이 정확히 그것을 막는 것이다).
+//
+// 폴백하지 않는 경우가 셋이고 전부 fail-closed다:
+//
+//	applied 손상  — "record가 없다"가 아니라 "알 수 없다".
+//	record 부재 + opt-in 없음 — 위 창 밖의 record 부재는 정상 상태가 아니다.
+//	세대 파일 무결성 실패 — 아래 재해시 참조.
 func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecutor, error) {
 	target := string(p.manifest.Target)
 	applied, err := p.rt.Workspace.Applied(target)
@@ -270,15 +279,29 @@ func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecut
 		}
 	}
 	if found == nil {
-		// 이 슬롯이 동봉 경로로 뜬 적이 없다(이관 첫 배포) — 기존 배선으로 내린다.
+		// 이 슬롯이 동봉 경로로 뜬 적이 없다. 이관 과도기(구 컨테이너가 legacy로 떠 있는
+		// 첫 동봉 배포)에서만 기존 배선으로 내린다 — 그 밖에서는 거절이다.
+		if !p.rt.AllowLegacy {
+			return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 applied record가 없다 — 동봉 배포에서 서명되지 않은 호스트 compose 파일로 down하지 않는다(이관 과도기라면 %s=1로 명시 허용한다 · fail-closed)", ErrComposeStorage, slot, "DEPLOY_ALLOW_LEGACY_COMPOSE")
+		}
 		if fallback == nil {
 			return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 정의도, 기존 배선도 없다", ErrComposeWiring, slot)
 		}
+		log.Printf("경고: %s — 구 active 슬롯(%s)에 applied record가 없어 호스트 compose 파일로 내린다(이관 과도기 전용 · target=%s requestId=%s)",
+			ComposePathLegacy, slot, target, p.manifest.RequestID)
 		return fallback, nil
 	}
 	path := p.rt.Workspace.CandidatePath(target, slot, found.Revision)
-	if _, serr := os.Stat(path); serr != nil {
-		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일이 없다(rev=%s) — 무엇을 내리는지 증명할 수 없다: %v", ErrComposeStorage, slot, shortRev(found.Revision), serr)
+	// 존재 확인만으로는 부족하다: 세대 파일은 파일명이 곧 내용 해시라는 계약 위에 서 있고,
+	// 그 계약은 **파일을 실제로 읽어 재대조할 때만** 증명된다(WriteCandidate의 기존 파일
+	// 재해시와 같은 수법). 변조·절단된 파일을 이름만 믿고 넘기면, 우리가 "그 슬롯이 돌리는
+	// 정의"라고 부르는 것이 사실은 누군가 바꿔 놓은 것이 된다.
+	body, rerr := os.ReadFile(path) //nolint:gosec // workspace 안에서 해시로 결정된 경로
+	if rerr != nil {
+		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일을 읽을 수 없다(rev=%s) — 무엇을 내리는지 증명할 수 없다: %v", ErrComposeStorage, slot, shortRev(found.Revision), rerr)
+	}
+	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != found.Revision {
+		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일이 기록된 revision과 다르다(기대=%s 실제=%s) — 변조·절단된 정의로 down하지 않는다(legacy 폴백도 하지 않는다)", ErrComposeStorage, slot, shortRev(found.Revision), shortRev(hex.EncodeToString(sum[:])))
 	}
 	kv := make([]string, 0, len(found.Injected))
 	for k, v := range found.Injected {

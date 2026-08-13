@@ -582,6 +582,26 @@ func newBGEmbedRig(t *testing.T, active Slot) *bgEmbedRig {
 	return r
 }
 
+// seedActive는 구 active 슬롯이 **동봉 경로로 떠 있는** 정상 상태를 만든다(이관이 끝난
+// 뒤의 모습). 이것을 만들지 않으면 구 active의 실행 정의를 확정할 수 없어 배포가 거절되는데,
+// 그 거절이야말로 E-7a가 세운 계약이므로 시나리오마다 명시적으로 깔아 준다.
+func (r *bgEmbedRig) seedActive(t *testing.T, slot, hostPort string) string {
+	t.Helper()
+	body := embeddedCompose + "# " + slot + " 세대\n"
+	rev := revHexOf(body)
+	if _, err := r.ws.WriteCandidate("core", slot, rev, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ws.Promote("core", compose.AppliedRecord{
+		Revision: rev, Slot: slot, ImageDigest: validDigest, CommitSHA: "c0",
+		RequestID: "req-0", TS: "t", Injected: map[string]string{"DEPLOY_HOST_PORT": hostPort},
+		Status: compose.StatusApplied,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rev
+}
+
 func (r *bgEmbedRig) dispatcher() LocalDispatcher {
 	return LocalDispatcher{
 		Repos:       repos(),
@@ -598,6 +618,7 @@ func (r *bgEmbedRig) dispatcher() LocalDispatcher {
 // slot이 그 idle이다(슬롯이 뒤바뀌면 복원이 엉뚱한 쪽을 되살린다).
 func TestBlueGreenEmbeddedCompletes(t *testing.T) {
 	r := newBGEmbedRig(t, SlotBlue) // active=blue → idle=green
+	r.seedActive(t, "blue", "18081")
 	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
 	if st != StateCompleted || err != nil {
 		t.Fatalf("state=%v err=%v, COMPLETED 기대", st, err)
@@ -617,14 +638,18 @@ func TestBlueGreenEmbeddedCompletes(t *testing.T) {
 	if aerr != nil {
 		t.Fatal(aerr)
 	}
-	if len(applied) != 1 || applied[0].Slot != "green" {
-		t.Fatalf("승격 record의 slot이 idle이 아니다: %+v", applied)
+	if applied[0].Slot != "green" {
+		t.Fatalf("승격 record의 slot이 idle이 아니다: %+v", applied[0])
+	}
+	if len(applied) != 2 || applied[1].Slot != "blue" {
+		t.Fatalf("직전 정상본(구 active)이 밀려났다: %+v", applied)
 	}
 }
 
 // E-6 ⑵: 전환 **전** 실패(헬스 미달) — 승격이 없고 candidate만 잔류한다. 라우트도 옮기지 않는다.
 func TestBlueGreenEmbeddedFailsBeforeCutover(t *testing.T) {
 	r := newBGEmbedRig(t, SlotBlue)
+	r.seedActive(t, "blue", "18081")
 	r.greenH = fakeHealth{name: "green", err: errors.New("헬스 미달")}
 
 	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
@@ -638,8 +663,10 @@ func TestBlueGreenEmbeddedFailsBeforeCutover(t *testing.T) {
 	if aerr != nil {
 		t.Fatal(aerr)
 	}
-	if len(applied) != 0 {
-		t.Fatalf("전환 전 실패가 승격됐다: %+v", applied)
+	for _, rec := range applied {
+		if rec.Slot == "green" {
+			t.Fatalf("전환 전 실패가 승격됐다: %+v", rec)
+		}
 	}
 	if _, serr := os.Stat(r.ws.CandidatePath("core", "green", revHexOf(embeddedCompose))); serr != nil {
 		t.Fatalf("candidate는 잔류해야 한다(무해·GC 대상): %v", serr)
@@ -708,16 +735,107 @@ func TestActiveSlotDownRefusesLegacyFallbackOnCorruptApplied(t *testing.T) {
 	}
 }
 
-// record가 아직 없는 슬롯(이관 첫 배포)은 기존 배선으로 내린다 — 과도기 폴백은 여기 하나뿐이다.
-func TestActiveSlotFallsBackWhenNoRecordYet(t *testing.T) {
-	r := newBGEmbedRig(t, SlotBlue)
-	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
-	if st != StateCompleted || err != nil {
-		t.Fatalf("state=%v err=%v", st, err)
+// E-7a: record 부재 시의 호스트 compose 폴백은 **legacy opt-in에서만** 열린다.
+//
+// 그 경로가 필요한 상황은 하나뿐이다 — 이관 중 첫 동봉 배포에서 구 컨테이너가 아직 legacy로
+// 떠 있는 때. opt-in으로 막지 않으면 동봉 배포가 서명되지 않은 호스트 파일로 down하는
+// fail-open이 상시로 열려 있게 되고, 그것이 이 결박이 막으려는 바로 그 동작이다.
+func TestActiveSlotFallbackRequiresLegacyOptIn(t *testing.T) {
+	t.Run("opt-in 없으면 거부", func(t *testing.T) {
+		r := newBGEmbedRig(t, SlotBlue)
+		st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+		if st != StateUnexecuted || !errors.Is(err, ErrComposeStorage) {
+			t.Fatalf("state=%v err=%v, UNEXECUTED·저장 무결성 기대(서명 안 된 파일로 down 금지)", st, err)
+		}
+		if r.blue.downs != 0 || r.green.ups != 0 {
+			t.Fatalf("거부인데 실행이 일어났다: blue.down=%d green.up=%d", r.blue.downs, r.green.ups)
+		}
+	})
+	t.Run("opt-in이면 과도기 폴백", func(t *testing.T) {
+		r := newBGEmbedRig(t, SlotBlue)
+		r.runtime.AllowLegacy = true
+		st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+		if st != StateCompleted || err != nil {
+			t.Fatalf("state=%v err=%v", st, err)
+		}
+		if r.blue.downs != 1 {
+			t.Fatalf("과도기 폴백이 동작하지 않았다(down %d회)", r.blue.downs)
+		}
+		// 동봉 검증 자체는 여전히 온전하다(opt-in은 폴백 창만 연다).
+		applied, _ := r.ws.Applied("core")
+		if len(applied) != 1 || applied[0].Slot != "green" {
+			t.Fatalf("폴백 경로에서 승격이 어긋났다: %+v", applied)
+		}
+	})
+}
+
+// E-7b: 세대 파일은 **파일명이 곧 내용 해시**라는 계약 위에 서 있고, 그 계약은 파일을 실제로
+// 읽어 재대조할 때만 증명된다. 존재 확인만 하면 변조·절단된 파일을 이름만 믿고 "그 슬롯이
+// 돌리는 정의"로 쓰게 된다.
+func TestActiveSlotGenerationFileIsRehashed(t *testing.T) {
+	setup := func(t *testing.T) (*bgEmbedRig, string, string) {
+		t.Helper()
+		r := newBGEmbedRig(t, SlotBlue)
+		oldCompose := embeddedCompose + "# 이전 세대\n"
+		oldRev := revHexOf(oldCompose)
+		if _, err := r.ws.WriteCandidate("core", "blue", oldRev, []byte(oldCompose)); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.ws.Promote("core", compose.AppliedRecord{
+			Revision: oldRev, Slot: "blue", ImageDigest: validDigest, CommitSHA: "c0",
+			RequestID: "req-0", TS: "t", Injected: map[string]string{"DEPLOY_HOST_PORT": "18081"},
+			Status: compose.StatusApplied,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return r, oldRev, r.ws.CandidatePath("core", "blue", oldRev)
 	}
-	if r.blue.downs != 1 {
-		t.Fatalf("record 없는 슬롯이 기존 배선으로 내려가지 않았다(down %d회)", r.blue.downs)
-	}
+
+	t.Run("정상 세대 파일은 통과", func(t *testing.T) {
+		r, oldRev, path := setup(t)
+		st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+		if st != StateCompleted || err != nil {
+			t.Fatalf("state=%v err=%v", st, err)
+		}
+		if downExec, ok := r.bound["blue|"+path]; !ok || downExec.downs != 1 {
+			t.Fatalf("정상 세대 파일인데 결박 down이 일어나지 않았다(rev=%s · 결박된 것 %v)", oldRev[:8], boundKeys(r.bound))
+		}
+	})
+
+	t.Run("1바이트 변조 = 거부", func(t *testing.T) {
+		r, _, path := setup(t)
+		body, rerr := os.ReadFile(path)
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		tampered := append([]byte(nil), body...)
+		tampered[len(tampered)-2] ^= 0x01 // 1비트만 뒤집는다(길이도 그대로)
+		if werr := os.WriteFile(path, tampered, 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+
+		st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+		if st != StateUnexecuted || !errors.Is(err, ErrComposeStorage) {
+			t.Fatalf("state=%v err=%v, UNEXECUTED·저장 무결성 기대", st, err)
+		}
+		if r.blue.downs != 0 {
+			t.Fatalf("변조된 정의인데 legacy 배선으로 폴백해 down했다(%d회) — 폴백 금지 계약 위반", r.blue.downs)
+		}
+		if r.green.ups != 0 {
+			t.Fatalf("변조 거부인데 배포가 진행됐다(up %d회)", r.green.ups)
+		}
+	})
+
+	t.Run("절단 = 거부", func(t *testing.T) {
+		r, _, path := setup(t)
+		if werr := os.WriteFile(path, []byte("services:"), 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+		st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+		if st != StateUnexecuted || !errors.Is(err, ErrComposeStorage) {
+			t.Fatalf("state=%v err=%v, UNEXECUTED·저장 무결성 기대", st, err)
+		}
+	})
 }
 
 // --- E-2 승격 실패의 가시화 ----------------------------------------------------
