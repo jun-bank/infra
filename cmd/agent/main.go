@@ -31,6 +31,9 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"net"
+
+	"github.com/jun-bank/infra/internal/agentrpc"
 	"github.com/jun-bank/infra/internal/auth"
 	"github.com/jun-bank/infra/internal/compose"
 	"github.com/jun-bank/infra/internal/deploy"
@@ -38,6 +41,13 @@ import (
 	"github.com/jun-bank/infra/internal/httpentry"
 	"github.com/jun-bank/infra/internal/store"
 )
+
+// defaultRPCTimeout은 main→위성 RPC 요청 하나의 상한이다(AGENT_RPC_TIMEOUT으로 덮어쓴다).
+// ⚠️ [구현 검증]: 실제 위성 dispatch(pull+up+헬스)가 이 안에 끝나야 COMPLETED가 돌아온다 —
+// 넘으면 main은 dial 후 timeout으로 UNKNOWN을 받고 락을 유지한다(위성은 background로 계속
+// 실행해 원장에 terminal을 남기지만 조각 A는 자동 재조회가 없어 사람이 받는다). 위성 배포
+// 소요와 함께 sizing한다(기본 6분은 defaultDeployLease와 같은 축의 합리 가정).
+const defaultRPCTimeout = 6 * time.Minute
 
 // defaultDeployLease는 배포 창 락의 기본 lease다(AGENT_DEPLOY_LEASE로 덮어쓴다). ⚠️ 이
 // 값은 [구현 검증]이다 — 한 배포 시퀀스를 넉넉히 덮으면서 죽은 주체를 오래 붙들지 않는
@@ -304,14 +314,68 @@ func buildCoordinator(st *store.SQLStore) (deploy.Coordinator, error) {
 		return nil, err
 	}
 
+	// target 라우팅(design D1 · 조각 A) — coordinator 앞에 RoutingDispatcher를 두어 core·gateway는
+	// 로컬 실행(.9 자기 배포), settlement·ledger는 원격 위성(HTTP+HMAC)으로 위임한다. coordinator·
+	// 락·모드·이력은 무접촉이다(대칭 인터페이스에 dispatcher만 교체).
+	routing, err := buildRoutingDispatcher(b.disp)
+	if err != nil {
+		return nil, fmt.Errorf("target 라우팅 dispatcher 조립: %w", err)
+	}
+
 	return deploy.NewCoordinator(deploy.Deps{
 		Mode:       st,
 		Lock:       st,
 		History:    st,
-		Dispatcher: b.disp, // 실행 지점 — pull → up → CD-1 헬스 → (게이트웨이 설정 시) 전환 → 드레인 → 구 slot 종료
+		Dispatcher: routing, // core·gateway → 로컬 · settlement·ledger → 원격 위성(미등록=fail-closed)
 		HolderID:   holderID,
 		Lease:      lease,
 	}), nil
+}
+
+// buildRoutingDispatcher는 target→dispatcher 표를 환경에서 조립한다(design D1 · D4). core·gateway는
+// 넘겨받은 로컬 dispatcher(b.disp)로 간다. settlement·ledger는 각 위성별 키·URL이 **둘 다** 설정된
+// 경우에만 원격 dispatcher로 등록한다 — 한쪽만 있으면 오설정으로 보고 기동을 거부하고(fail-closed),
+// 둘 다 없으면 미등록으로 두어 그 target 배포가 RoutingDispatcher에서 부작용 0으로 거절되게 한다
+// (design D4 "미설정 = 그 target 배포 거절"). 키는 게이트1(AGENT_HMAC_KEY)·gateway
+// (GATEWAY_INTERNAL_HMAC_KEY)와 **별도**다(신뢰 경계 분리).
+func buildRoutingDispatcher(local deploy.Dispatcher) (deploy.Dispatcher, error) {
+	timeout, err := envDuration("AGENT_RPC_TIMEOUT", defaultRPCTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("AGENT_RPC_TIMEOUT은 >0 이어야 한다(fail-closed): %s", timeout)
+	}
+
+	routes := map[deploy.Target]deploy.Dispatcher{
+		deploy.TargetCore:    local,
+		deploy.TargetGateway: local,
+	}
+
+	for _, sat := range []struct {
+		target         deploy.Target
+		keyEnv, urlEnv string
+	}{
+		{deploy.TargetSettlement, "AGENT_RPC_KEY_SETTLEMENT", "AGENT_REMOTE_URL_SETTLEMENT"},
+		{deploy.TargetLedger, "AGENT_RPC_KEY_LEDGER", "AGENT_REMOTE_URL_LEDGER"},
+	} {
+		key := os.Getenv(sat.keyEnv)
+		rawURL := strings.TrimSpace(os.Getenv(sat.urlEnv))
+		// 둘 다 비었으면 미등록(그 target 배포는 라우터에서 fail-closed 거절). 한쪽만 있으면 오설정.
+		if strings.TrimSpace(key) == "" && rawURL == "" {
+			continue
+		}
+		if strings.TrimSpace(key) == "" || rawURL == "" {
+			return nil, fmt.Errorf("%s와 %s는 함께 설정한다(한쪽만 설정 = 오설정 · fail-closed)", sat.keyEnv, sat.urlEnv)
+		}
+		rd, rerr := agentrpc.NewRemoteDispatcher(rawURL, []byte(key), timeout, sat.target)
+		if rerr != nil {
+			return nil, fmt.Errorf("원격 dispatcher 조립(%s): %w", sat.target, rerr)
+		}
+		routes[sat.target] = rd
+	}
+
+	return deploy.NewRoutingDispatcher(routes)
 }
 
 // defaultHealth*는 CD-1 준비성 프로브의 기본값이다(모두 [구현 검증] CDV-1 — 실측으로
@@ -675,10 +739,106 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 	return d, nil
 }
 
-// runAgent는 ROLE=agent의 실행자 역할이다. 아직 미구현이므로 기동을 거부한다
-// (fail-closed — 다음 마일스톤에서 채운다).
+// runAgent는 ROLE=agent(위성 .158·.164)의 실행자다(infra#34 조각 A · DO-22·DO-23). main에서
+// 서명된 배포 명령을 **LAN 전용**으로 수신하고(R7 bind), RPC 서명을 검증한 뒤(위성 자기 키)
+// AGENT_TARGET 결박(R5)·crash-safe 원장(R3)을 지나 internal/dispatch를 재사용하는 로컬 실행
+// 지점으로 자기 호스트를 배포한다(B5/G2). 응답도 HMAC 서명한다(R1). 자동 재개·위성 fencing
+// guard는 이 슬라이스 밖이다(조각 C·B).
 func runAgent() error {
-	// TODO(다음 마일스톤): 메인에서 서명된 명령을 LAN 전용으로 수신하고(DO-22),
-	// 서명 검증 통과 후 internal/dispatch로 자기 호스트의 특권 조작을 실행한다(DO-23).
-	return errors.New("ROLE=agent 미구현 (다음 마일스톤)")
+	target, err := resolveAgentTarget(os.Getenv("AGENT_TARGET"))
+	if err != nil {
+		return err
+	}
+	key := os.Getenv("AGENT_RPC_KEY")
+	if strings.TrimSpace(key) == "" {
+		return errors.New("AGENT_RPC_KEY 미설정(공백뿐도 불가) — 위성 RPC 서명 키가 없으면 수신을 인증할 수 없다(fail-closed). 게이트1 AGENT_HMAC_KEY와는 별도 키다")
+	}
+	listenAddr, err := agentrpc.ValidateListenAddr(os.Getenv("AGENT_LISTEN_ADDR"))
+	if err != nil {
+		return err
+	}
+	ledgerPath := strings.TrimSpace(os.Getenv("AGENT_LEDGER_PATH"))
+	if ledgerPath == "" {
+		return errors.New("AGENT_LEDGER_PATH 미설정 — crash-safe 원장을 둘 곳이 없으면 멱등·재기동 안전을 보증할 수 없다(fail-closed · R3)")
+	}
+
+	// 로컬 실행 지점을 main과 같은 조립기로 만든다(B5/G2 — 실행 로직 중복 0). 위성은 게이트웨이
+	// 미설정(DEPLOY_GATEWAY_URL 없음)이므로 단일 경로 LocalDispatcher가 조립된다.
+	b, err := buildDispatcher()
+	if err != nil {
+		return fmt.Errorf("위성 로컬 실행 지점(dispatcher) 조립: %w", err)
+	}
+
+	ledger, err := agentrpc.OpenLedger(ledgerPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ledger.Close() }()
+
+	// background 실행 상한(R7) — 요청 ctx와 분리된 dispatch가 한 배포를 넉넉히 덮게 한다:
+	// pull+up(phaseBudget) + 헬스(D) + 실패 시 cleanup + slack. lease가 아니라 이 예산이 위성
+	// 실행을 감싼다(위성엔 배포 창 락이 없다 — 그건 main coordinator 소유).
+	execBudget := b.phaseBudget + b.healthDeadline + deploy.CleanupTimeout + dispatchLeaseSlack
+
+	handler, err := agentrpc.Handler(agentrpc.ServerConfig{
+		Target:     deploy.Target(target),
+		Key:        []byte(key),
+		Dispatcher: b.disp,
+		Ledger:     ledger,
+		ExecBudget: execBudget,
+	})
+	if err != nil {
+		return fmt.Errorf("위성 RPC 핸들러 조립: %w", err)
+	}
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("위성 RPC LAN bind 실패(%s): %w", listenAddr, err)
+	}
+	// R7 — 리스너의 **실제** 주소가 LAN literal private IP인지 한 번 더 확인한다(bind 후 주소 확인).
+	if _, verr := agentrpc.ValidateListenAddr(ln.Addr().String()); verr != nil {
+		_ = ln.Close()
+		return fmt.Errorf("위성 리스너 실제 주소가 LAN literal이 아니다(%s): %w", ln.Addr(), verr)
+	}
+
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second, // slowloris 완화 — [구현 검증]
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		fmt.Printf("jun-bank deploy-agent · ROLE=agent · target=%s · listen: %s\n", target, ln.Addr())
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	}
+}
+
+// resolveAgentTarget은 AGENT_TARGET을 검증한다(R5). 위성은 settlement|ledger만 담당한다 —
+// 빈 값·미지원·core·gateway는 오류다(fail-closed — 대상이 정해지지 않은 채 실행자를 열지 않는다).
+func resolveAgentTarget(raw string) (deploy.Target, error) {
+	t := deploy.Target(strings.TrimSpace(raw))
+	switch t {
+	case deploy.TargetSettlement, deploy.TargetLedger:
+		return t, nil
+	case "":
+		return "", errors.New("AGENT_TARGET 미설정 (.env에 AGENT_TARGET=settlement 또는 ledger 를 둔다 — R5 오배선 방어)")
+	default:
+		return "", fmt.Errorf("AGENT_TARGET 미지원: %q (settlement|ledger 중 하나여야 한다 · core·gateway는 .9 로컬 배포)", raw)
+	}
 }
