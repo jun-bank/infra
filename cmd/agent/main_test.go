@@ -167,6 +167,9 @@ func setRequiredDispatchEnv(t *testing.T) {
 	t.Setenv("DEPLOY_COMPOSE_PROJECT", "core-green")
 	t.Setenv("DEPLOY_HEALTH_URL", "http://127.0.0.1:8080/ready")
 	t.Setenv("IMAGE_CORE", "registry.example/core")
+	// 동봉이 기본이므로 CP-3의 호스트 값과 image 변수명은 기동 필수다(E-4).
+	t.Setenv("DEPLOY_APP_SERVICE", "app")
+	t.Setenv("DEPLOY_IMAGE_ENV", "CORE_IMAGE")
 	setWorkspaceEnv(t)
 }
 
@@ -229,7 +232,8 @@ func setBlueGreenEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("IMAGE_CORE", "registry.example/core")
 	t.Setenv("DEPLOY_GATEWAY_URL", "http://127.0.0.1:8090")
-	t.Setenv("DEPLOY_APP_SERVICE", "app") // #21 — 블루-그린 모드에서는 필수
+	t.Setenv("DEPLOY_APP_SERVICE", "app")      // #21 — 블루-그린 모드에서는 필수
+	t.Setenv("DEPLOY_IMAGE_ENV", "CORE_IMAGE") // E-4 — 동봉 필수 배선에서는 기동 필수
 	setWorkspaceEnv(t)
 	t.Setenv("DEPLOY_HOST_PORT_BLUE", "18081")
 	t.Setenv("DEPLOY_HOST_PORT_GREEN", "18082")
@@ -388,10 +392,22 @@ func TestBuildDispatcherSinglePathAppServiceOptional(t *testing.T) {
 		return x
 	}
 
-	t.Run("미설정이면 결박 없음", func(t *testing.T) {
+	// ⚠️ 전제 변경(리뷰 E-4): DEPLOY_APP_SERVICE가 선택인 것은 **과도기 배선에서뿐**이다.
+	// 동봉이 필수인 기본 배선에서는 CP-3의 호스트 쪽 값이 없으면 대조할 상대가 없으므로
+	// 기동이 거부된다 — 아래 두 케이스가 그 경계를 함께 못박는다.
+	t.Run("동봉 필수 배선에서는 미설정이 기동 거부", func(t *testing.T) {
 		setRequiredDispatchEnv(t)
 		t.Setenv("DEPLOY_GATEWAY_URL", "")
 		t.Setenv("DEPLOY_APP_SERVICE", "")
+		if _, err := buildDispatcher(); err == nil {
+			t.Fatal("동봉 필수인데 DEPLOY_APP_SERVICE 없이 조립됐다(CP-3 대조 상대 부재)")
+		}
+	})
+	t.Run("과도기 배선에서는 미설정이면 결박 없음", func(t *testing.T) {
+		setRequiredDispatchEnv(t)
+		t.Setenv("DEPLOY_GATEWAY_URL", "")
+		t.Setenv("DEPLOY_APP_SERVICE", "")
+		t.Setenv("DEPLOY_ALLOW_LEGACY_COMPOSE", "1")
 		if got := singleExec(t).AppService(); got != "" {
 			t.Fatalf("미설정인데 결박=%q", got)
 		}

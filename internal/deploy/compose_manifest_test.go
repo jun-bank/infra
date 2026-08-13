@@ -229,3 +229,53 @@ func TestLenientParserStillLenientForTargetExtraction(t *testing.T) {
 		t.Fatalf("관용 파서가 미지 필드에서 실패했다(락 이전 target 추출 계약): m=%+v err=%v", m, err)
 	}
 }
+
+// E-5: 최상위 키는 canonical 문자열 8개뿐이다. encoding/json의 필드 매칭이 **대소문자를
+// 무시하기 때문에** DisallowUnknownFields만으로는 부족하다: `{"COMPOSECONTENT":…}`는
+// 구조체 필드에 매칭되어 미지 필드로 걸리지 않고 값이 실린다. 그러면 2분법의 판정 소스가
+// 둘로 갈린다 — 키 존재 검사(정확 문자열)는 "없다"고 보는데 디코드 값은 "있다"가 되어,
+// 부분 조합이 legacy로 접힌 채 내용은 실려 있는 상태가 만들어진다.
+func TestCanonicalKeyAllowlist(t *testing.T) {
+	variants := []string{
+		`"COMPOSECONTENT":"` + b64(manifestCompose) + `","appService":"app"`,
+		`"ComposeContent":"` + b64(manifestCompose) + `","appService":"app"`,
+		`"composecontent":"` + b64(manifestCompose) + `","appService":"app"`,
+		`"composeContent":"` + b64(manifestCompose) + `","APPSERVICE":"app"`,
+		`"AppService":"app","composeContent":"` + b64(manifestCompose) + `"`,
+		`"TARGET":"gateway"`,
+		`"RequestId":"other"`,
+	}
+	for _, v := range variants {
+		name := v
+		if len(name) > 24 {
+			name = name[:24]
+		}
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseManifestStrict(bodyOf(v))
+			if !errors.Is(err, ErrManifestJSONStrict) {
+				t.Fatalf("대소문자 변형 키가 canonical allowlist에 걸리지 않았다: %v", err)
+			}
+		})
+	}
+	// canonical 8칸은 그대로 통과한다(allowlist가 정당한 입력을 막지 않는다).
+	if _, err := ParseManifestStrict(embeddedBody()); err != nil {
+		t.Fatalf("canonical 키만 쓴 body가 거절됐다: %v", err)
+	}
+}
+
+// U-33: base64 마지막 그룹의 **잉여 비트**. `QR==`는 디코드는 되지만 패딩 앞 문자가 담은
+// 비트 중 일부가 버려지므로 같은 바이트를 여러 문자열이 표현하게 된다 — Strict 디코드와
+// 재인코딩 대조가 함께 그 다중 표현을 닫는다.
+func TestBase64RejectsNonZeroTrailingBits(t *testing.T) {
+	// "A" 한 바이트의 canonical 표현은 "QQ==". "QR=="은 잉여 비트가 0이 아닌 변형이다.
+	if base64.StdEncoding.EncodeToString([]byte("A")) != "QQ==" {
+		t.Fatal("픽스처 전제가 깨졌다")
+	}
+	body := []byte(`{"target":"core","commitSha":"c1","imageDigest":"` + validDigest + `",` +
+		`"composeRevision":"sha256:` + sha256Hex("A") + `",` +
+		`"configVersion":"v1","requestId":"req-1",` +
+		`"composeContent":"QR==","appService":"app"}`)
+	if _, err := ParseManifestStrict(body); !errors.Is(err, ErrManifestComposeEncoding) {
+		t.Fatalf("잉여 비트가 0이 아닌 base64가 통과했다(또는 다른 이유로 거절): %v", err)
+	}
+}

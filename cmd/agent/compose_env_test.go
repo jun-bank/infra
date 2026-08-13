@@ -198,8 +198,10 @@ func TestBuildDispatcherWiresComposeRuntime(t *testing.T) {
 		t.Fatalf("슬롯별 호스트 포트 배선=%v", rt.HostPort)
 	}
 	p := rt.Policy(deploy.TargetCore)
-	if p.ImageEnvVar != dispatch.DefaultImageEnvVar {
-		t.Fatalf("image 변수명=%q, 실행기 기본값과 같아야 한다", p.ImageEnvVar)
+	// 정본 compose가 쓰는 변수명 그대로여야 한다 — 검증기와 실행기가 다른 이름을 보면
+	// 통과한 compose를 실행기가 채우지 못한다(주입 실패 = 빈 image).
+	if p.ImageEnvVar != "CORE_IMAGE" {
+		t.Fatalf("image 변수명=%q, DEPLOY_IMAGE_ENV 값과 같아야 한다", p.ImageEnvVar)
 	}
 	if len(p.EnvAllow) != 1 || p.EnvAllow[0] != "CORE_BLUE_URI" {
 		t.Fatalf("등재 env 키=%v", p.EnvAllow)
@@ -233,5 +235,60 @@ func TestBuildDispatcherWiresComposeRuntime(t *testing.T) {
 	}
 	if _, _, uerr := rt.Bind("unknown-slot", deploy.ComposeBinding{ComposeFile: "/a/b.yml", ProjectDirectory: "/a"}); uerr == nil {
 		t.Fatal("배선 없는 슬롯이 결박됐다")
+	}
+}
+
+// E-4: 동봉이 필수인 배선(= legacy opt-in 꺼짐)에서는 CP-3의 호스트 값과 image 변수명이
+// **기동 필수**다. 둘 다 동봉 검증의 입력이라, 없으면 검증이 성립하지 않는다 —
+// DEPLOY_APP_SERVICE가 비면 서명된 appService와 대조할 상대가 없고, DEPLOY_IMAGE_ENV가
+// 기본값에 기대면 정본 compose가 쓰는 변수명(.9: CORE_IMAGE)과 어긋난 채 기동해 그 어긋남이
+// 매 배포의 검증 실패로만 드러난다.
+func TestBootRequiresAppServiceAndImageEnvWhenEmbeddedRequired(t *testing.T) {
+	for _, mode := range []struct {
+		name  string
+		setup func(*testing.T)
+	}{
+		{"단일 경로", func(t *testing.T) { setRequiredDispatchEnv(t); t.Setenv("DEPLOY_GATEWAY_URL", "") }},
+		{"블루-그린", func(t *testing.T) { setBlueGreenEnv(t) }},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			for _, missing := range []string{"DEPLOY_APP_SERVICE", "DEPLOY_IMAGE_ENV"} {
+				t.Run(missing+" 미설정 = 기동 거부", func(t *testing.T) {
+					mode.setup(t)
+					t.Setenv(missing, "")
+					if _, err := buildDispatcher(); err == nil {
+						t.Fatalf("%s 없이 동봉 필수 배선이 조립됐다", missing)
+					}
+				})
+				t.Run(missing+" 공백뿐 = 기동 거부", func(t *testing.T) {
+					mode.setup(t)
+					t.Setenv(missing, "   ")
+					if _, err := buildDispatcher(); err == nil {
+						t.Fatalf("%s가 공백뿐인데 조립됐다", missing)
+					}
+				})
+			}
+			t.Run("둘 다 있으면 조립", func(t *testing.T) {
+				mode.setup(t)
+				if _, err := buildDispatcher(); err != nil {
+					t.Fatalf("정상 배선인데 거부: %v", err)
+				}
+			})
+			// 과도기 opt-in에서는 둘 다 선택으로 돌아간다(기존 호스트를 막지 않는다).
+			t.Run("legacy opt-in이면 선택", func(t *testing.T) {
+				mode.setup(t)
+				t.Setenv("DEPLOY_IMAGE_ENV", "")
+				t.Setenv("DEPLOY_ALLOW_LEGACY_COMPOSE", "1")
+				if mode.name == "블루-그린" {
+					// #21 결박은 블루-그린에서 여전히 필수다(동봉과 별개 축).
+					t.Setenv("DEPLOY_APP_SERVICE", "app")
+				} else {
+					t.Setenv("DEPLOY_APP_SERVICE", "")
+				}
+				if _, err := buildDispatcher(); err != nil {
+					t.Fatalf("과도기 배선인데 거부: %v", err)
+				}
+			})
+		})
 	}
 }

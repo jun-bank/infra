@@ -148,6 +148,13 @@ func buildComposeRuntime(appService, imageEnvVar string, hostPorts map[string]st
 		return nil, err
 	}
 
+	// 호스트 포트가 하나도 배선되지 않았으면 한 줄 남긴다(리뷰 E-11). 기동을 막지는 않는다 —
+	// ports를 선언하지 않는 compose도 유효하기 때문이다. 다만 ports를 쓰는 compose가 오면 그
+	// 배포는 실패하므로, 그 실패를 배포 시점이 아니라 기동 로그에서 먼저 짐작할 수 있게 한다.
+	if len(hostPorts) == 0 {
+		fmt.Printf("경고: %s·%sBLUE/GREEN이 하나도 설정되지 않았다 — ports를 선언한 동봉 compose는 주입값 부재로 거절된다(ports 없는 compose만 배포한다면 무해)\n", envHostPort, envHostPortPrefix)
+	}
+
 	envAllow, err := parseComposeEnvAllow(os.Getenv(envComposeEnvAllow))
 	if err != nil {
 		return nil, err

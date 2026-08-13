@@ -1,9 +1,12 @@
 package deploy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -101,17 +104,23 @@ func (d LocalDispatcher) composePreflight(m Manifest) (*composePlan, error) {
 		return nil, err
 	}
 
-	// CP-3 — manifest.appService와 호스트 env가 먼저 맞아야 한다. 이 대조가 없으면 서명값이
-	// 호스트의 사후조건 결박 대상과 다른 서비스를 가리켜도 배포가 진행된다(#21이 닫지 못한 축).
-	if m.AppService != rt.AppService {
-		return nil, fmt.Errorf("%w: manifest.appService=%q가 호스트 DEPLOY_APP_SERVICE=%q와 다르다(CP-3 상호 검증)", ErrComposePreflight, m.AppService, rt.AppService)
-	}
-
+	// 구조 allowlist(CP-7)를 CP-3 호스트 대조보다 **먼저** 본다(리뷰 E-8). 순서가 계약인
+	// 이유: 두 위반이 겹친 입력(구조도 틀렸고 호스트 배선과도 다르다)에서 어느 코드가 나오는지가
+	// 진단의 출발점을 정한다. 구조 위반은 "이 compose는 애초에 실행될 수 없다"이고 CP-3
+	// 불일치는 "이 호스트가 배포할 대상이 아니다"라, 전자를 먼저 알려야 CI를 고치러 간다.
+	// 여기서 쓰는 appService는 **manifest의 값**이다 — compose 정의와 서명값이 먼저 맞아야
+	// 하고, 그 다음에 호스트 배선과 맞춘다(3자 일치를 두 단계로 닫는다).
 	policy := rt.Policy(m.Target)
 	policy.AppService = m.AppService
 	spec, verr := compose.Validate(content, policy)
 	if verr != nil {
 		return nil, fmt.Errorf("%w[%s]: %v", ErrComposePreflight, compose.CodeOf(verr), verr)
+	}
+
+	// CP-3 마지막 한 자리 — 서명값과 호스트 env. 이 대조가 없으면 서명값이 호스트의 사후조건
+	// 결박 대상과 다른 서비스를 가리켜도 배포가 진행된다(#21이 닫지 못한 축).
+	if m.AppService != rt.AppService {
+		return nil, fmt.Errorf("%w: manifest.appService=%q가 호스트 DEPLOY_APP_SERVICE=%q와 다르다(CP-3 상호 검증)", ErrComposePreflight, m.AppService, rt.AppService)
 	}
 
 	plan := &composePlan{rt: rt, manifest: m, content: content, revHex: revHex, spec: spec}
@@ -169,6 +178,9 @@ func (p *composePlan) bind(slot string) (HostExecutor, HealthChecker, map[string
 	target := string(p.manifest.Target)
 	cand, werr := p.rt.Workspace.WriteCandidate(target, slot, p.revHex, p.content)
 	if werr != nil {
+		// 분류가 갈리는 자리다(리뷰 E-11): revision 형식 위반은 **요청에서 온 값**이라 422이고,
+		// 저장 무결성 장애는 이 호스트의 디스크 문제라 500이다. 뭉치면 CI가 자기 산출물 대신
+		// 남의 디스크를 의심하거나 그 반대가 된다.
 		if compose.CodeOf(werr) == compose.CodeStorageIntegrity {
 			return nil, nil, nil, fmt.Errorf("%w: %v", ErrComposeStorage, werr)
 		}
@@ -192,10 +204,16 @@ func (p *composePlan) bind(slot string) (HostExecutor, HealthChecker, map[string
 	return exec, health, vals, nil
 }
 
+// ComposePromotionFailed는 배포는 성공했으나 applied 승격이 실패했음을 이력에 남기는
+// 코드다(리뷰 E-2). 배포 결과를 뒤집지 않는 대신 **요청별로 이력에 드러난다** — 그러지
+// 않으면 나중에 "이 배포의 복원 재료가 왜 없는가"를 되짚을 근거가 아무 데도 없다.
+const ComposePromotionFailed = "APPLIED_INDEX_PROMOTION_FAILED"
+
 // promote는 **배포가 성공한 뒤에만** 호출된다(B4'). 승격 실패는 배포 결과를 뒤집지 않는다:
 // 컨테이너는 실제로 떴고 트래픽도 옮겨졌으므로 UNKNOWN으로 접으면 사람을 부르면서도 실상은
-// "복원 재료 기록만 실패"다. 대신 요란하게 로그를 남긴다 — 다음 배포가 다시 기록한다.
-func (p *composePlan) promote(slot string, injected map[string]string) {
+// "복원 재료 기록만 실패"다. 대신 WARN 로그 + 이력 detail 표기를 남긴다 — 다음 배포가
+// 다시 기록하되, 이번에 남기지 못했다는 사실 자체는 사라지지 않는다.
+func (p *composePlan) promote(ctx context.Context, slot string, injected map[string]string) {
 	target := string(p.manifest.Target)
 	rec := compose.AppliedRecord{
 		Revision:    p.revHex,
@@ -205,10 +223,12 @@ func (p *composePlan) promote(slot string, injected map[string]string) {
 		RequestID:   p.manifest.RequestID,
 		TS:          time.Now().UTC().Format(time.RFC3339),
 		Injected:    injected,
-		Status:      "applied",
+		Status:      compose.StatusApplied,
 	}
 	if err := p.rt.Workspace.Promote(target, rec); err != nil {
-		log.Printf("경고: 배포는 성공했으나 applied 인덱스 승격 실패(수동 복원 재료가 이번 배포를 담지 못한다 — 배포 결과는 뒤집지 않는다) target=%s rev=%s: %v", target, p.revHex[:12], err)
+		log.Printf("경고: %s — 배포는 성공했으나 applied 인덱스 승격 실패(수동 복원 재료가 이번 배포를 담지 못한다 · 배포 결과는 뒤집지 않는다) target=%s rev=%s: %v",
+			ComposePromotionFailed, target, p.revHex[:12], err)
+		addWarning(ctx, "composePromotion="+ComposePromotionFailed)
 		return
 	}
 	// GC는 승격 뒤에만 돈다 — 승격 전에 돌리면 방금 쓴 candidate가 pin되기 전에 지워질 수 있다.
@@ -221,6 +241,67 @@ func (p *composePlan) promote(slot string, injected map[string]string) {
 	if err := p.rt.Workspace.GC(target, pinned); err != nil {
 		log.Printf("경고: 세대 GC 실패(무해 — 다음 배포가 재시도한다) target=%s: %v", target, err)
 	}
+}
+
+// bindActive는 **구 active 슬롯을 내릴 실행기**를 그 슬롯이 실제로 떠 있는 정의에 결박한다
+// (리뷰 E-7). 결박 없이 기존 SlotExec로 down하면 `-f`가 이번 배포의 파일도, 그 슬롯이 뜰 때
+// 쓴 파일도 아닌 **호스트의 옛 compose 파일**을 가리킨다 — compose는 프로젝트 라벨로 컨테이너를
+// 찾지만 프로젝트 로드 자체가 그 파일 기준이라, 정의가 어긋나면 down이 무엇을 내리는지가
+// 서명 밖에서 정해진다(동봉 필수 호스트에는 그 파일이 아예 없을 수도 있다).
+//
+// 정의의 출처는 applied 인덱스의 **그 슬롯 최근 record**다: 승격은 배포 성공 뒤에만 일어나므로
+// 그 record가 곧 "그 슬롯이 지금 돌리고 있는 것"이다. injected·이미지 placeholder도 그 record의
+// 문맥으로 넣는다(이번 배포의 주입값을 쓰면 남의 컨테이너를 우리 값으로 해석하게 된다).
+//
+// 과도기 fallback은 **record가 없을 때뿐**이다(아직 동봉으로 뜬 적 없는 슬롯). applied가
+// 손상됐을 때는 fallback하지 않는다 — 그때는 "record가 없다"가 아니라 "알 수 없다"이고,
+// 알 수 없는 채로 옛 파일을 들고 down하는 것이 정확히 막으려는 동작이다.
+func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecutor, error) {
+	target := string(p.manifest.Target)
+	applied, err := p.rt.Workspace.Applied(target)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 정의를 확정할 수 없다(applied 인덱스 손상 — legacy 파일로 폴백하지 않는다): %v", ErrComposeStorage, slot, err)
+	}
+	var found *compose.AppliedRecord
+	for i := range applied {
+		if applied[i].Slot == slot {
+			found = &applied[i]
+			break
+		}
+	}
+	if found == nil {
+		// 이 슬롯이 동봉 경로로 뜬 적이 없다(이관 첫 배포) — 기존 배선으로 내린다.
+		if fallback == nil {
+			return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 정의도, 기존 배선도 없다", ErrComposeWiring, slot)
+		}
+		return fallback, nil
+	}
+	path := p.rt.Workspace.CandidatePath(target, slot, found.Revision)
+	if _, serr := os.Stat(path); serr != nil {
+		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일이 없다(rev=%s) — 무엇을 내리는지 증명할 수 없다: %v", ErrComposeStorage, slot, shortRev(found.Revision), serr)
+	}
+	kv := make([]string, 0, len(found.Injected))
+	for k, v := range found.Injected {
+		kv = append(kv, k+"="+v)
+	}
+	sort.Strings(kv)
+	exec, _, berr := p.rt.Bind(slot, ComposeBinding{
+		ComposeFile:      path,
+		ProjectDirectory: filepath.Dir(path),
+		Injected:         kv,
+	})
+	if berr != nil {
+		return nil, fmt.Errorf("%w: 구 active 슬롯(%s) 실행기 결박 실패: %v", ErrComposeWiring, slot, berr)
+	}
+	return exec, nil
+}
+
+// shortRev는 로그·오류 메시지용 축약 revision이다.
+func shortRev(rev string) string {
+	if len(rev) > 12 {
+		return rev[:12]
+	}
+	return rev
 }
 
 // runningRevisions는 GC가 무조건 pin해야 할 revision들을 준다: 이번 배포의 revision +

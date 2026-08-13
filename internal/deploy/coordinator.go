@@ -227,7 +227,11 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 
 	// 7. 실행 지점(dispatch — #15). 스텁은 UNEXECUTED(부작용 0)를 낸다. 실행 상태를
 	//    이력에 남긴다(DO-16 3상태 기록·조회 골격).
-	state, derr := c.d.Dispatcher.Dispatch(ctx, m, hold.Token())
+	// 경고 채널을 붙여 dispatch에 넘긴다(E-2) — 배포 결과를 뒤집지 않는 사실(예: 승격 실패)을
+	// 이력 detail로 나르는 통로다. 오류로 실으면 (COMPLETED, err)가 되어 모순 조합 정규화가
+	// 정상 배포를 UNKNOWN으로 접고, 로그로만 남기면 이력에 근거가 남지 않는다.
+	dctx, warns := withWarnings(ctx)
+	state, derr := c.d.Dispatcher.Dispatch(dctx, m, hold.Token())
 
 	// dispatch가 정의된 세 상태(UNEXECUTED·COMPLETED·UNKNOWN) 밖의 값(빈 문자열·미지)을 내면
 	// 실행 결과를 신뢰할 수 없다 — UNEXECUTED로 오인해 락을 풀면 fail-open이다. UNKNOWN으로
@@ -245,6 +249,9 @@ func (c coordinator) Orchestrate(ctx context.Context, req Request) Result {
 	// 요청마다 **어느 compose 경로로 배포됐는지**를 이력에 남긴다(G-11 · B5' — 조용한 폴백
 	// 금지). 이 표기가 있어야 "legacy 표기 급증"이라는 이관 순서 위반의 관측 신호가 성립한다.
 	dispatchDetail := "composePath=" + m.ComposePathCode()
+	for _, w := range warns.list() {
+		dispatchDetail += " · " + w
+	}
 	if derr != nil {
 		dispatchDetail += " · " + derr.Error()
 	}

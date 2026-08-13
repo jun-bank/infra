@@ -1,11 +1,13 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -488,4 +490,364 @@ func TestStrictParseRejectsBeforeDispatch(t *testing.T) {
 	if h.last().EventType != "REJECTED" {
 		t.Fatalf("거절이 이력에 남지 않았다: %+v", h.last())
 	}
+}
+
+// --- E-8 preflight 순서 -------------------------------------------------------
+
+// 두 위반이 겹친 입력에서 **어느 방어선이 잡는가**는 진단의 출발점을 정한다. 순서가
+// 흔들리면 같은 입력이 어느 날 다른 코드로 거절되고, 그때 사람은 엉뚱한 곳을 고치러 간다.
+func TestPreflightOrder(t *testing.T) {
+	// I-09: 해시 불일치 + YAML 구조 위반이 동시에 걸린 입력 → **해시**가 먼저다.
+	// 해시가 어긋났다는 것은 "이 바이트는 서명된 것이 아니다"라, 그 내용을 구조로 평가하는
+	// 것 자체가 의미 없다.
+	t.Run("I-09 해시+구조 이중 위반 = 해시", func(t *testing.T) {
+		r := newEmbedRig(t)
+		m := embeddedManifest("services:\n  app:\n    image: ${DEPLOY_IMAGE_REF}\n    privileged: true\n")
+		m.ComposeRevision = "sha256:" + strings.Repeat("0", 64) // 해시도 어긋나게
+		_, err := r.run(m)
+		if !errors.Is(err, ErrManifestComposeHash) {
+			t.Fatalf("해시가 먼저 잡아야 한다: %v", err)
+		}
+	})
+
+	// I-10: 구조 위반 + CP-3 호스트 불일치 → **구조**가 먼저다. 구조 위반은 "이 compose는
+	// 애초에 실행될 수 없다"이고 CP-3 불일치는 "이 호스트가 배포할 대상이 아니다"라,
+	// 전자를 먼저 알려야 CI를 고치러 간다.
+	t.Run("I-10 구조+CP-3 이중 위반 = 구조", func(t *testing.T) {
+		r := newEmbedRig(t)
+		// 서비스명이 host env("app")와 다르고, 그 안에 미지 키까지 있다.
+		m := embeddedManifest("services:\n  other:\n    image: ${DEPLOY_IMAGE_REF}\n    privileged: true\n")
+		m.AppService = "other"
+		_, err := r.run(m)
+		if !errors.Is(err, ErrComposePreflight) {
+			t.Fatalf("preflight 분류가 아니다: %v", err)
+		}
+		if !strings.Contains(err.Error(), compose.CodeUnknownKey) {
+			t.Fatalf("구조 위반 코드가 아니라 다른 방어선이 잡았다: %v", err)
+		}
+	})
+
+	// 구조가 온전하고 CP-3만 어긋나면 그때 CP-3가 잡는다(순서가 CP-3를 삼키지 않는다).
+	t.Run("구조 정상 + CP-3만 불일치 = CP-3", func(t *testing.T) {
+		r := newEmbedRig(t)
+		m := embeddedManifest("services:\n  other:\n    image: ${DEPLOY_IMAGE_REF}\n")
+		m.AppService = "other"
+		_, err := r.run(m)
+		if !errors.Is(err, ErrComposePreflight) || !strings.Contains(err.Error(), "DEPLOY_APP_SERVICE") {
+			t.Fatalf("CP-3 대조가 잡아야 한다: %v", err)
+		}
+	})
+}
+
+// --- E-6 블루-그린 + 동봉 ------------------------------------------------------
+
+// bgEmbedRig는 동봉 배선을 얹은 블루-그린 시험대다.
+type bgEmbedRig struct {
+	*embedRig
+	blue, green   *fakeExec
+	blueH, greenH fakeHealth
+	gw            *fakeGateway
+	bound         map[string]*fakeExec
+}
+
+func newBGEmbedRig(t *testing.T, active Slot) *bgEmbedRig {
+	base := newEmbedRig(t)
+	r := &bgEmbedRig{
+		embedRig: base,
+		blue:     &fakeExec{name: "blue"},
+		green:    &fakeExec{name: "green"},
+		blueH:    fakeHealth{name: "blue"},
+		greenH:   fakeHealth{name: "green"},
+		gw:       &fakeGateway{active: string(active)},
+		bound:    map[string]*fakeExec{},
+	}
+	// 결박은 슬롯마다 **새 실행기**를 낸다 — 실제 배선(WithCompose 파생)과 같은 모양이라야
+	// "누가 어떤 파일로 무엇을 했는가"를 슬롯별로 가려낼 수 있다.
+	base.runtime.Bind = func(slot string, b ComposeBinding) (HostExecutor, HealthChecker, error) {
+		base.binds++
+		base.lastSlot, base.lastBind = slot, b
+		if base.bindErr != nil {
+			return nil, nil, base.bindErr
+		}
+		ex := &fakeExec{name: slot + ":bound"}
+		r.bound[slot+"|"+b.ComposeFile] = ex
+		health := fakeHealth{name: slot}
+		if slot == string(SlotBlue) {
+			health.err = r.blueH.err
+		} else if slot == string(SlotGreen) {
+			health.err = r.greenH.err
+		}
+		return ex, health, nil
+	}
+	return r
+}
+
+func (r *bgEmbedRig) dispatcher() LocalDispatcher {
+	return LocalDispatcher{
+		Repos:       repos(),
+		PhaseBudget: time.Minute,
+		Gateway:     r.gw,
+		SlotExec:    map[Slot]HostExecutor{SlotBlue: r.blue, SlotGreen: r.green},
+		SlotHealth:  map[Slot]HealthChecker{SlotBlue: r.blueH, SlotGreen: r.greenH},
+		DrainWait:   testDrainWait,
+		Compose:     r.runtime,
+	}
+}
+
+// E-6 ⑴: 블루-그린 정상 완주 — idle 슬롯에 결박된 candidate로 올라가고, 승격 record의
+// slot이 그 idle이다(슬롯이 뒤바뀌면 복원이 엉뚱한 쪽을 되살린다).
+func TestBlueGreenEmbeddedCompletes(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue) // active=blue → idle=green
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateCompleted || err != nil {
+		t.Fatalf("state=%v err=%v, COMPLETED 기대", st, err)
+	}
+
+	rev := revHexOf(embeddedCompose)
+	wantPath := r.ws.CandidatePath("core", "green", rev)
+	if r.lastSlot != "green" || r.lastBind.ComposeFile != wantPath {
+		t.Fatalf("idle 슬롯 결박이 어긋났다: slot=%q file=%q", r.lastSlot, r.lastBind.ComposeFile)
+	}
+	// 주입값은 그 슬롯의 호스트 포트를 쓴다(슬롯마다 다르다).
+	if !containsStr(r.lastBind.Injected, "DEPLOY_HOST_PORT=18082") {
+		t.Fatalf("green 슬롯의 호스트 포트가 주입되지 않았다: %v", r.lastBind.Injected)
+	}
+
+	applied, aerr := r.ws.Applied("core")
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	if len(applied) != 1 || applied[0].Slot != "green" {
+		t.Fatalf("승격 record의 slot이 idle이 아니다: %+v", applied)
+	}
+}
+
+// E-6 ⑵: 전환 **전** 실패(헬스 미달) — 승격이 없고 candidate만 잔류한다. 라우트도 옮기지 않는다.
+func TestBlueGreenEmbeddedFailsBeforeCutover(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue)
+	r.greenH = fakeHealth{name: "green", err: errors.New("헬스 미달")}
+
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateUnexecuted || err == nil {
+		t.Fatalf("state=%v err=%v, UNEXECUTED 기대", st, err)
+	}
+	if r.gw.switches != 0 {
+		t.Fatalf("전환 전 실패인데 라우트가 옮겨졌다(%d회)", r.gw.switches)
+	}
+	applied, aerr := r.ws.Applied("core")
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	if len(applied) != 0 {
+		t.Fatalf("전환 전 실패가 승격됐다: %+v", applied)
+	}
+	if _, serr := os.Stat(r.ws.CandidatePath("core", "green", revHexOf(embeddedCompose))); serr != nil {
+		t.Fatalf("candidate는 잔류해야 한다(무해·GC 대상): %v", serr)
+	}
+}
+
+// --- E-7 구 active 슬롯의 down 결박 --------------------------------------------
+
+// 구 active 슬롯을 내릴 때 `-f`는 **그 슬롯이 실제로 떠 있는 정의**를 가리켜야 한다.
+// 기존 SlotExec로 내리면 호스트의 옛 compose 파일 기준으로 프로젝트를 로드하게 되고,
+// 동봉 필수 호스트에는 그 파일이 아예 없을 수도 있다.
+func TestActiveSlotDownBoundToAppliedRecord(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue)
+
+	// blue가 예전에 다른 정의로 떠 있었다고 기록한다(그 세대 파일도 함께).
+	oldCompose := embeddedCompose + "# 이전 세대\n"
+	oldRev := revHexOf(oldCompose)
+	if _, err := r.ws.WriteCandidate("core", "blue", oldRev, []byte(oldCompose)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ws.Promote("core", compose.AppliedRecord{
+		Revision: oldRev, Slot: "blue", ImageDigest: validDigest, CommitSHA: "c0",
+		RequestID: "req-0", TS: "t", Injected: map[string]string{"DEPLOY_HOST_PORT": "18081"},
+		Status: compose.StatusApplied,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateCompleted || err != nil {
+		t.Fatalf("state=%v err=%v", st, err)
+	}
+
+	// blue(구 active)를 내린 실행기는 **그 record의 세대 파일**로 결박됐어야 한다.
+	oldPath := r.ws.CandidatePath("core", "blue", oldRev)
+	downExec, ok := r.bound["blue|"+oldPath]
+	if !ok {
+		t.Fatalf("구 active 슬롯이 applied record의 정의로 결박되지 않았다(결박된 것: %v)", boundKeys(r.bound))
+	}
+	if downExec.downs != 1 {
+		t.Fatalf("결박된 실행기가 down하지 않았다(%d회)", downExec.downs)
+	}
+	if r.blue.downs != 0 {
+		t.Fatalf("호스트 옛 compose 파일 실행기가 down했다(%d회) — 결박이 우회됐다", r.blue.downs)
+	}
+}
+
+// applied가 손상되면 **legacy 파일로 폴백하지 않는다** — 그때는 "record가 없다"가 아니라
+// "알 수 없다"이고, 알 수 없는 채로 옛 파일을 들고 down하는 것이 막으려는 동작이다.
+func TestActiveSlotDownRefusesLegacyFallbackOnCorruptApplied(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue)
+	dir := filepath.Join(r.root, "core")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "applied.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateUnexecuted || !errors.Is(err, ErrComposeStorage) {
+		t.Fatalf("state=%v err=%v, UNEXECUTED·저장 무결성 기대", st, err)
+	}
+	if r.blue.downs != 0 || r.green.ups != 0 {
+		t.Fatalf("손상인데 실행이 일어났다: blue.down=%d green.up=%d", r.blue.downs, r.green.ups)
+	}
+}
+
+// record가 아직 없는 슬롯(이관 첫 배포)은 기존 배선으로 내린다 — 과도기 폴백은 여기 하나뿐이다.
+func TestActiveSlotFallsBackWhenNoRecordYet(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue)
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateCompleted || err != nil {
+		t.Fatalf("state=%v err=%v", st, err)
+	}
+	if r.blue.downs != 1 {
+		t.Fatalf("record 없는 슬롯이 기존 배선으로 내려가지 않았다(down %d회)", r.blue.downs)
+	}
+}
+
+// --- E-2 승격 실패의 가시화 ----------------------------------------------------
+
+// 승격 실패는 배포 결과를 뒤집지 않되 **이력에 드러난다**. 오류로 실으면 (COMPLETED, err)가
+// 되어 모순 조합 정규화가 정상 배포를 UNKNOWN으로 접고, 로그로만 남기면 나중에 "이 배포의
+// 복원 재료가 왜 없는가"를 되짚을 근거가 없다.
+func TestPromotionFailureIsVisibleWithoutFlippingOutcome(t *testing.T) {
+	r := newEmbedRig(t)
+	// applied.json을 손상시켜 승격만 실패하게 만든다(배포 자체는 성공한다).
+	dir := filepath.Join(r.root, "core")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "applied.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d, _, h := baseDeps()
+	d.Dispatcher = r.dispatcher()
+	res := NewCoordinator(d).Orchestrate(context.Background(), Request{RequestID: "req-1", Body: embeddedBody()})
+
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("승격 실패가 배포 결과를 뒤집었다: outcome=%v detail=%q", res.Outcome, res.Detail)
+	}
+	if !strings.Contains(h.last().Detail, "composePromotion="+ComposePromotionFailed) {
+		t.Fatalf("승격 실패가 이력에 남지 않았다: %q", h.last().Detail)
+	}
+}
+
+// --- E-10 blind 보강 -----------------------------------------------------------
+
+// I-04: legacy opt-in이 켜져 있어도 **동봉 manifest는 전 검증을 그대로 받는다**. opt-in이
+// "검증 완화"로 새면, 과도기 플래그 하나가 결박 전체를 끄는 스위치가 된다.
+func TestOptInDoesNotWeakenEmbeddedValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*Manifest)
+		want error
+	}{
+		{"해시 위조", func(m *Manifest) { m.ComposeRevision = "sha256:" + strings.Repeat("0", 64) }, ErrManifestComposeHash},
+		{"구조 위반", func(m *Manifest) {
+			*m = embeddedManifest("services:\n  app:\n    image: ${DEPLOY_IMAGE_REF}\n    privileged: true\n")
+		}, ErrComposePreflight},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newEmbedRig(t)
+			r.runtime.AllowLegacy = true // 과도기 켜짐
+			m := embeddedManifest(embeddedCompose)
+			tc.mut(&m)
+			st, err := r.run(m)
+			if st != StateUnexecuted || !errors.Is(err, tc.want) {
+				t.Fatalf("opt-in이 동봉 검증을 완화했다: state=%v err=%v", st, err)
+			}
+		})
+	}
+}
+
+// I-02: legacy 수락은 **WARN 로그**로 드러난다(조용한 폴백 금지 · G-11의 로그 축).
+func TestLegacyAcceptanceLogsWarning(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	r := newEmbedRig(t)
+	r.runtime.AllowLegacy = true
+	if st, err := r.run(manifest(validDigest)); st != StateCompleted || err != nil {
+		t.Fatalf("state=%v err=%v", st, err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, ComposePathLegacy) {
+		t.Fatalf("legacy 수락 WARN에 경로 코드가 없다: %q", out)
+	}
+	if !strings.Contains(out, "경고") {
+		t.Fatalf("WARN 문면이 아니다: %q", out)
+	}
+
+	// 동봉 경로는 이 경고를 내지 않는다(경고가 상시 울리면 신호가 죽는다).
+	buf.Reset()
+	if st, err := r.run(embeddedManifest(embeddedCompose)); st != StateCompleted || err != nil {
+		t.Fatalf("state=%v err=%v", st, err)
+	}
+	if strings.Contains(buf.String(), ComposePathLegacy) {
+		t.Fatalf("동봉 배포가 legacy 경고를 냈다: %q", buf.String())
+	}
+}
+
+// I-07: candidate 파일에는 **등재 config 키의 값이 들어 있지 않다**. 값은 호스트 .env가
+// 소유하고 compose에는 키만 실린다(CP-5) — 값이 파일로 내려가면 서명 대상에 설정이 섞이고,
+// 0644 파일에 그것이 남는다.
+func TestCandidateNeverContainsInjectedValues(t *testing.T) {
+	r := newEmbedRig(t)
+	if st, err := r.run(embeddedManifest(embeddedCompose)); st != StateCompleted || err != nil {
+		t.Fatalf("state=%v err=%v", st, err)
+	}
+	body, err := os.ReadFile(r.ws.CandidatePath("core", compose.SlotSingle, revHexOf(embeddedCompose)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secretish := range []string{"http://127.0.0.1:18081", "18080"} {
+		if strings.Contains(string(body), secretish) {
+			t.Fatalf("candidate에 주입값이 들어 있다(%q) — 값의 소유는 호스트 .env다: %s", secretish, body)
+		}
+	}
+	// 키 자체는 있어야 한다(pass-through 목록).
+	if !strings.Contains(string(body), "CORE_BLUE_URI") {
+		t.Fatalf("pass-through 키가 사라졌다: %s", body)
+	}
+}
+
+// W-10(유예 근거): "배포 창 락이 동봉 경로 전체를 포괄하는가"는 여기서 따로 시험하지 않는다.
+// 결박은 dispatch **안**에서 일어나고, dispatch가 락 보유 구간 안에 통째로 들어간다는 것은
+// coordinator 테스트(락 획득 → fencing 재확인 → dispatch → 해제 순서)와 main의 lease 하한식
+// 검증이 이미 고정하고 있다 — 같은 불변식을 이 층에서 다시 세우면 정본이 둘이 된다.
+
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func boundKeys(m map[string]*fakeExec) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
