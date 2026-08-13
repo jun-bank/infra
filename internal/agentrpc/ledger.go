@@ -214,6 +214,15 @@ func replay(f *os.File) (map[string]record, int64, error) {
 		if err := json.Unmarshal(line, &r); err != nil || r.RequestID == "" {
 			return nil, -1, fmt.Errorf("journal 손상(치명): 개행 종료된 완전한 줄 %d 파싱 불가(중간·완전줄 손상은 torn tail이 아니다)", i)
 		}
+		// legacy(조각 A) 하위호환(C-C1): attempt 축은 조각 C에서 추가돼 기존 레코드엔 필드가 없다 —
+		// json.Unmarshal이 0으로 둔다. 정상 레코드의 attempt는 항상 ≥ firstAttempt(1)이므로(Accept가
+		// attempt<1을 부작용 전 거절·Finalize가 그 값을 이어받음), attempt==0은 오직 legacy 레코드다.
+		// 이를 firstAttempt로 정규화하지 않으면 업그레이드 후 정상 execute#1(attempt 1)이 legacy
+		// UNEXECUTED@0에 대해 N+1(0+1=1) 재개 조건을 만족해 **중복 실행**된다(조각 A "중복=Report" 파손).
+		// 1로 올리면 execute#1=같은 attempt=중복 Report, 재개(attempt 2)만 Proceed로 정상 축이 선다.
+		if r.Attempt == 0 {
+			r.Attempt = firstAttempt
+		}
 		out[r.RequestID] = r
 	}
 	return out, truncateTo, nil

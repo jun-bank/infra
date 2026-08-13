@@ -39,9 +39,12 @@ const maxResponseBytes = 1 << 16
 // 실제로 dispatch를 돌려 부작용0을 내구 증명한 상태다 — 두 문자열은 다른 값이라(C8) 정확 일치로 가른다.
 //
 // ⚠️ 재개 실익의 정직한 한계(R5): 위성 durable UNEXECUTED는 "dispatch가 실제 돌아 부작용0 거절"
-// (pull 실패·preflight)이고 **대부분 결정론적**이라 재실행이 같은 거절을 재현한다. 실익은 transient
-// (레지스트리 일시 불통 → 회복 후 성공)의 좁은 창뿐이다. 무의미할 수 있는 1회 재배포는 수용한다 —
-// 무한이 아니고(op≤3) fencing(조각 B)이 중복 배포를 막는다.
+// (pull 실패·preflight)이고 **대부분 결정론적**이라 재실행이 같은 거절을 재현한다. 게다가 재개는
+// execute#1이 **UNKNOWN(응답 유실 — dial 후 단절·검증 실패)** 일 때만 발동한다 — 위성이 UNEXECUTED를
+// **깨끗이 응답**하면 그 값이 그대로 반환돼(해소 사이클 미진입) 재개하지 않는다. 따라서 실익은
+// "transient 거절 + 그 응답까지 유실"이 겹치는 **더 좁은** 창(레지스트리 일시 불통이 회복될 즈음
+// 응답도 유실)뿐이다. 무의미할 수 있는 1회 재배포는 수용한다 — 무한이 아니고(op≤3) fencing
+// (조각 B)이 중복 배포를 막는다.
 type RemoteDispatcher struct {
 	baseURL string        // 위성 base URL(예: http://10.0.0.158:9000) — 경로는 붙이지 않은 채 보관
 	key     []byte        // 위성별 개별 키(AGENT_RPC_KEY_SETTLEMENT/LEDGER 중 하나)
