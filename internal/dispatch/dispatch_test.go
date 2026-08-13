@@ -12,14 +12,14 @@ import (
 // captureRunner는 마지막 실행의 argv·env·stdin을 포착하는 페이크 러너다(부작용 0).
 type captureRunner struct {
 	argv  []string
-	env   []string
+	env   envSpec
 	stdin string
 	out   string
 	err   error
 }
 
 func (c *captureRunner) fn() runnerFunc {
-	return func(_ context.Context, argv []string, env []string, stdin string) (string, error) {
+	return func(_ context.Context, argv []string, env envSpec, stdin string) (string, error) {
 		c.argv, c.env, c.stdin = argv, env, stdin
 		return c.out, c.err
 	}
@@ -141,7 +141,7 @@ func TestUpArgvAndImageEnv(t *testing.T) {
 	if contains(r.argv, ref) {
 		t.Fatalf("이미지 참조가 up argv에 직접 들어감(env 치환이어야 한다): %v", r.argv)
 	}
-	if len(r.env) != 1 || r.env[0] != "DEPLOY_IMAGE_REF="+ref {
+	if len(r.env.vars) != 1 || r.env.vars[0] != "DEPLOY_IMAGE_REF="+ref {
 		t.Fatalf("up env = %v, 기대 [DEPLOY_IMAGE_REF=%s]", r.env, ref)
 	}
 }
@@ -155,7 +155,7 @@ func TestUpCustomImageEnvVar(t *testing.T) {
 	if err := e.Up(context.Background(), ref); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.env) != 1 || r.env[0] != "REHEARSAL_IMAGE="+ref {
+	if len(r.env.vars) != 1 || r.env.vars[0] != "REHEARSAL_IMAGE="+ref {
 		t.Fatalf("커스텀 env = %v, 기대 [REHEARSAL_IMAGE=%s]", r.env, ref)
 	}
 }
@@ -304,7 +304,7 @@ type scriptRunner struct {
 }
 
 func (s *scriptRunner) fn() runnerFunc {
-	return func(_ context.Context, argv []string, _ []string, _ string) (string, error) {
+	return func(_ context.Context, argv []string, _ envSpec, _ string) (string, error) {
 		if contains(argv, "ps") && contains(argv, "-q") {
 			return s.psOut, s.psErr
 		}
@@ -608,7 +608,7 @@ func TestComposeOpsInjectImageEnv(t *testing.T) {
 		if err := newExec(cfg, r).Down(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if !hasEnv(r.env) {
+		if !hasEnv(r.env.vars) {
 			t.Fatalf("down env에 %q 없음: %v", wantEnv, r.env)
 		}
 	})
@@ -617,7 +617,7 @@ func TestComposeOpsInjectImageEnv(t *testing.T) {
 		if _, err := newExec(cfg, r).GreenContainers(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if !hasEnv(r.env) {
+		if !hasEnv(r.env.vars) {
 			t.Fatalf("ps -q env에 %q 없음: %v", wantEnv, r.env)
 		}
 	})
@@ -626,7 +626,7 @@ func TestComposeOpsInjectImageEnv(t *testing.T) {
 		if _, err := newExec(cfg, r).Status(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if !hasEnv(r.env) {
+		if !hasEnv(r.env.vars) {
 			t.Fatalf("status env에 %q 없음: %v", wantEnv, r.env)
 		}
 	})
@@ -638,7 +638,7 @@ func TestComposeOpsInjectImageEnv(t *testing.T) {
 		}
 		want := "CORE_IMAGE=" + ref
 		found := false
-		for _, e := range r.env {
+		for _, e := range r.env.vars {
 			if e == want {
 				found = true
 			}
