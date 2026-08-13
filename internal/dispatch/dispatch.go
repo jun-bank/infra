@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -65,6 +66,26 @@ type Config struct {
 	// ImageEnvVar는 compose up이 digest 고정 참조를 읽는 env 변수명이다. compose 파일이
 	// image: ${<ImageEnvVar>} 로 이 값을 참조한다. 비면 defaultImageEnvVar를 쓴다.
 	ImageEnvVar string
+	// --- 동봉 compose 실행 위생(infra#19 · 설계 rev.2 R3). 셋은 함께 켜진다: 실행되는
+	// compose가 이번 서명 바이트(candidate)일 때만 의미가 있기 때문이다.
+
+	// ProjectDirectory는 compose의 `--project-directory`다. compose는 이 디렉터리를 기준으로
+	// 상대 경로와 `.env`를 해석하므로, 비워 두면 그 기준이 compose 파일 위치·cwd에 따라
+	// 흔들린다 — candidate 디렉터리로 고정해 보간 소스가 workspace 밖으로 새지 않게 한다.
+	// 비면 플래그를 붙이지 않는다(legacy 경로의 기존 동작 그대로).
+	ProjectDirectory string
+	// Injected는 compose subprocess에 넣을 KEY=VALUE다(호스트 포트·등재 config 키의 값).
+	// 이미지 참조는 여기 없다 — Up이 매 실행마다 pinned digest로 직접 주입한다.
+	Injected []string
+	// Isolated는 compose subprocess가 **호스트 env를 상속하지 않게** 한다(B1' — 실효 설정 =
+	// 서명 바이트 + 닫힌 주입값). 상속하면 COMPOSE_FILE·COMPOSE_PROJECT_NAME·COMPOSE_PROFILES
+	// 같은 변수가 우리가 준 -f/-p를 덮고, 호스트에 있는 아무 변수나 `${...}` 보간 소스가 된다.
+	// 켜지면 env는 PATH + Injected(+ image 변수)뿐이다.
+	// ⚠️ [구현 검증]: docker CLI가 이 최소 집합으로 데몬·레지스트리 설정을 찾는지(HOME·
+	// DOCKER_CONFIG 부재 영향)는 .9 리허설에서 확인한다 — pull은 이 경로가 아니라 기존
+	// 상속 env로 돌므로 레지스트리 인증에는 영향이 없다.
+	Isolated bool
+
 	// AppService는 이 배포의 대상 app compose 서비스명이다(#21 — 사후조건 identity 결박).
 	// 컨테이너의 소속 서비스는 docker가 붙이는 composeServiceLabel 라벨로 식별하며, 이 값이
 	// 설정되면 사후조건(이미지 대조·부분기동 판정)과 재시작 검사가 **그 서비스의 컨테이너만**
@@ -102,12 +123,31 @@ func (c Config) imageEnvVar() string {
 	return c.ImageEnvVar
 }
 
-// composeEnv는 image-무관 compose 명령(down·ps·status)에 주입할 image env를 만든다.
-// up이 실제 digest를 주입하는 것과 짝을 이뤄, 모든 compose 명령이 프로젝트를 파싱할 수 있게
-// 한다(imageEnvVar는 기본값이 있어 항상 비어있지 않다). 실행 대상 컨테이너는 프로젝트 라벨로
-// 정해지므로 여기 image 값(placeholder)은 어떤 컨테이너도 만들거나 pull하지 않는다.
-func (c Config) composeEnv() []string {
-	return []string{c.imageEnvVar() + "=" + composeImagePlaceholder}
+// envSpec은 child 프로세스의 환경을 어떻게 만들지다. 상속 여부를 **명시 필드**로 두는
+// 이유: 예전처럼 "빈 슬라이스면 상속"이라는 암묵 규칙에 기대면, 격리를 켠 명령이 주입값을
+// 하나도 갖지 않는 순간 조용히 호스트 env 전체를 상속한다(격리가 무음으로 풀린다).
+type envSpec struct {
+	// isolated면 os.Environ()을 상속하지 않고 PATH + vars만 준다.
+	isolated bool
+	// vars는 KEY=VALUE 목록이다.
+	vars []string
+}
+
+// composeEnv는 image-무관 compose 명령(down·ps·status)의 env다. up이 실제 digest를 주입하는
+// 것과 짝을 이뤄, 모든 compose 명령이 프로젝트를 파싱할 수 있게 한다(imageEnvVar는 기본값이
+// 있어 항상 비어있지 않다). 실행 대상 컨테이너는 프로젝트 라벨로 정해지므로 여기 image
+// 값(placeholder)은 어떤 컨테이너도 만들거나 pull하지 않는다. 동봉 경로에서는 등재 주입값도
+// 함께 넣는다 — compose가 프로젝트를 로드할 때 environment 목록의 키를 해석해야 하기 때문이다.
+func (c Config) composeEnv() envSpec {
+	return c.envWithImage(composeImagePlaceholder)
+}
+
+// envWithImage는 주입 집합에 image 변수를 얹은 env다(순수 함수 — 테스트가 직접 단언한다).
+func (c Config) envWithImage(imageValue string) envSpec {
+	vars := make([]string, 0, len(c.Injected)+1)
+	vars = append(vars, c.Injected...)
+	vars = append(vars, c.imageEnvVar()+"="+imageValue)
+	return envSpec{isolated: c.Isolated, vars: vars}
 }
 
 // commandLine은 sudo 프리픽스를 앞에 붙인 전체 argv를 만든다(순수 함수 — raw shell 없음).
@@ -121,6 +161,19 @@ func (c Config) commandLine(base ...string) []string {
 	argv = append(argv, c.SudoPrefix...)
 	argv = append(argv, base...)
 	return argv
+}
+
+// composeCommand는 모든 compose 하위 명령의 공통 앞부분을 한 곳에서 만든다:
+// `docker compose -f <파일> [--project-directory <디렉터리>] -p <프로젝트> <하위명령…>`.
+// 한 곳인 것이 요점이다 — up·down·ps가 각자 조립하면 --project-directory가 한 군데만
+// 빠져도 그 명령만 다른 기준으로 보간을 해석한다(조용한 비대칭).
+func (c Config) composeCommand(sub ...string) []string {
+	base := []string{"docker", "compose", "-f", c.ComposeFile}
+	if c.ProjectDirectory != "" {
+		base = append(base, "--project-directory", c.ProjectDirectory)
+	}
+	base = append(base, "-p", c.Project)
+	return c.commandLine(append(base, sub...)...)
 }
 
 // argv는 Action별 전체 명령 argv를 조립한다(순수 함수 — 테스트가 argv를 직접 assert한다).
@@ -138,14 +191,14 @@ func (c Config) argv(act Action, ref string) ([]string, error) {
 		// 볼륨을 붙들지 않게). 사후조건 fail-open(H2)의 방어는 더 이상 이 플래그에 기대지
 		// 않는다 — VerifyImageDigest가 대상 app 서비스로 결박돼(#21) orphan·사이드카가 무엇을
 		// 실행 중이든 app의 일치를 대신해 주지 못한다.
-		return c.commandLine("docker", "compose", "-f", c.ComposeFile, "-p", c.Project, "up", "-d", "--no-build", "--remove-orphans"), nil
+		return c.composeCommand("up", "-d", "--no-build", "--remove-orphans"), nil
 	case ActionDown:
 		// down은 green 프로젝트만 종료한다(-p 항상 포함 — Q2). --rmi 없음: 이미지를
 		// 지우지 않는다(RL-5 — 호스트 로컬 되돌림이 성립해야 한다).
-		return c.commandLine("docker", "compose", "-f", c.ComposeFile, "-p", c.Project, "down"), nil
+		return c.composeCommand("down"), nil
 	case ActionStatus:
 		// status는 부작용 없는 조회다(DO-16).
-		return c.commandLine("docker", "compose", "-f", c.ComposeFile, "-p", c.Project, "ps"), nil
+		return c.composeCommand("ps"), nil
 	default:
 		return nil, fmt.Errorf("dispatch: action이 닫힌 열거 밖이다: %q", act)
 	}
@@ -153,7 +206,7 @@ func (c Config) argv(act Action, ref string) ([]string, error) {
 
 // runnerFunc는 조립된 argv를 실제로 실행하는 함수다. 기본은 osExec이며, 단위 테스트는
 // 이를 교체해 argv·env·stdin을 실제 exec 없이 포착한다(부작용 없는 계약 검증).
-type runnerFunc func(ctx context.Context, argv []string, env []string, stdin string) (string, error)
+type runnerFunc func(ctx context.Context, argv []string, env envSpec, stdin string) (string, error)
 
 // Executor는 Config를 들고 열거된 특권 명령을 실행한다. 실행 경로는 오직 argv 슬라이스
 // 이며 문자열 셸 평가가 없다.
@@ -176,6 +229,38 @@ func NewExecutor(cfg Config) (*Executor, error) {
 // 전체 판정). 읽기 전용 접근자이며, 조립(env → Config) 배선이 실제로 이어졌는지 boot 테스트가
 // 관측하기 위해 있다 — 결박이 조용히 끊기면 H2 fail-open이 그대로 되돌아온다(#21).
 func (e *Executor) AppService() string { return e.cfg.AppService }
+
+// ComposeFile은 이 실행기가 `-f`로 넘기는 compose 파일이다(읽기 전용 접근자 — 동봉 결박이
+// 실제로 candidate를 가리키는지 boot·통합 테스트가 관측하기 위해 있다).
+func (e *Executor) ComposeFile() string { return e.cfg.ComposeFile }
+
+// ProjectDirectory는 이 실행기의 `--project-directory`다(비면 플래그 없음).
+func (e *Executor) ProjectDirectory() string { return e.cfg.ProjectDirectory }
+
+// WithCompose는 이 실행기를 **이번 배포의 candidate에 결박한 새 실행기**로 파생한다(R3).
+// 프로젝트명·sudo 프리픽스·대상 서비스는 그대로 물려받고, compose 파일·실행 기준 디렉터리·
+// 주입 집합만 갈아끼운다 — 슬롯의 정체성(어느 compose project를 다루는가)은 배포마다 바뀌지
+// 않고, 바뀌는 것은 "이번에 무엇을 띄우는가"뿐이기 때문이다.
+//
+// 원본을 변형하지 않고 새 값을 만드는 것이 요점이다: 실행기는 프로버가 함께 붙들고 있는
+// 공유 객체라, 배포마다 제자리에서 고치면 판정 중인 프로버가 다른 compose 파일을 보게 된다.
+//
+// 파생된 실행기는 항상 격리 env로 돈다 — candidate를 실행하면서 호스트 env를 상속하면
+// 서명 바이트 결박이 보간 층에서 새어 나간다.
+func (e *Executor) WithCompose(composeFile, projectDir string, injected []string) (*Executor, error) {
+	if composeFile == "" || !filepath.IsAbs(composeFile) {
+		return nil, fmt.Errorf("dispatch: 동봉 compose 파일은 절대경로여야 한다: %q", composeFile)
+	}
+	if projectDir == "" || !filepath.IsAbs(projectDir) {
+		return nil, fmt.Errorf("dispatch: 동봉 실행 기준 디렉터리는 절대경로여야 한다: %q", projectDir)
+	}
+	cfg := e.cfg
+	cfg.ComposeFile = composeFile
+	cfg.ProjectDirectory = projectDir
+	cfg.Injected = append([]string(nil), injected...)
+	cfg.Isolated = true
+	return &Executor{cfg: cfg, run: e.run}, nil
+}
 
 // allowedSudoFlags는 프리픽스에 허용되는 sudo 플래그의 닫힌 allowlist다(정확 토큰만).
 // 비대화 비밀번호 주입(-S)·타임스탬프 무효화(-k)·비대화 실패(-n)와 각 롱폼만 둔다 —
@@ -226,7 +311,7 @@ func (e *Executor) Pull(ctx context.Context, imageRef string) error {
 	if err != nil {
 		return err
 	}
-	_, err = e.run(ctx, argv, nil, e.stdin())
+	_, err = e.run(ctx, argv, envSpec{}, e.stdin())
 	return err
 }
 
@@ -237,8 +322,8 @@ func (e *Executor) Up(ctx context.Context, imageRef string) error {
 	if err != nil {
 		return err
 	}
-	env := []string{e.cfg.imageEnvVar() + "=" + imageRef}
-	_, err = e.run(ctx, argv, env, e.stdin())
+	// up만이 실제 pinned digest를 주입한다(DO-18 ⑵) — 나머지 compose 명령은 placeholder다.
+	_, err = e.run(ctx, argv, e.cfg.envWithImage(imageRef), e.stdin())
 	return err
 }
 
@@ -269,7 +354,7 @@ func (e *Executor) Status(ctx context.Context) (string, error) {
 func (e *Executor) RestartCount(ctx context.Context, name string) (int, error) {
 	// inspect는 열거된 4개 mutate action이 아니라 status 계열의 부작용 없는 조회다.
 	argv := e.cfg.commandLine("docker", "inspect", "-f", "{{.RestartCount}}", name)
-	out, err := e.run(ctx, argv, nil, e.stdin())
+	out, err := e.run(ctx, argv, envSpec{}, e.stdin())
 	if err != nil {
 		return 0, err
 	}
@@ -296,7 +381,7 @@ func (e *Executor) RestartCount(ctx context.Context, name string) (int, error) {
 // 프로세스의 성공으로 이어붙이는 것)은 앱 서비스 안에서 전부 관측된다. 앱 서비스의 재시작은
 // 여전히 baseline 대비 증가로 즉시 실패시킨다(방어선 자체는 그대로 켜져 있다).
 func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
-	argv := e.cfg.commandLine("docker", "compose", "-f", e.cfg.ComposeFile, "-p", e.cfg.Project, "ps", "-q")
+	argv := e.cfg.composeCommand("ps", "-q")
 	out, err := e.run(ctx, argv, e.cfg.composeEnv(), e.stdin())
 	if err != nil {
 		return nil, fmt.Errorf("dispatch: green 컨테이너 조회 실패(compose ps -q): %w", err)
@@ -335,7 +420,7 @@ func (e *Executor) GreenContainers(ctx context.Context) ([]string, error) {
 // 판정이 부분기동(일부 서비스가 up 직후 종료)을 검출할 수 있게 한다(P1). 빈 목록은 오류가
 // 아니라 빈 슬라이스로 준다 — 판정은 호출자가 한다.
 func (e *Executor) projectContainerIDs(ctx context.Context) ([]string, error) {
-	argv := e.cfg.commandLine("docker", "compose", "-f", e.cfg.ComposeFile, "-p", e.cfg.Project, "ps", "-a", "-q")
+	argv := e.cfg.composeCommand("ps", "-a", "-q")
 	out, err := e.run(ctx, argv, e.cfg.composeEnv(), e.stdin())
 	if err != nil {
 		return nil, fmt.Errorf("dispatch: 프로젝트 컨테이너 조회 실패(compose ps -a -q): %w", err)
@@ -374,7 +459,7 @@ const inspectStateFormat = "{{.State.Status}} {{.Config.Image}} {{index .Config.
 // 직접 대조에 쓸 수 없다.
 func (e *Executor) inspectState(ctx context.Context, id string) (containerState, error) {
 	argv := e.cfg.commandLine("docker", "inspect", "-f", inspectStateFormat, id)
-	out, err := e.run(ctx, argv, nil, e.stdin())
+	out, err := e.run(ctx, argv, envSpec{}, e.stdin())
 	if err != nil {
 		return containerState{}, fmt.Errorf("dispatch: 컨테이너 상태 조회 실패(inspect %s): %w", id, err)
 	}
@@ -502,13 +587,19 @@ func (e *Executor) VerifyImageDigest(ctx context.Context, imageRef string) error
 
 // osExec는 기본 러너다. argv[0]를 실행 파일로, 나머지를 인자 슬라이스로 넘겨 셸 해석을
 // 거치지 않는다(DO-23 ⑴). stdin이 비어있지 않을 때만 child stdin에 흘린다.
-func osExec(ctx context.Context, argv []string, env []string, stdin string) (string, error) {
+func osExec(ctx context.Context, argv []string, env envSpec, stdin string) (string, error) {
 	if len(argv) == 0 {
 		return "", fmt.Errorf("dispatch: 빈 argv — 실행 불가")
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
+	switch {
+	case env.isolated:
+		// 동봉 경로 — 호스트 env를 상속하지 않는다. PATH는 docker CLI를 찾기 위해 남긴다.
+		// COMPOSE_* 를 "지우는" 코드가 없는 이유가 이것이다: 애초에 상속하지 않으므로
+		// 지울 것이 없다(금지 목록을 유지하는 대신 허용 집합만 만든다).
+		cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, env.vars...)
+	case len(env.vars) > 0:
+		cmd.Env = append(os.Environ(), env.vars...)
 	}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
