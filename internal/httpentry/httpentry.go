@@ -543,6 +543,11 @@ func writeOutcome(w http.ResponseWriter, res deploy.Result) {
 		// ⚠️ 앞단 프록시·엣지가 내는 502(agent에 닿지도 못한 경우)와는 코드만으로 구분되지 않는다 —
 		// 구분자는 본문 접두어("배포 실행 실패")다. 코드로만 분기하는 소비자는 그 접두어를 함께 본다.
 		http.Error(w, "배포 실행 실패: "+res.Detail, http.StatusBadGateway)
+	case deploy.OutcomeStorageIntegrity:
+		// 500 — 동봉 compose의 candidate 기록·재해시가 어긋났다(G-14). 요청은 옳았고 이 호스트의
+		// 저장 계층이 잘못했으므로 4xx로 돌려 CI가 자기 산출물을 의심하게 만들지 않는다. 코드를
+		// 본문 접두어로 실어 워크플로 로그·관제가 문자열 매칭 없이 이 범주를 집계할 수 있게 한다.
+		http.Error(w, string(deploy.OutcomeStorageIntegrity)+": "+res.Detail, http.StatusInternalServerError)
 	case deploy.OutcomeCompleted:
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "배포 완료\n")

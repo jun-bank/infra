@@ -36,7 +36,10 @@ import (
 const (
 	dirPerm       os.FileMode = 0o700
 	candidatePerm os.FileMode = 0o644
-	appliedPerm   os.FileMode = 0o644
+	// applied.json은 0600이다 — candidate와 달리 **주입 변수의 실값**(등재 config 키의
+	// 호스트 값)을 담기 때문이다. 시크릿은 애초에 여기 오면 안 되지만(CF-6), 값이 담기는
+	// 파일을 값이 담기지 않는 파일과 같은 모드로 두지 않는다.
+	appliedPerm os.FileMode = 0o600
 )
 
 // maxGenerations는 세대 파일 잔여 상한이다(rev.2.1 C1 선언값 — pin된 것은 이 상한과
