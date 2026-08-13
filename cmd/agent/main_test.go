@@ -4,6 +4,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -165,6 +167,24 @@ func setRequiredDispatchEnv(t *testing.T) {
 	t.Setenv("DEPLOY_COMPOSE_PROJECT", "core-green")
 	t.Setenv("DEPLOY_HEALTH_URL", "http://127.0.0.1:8080/ready")
 	t.Setenv("IMAGE_CORE", "registry.example/core")
+	setWorkspaceEnv(t)
+}
+
+// setWorkspaceEnv는 배타성 계약(절대경로·심볼릭 링크 없음·0700·현재 uid 소유)을 만족하는
+// workspace를 만들어 배선한다. 신 agent의 기본이 동봉 필수(R7)라 이것 없이는 어떤 배포
+// 배선도 조립되지 않는다 — 그 사실 자체가 기본값이 살아 있다는 증거다.
+func setWorkspaceEnv(t *testing.T) string {
+	t.Helper()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "ws")
+	if mkErr := os.Mkdir(root, 0o700); mkErr != nil {
+		t.Fatal(mkErr)
+	}
+	t.Setenv("DEPLOY_WORKSPACE", root)
+	return root
 }
 
 func TestBuildDispatcherRejectsInvalidHealthEnv(t *testing.T) {
@@ -210,6 +230,9 @@ func setBlueGreenEnv(t *testing.T) {
 	t.Setenv("IMAGE_CORE", "registry.example/core")
 	t.Setenv("DEPLOY_GATEWAY_URL", "http://127.0.0.1:8090")
 	t.Setenv("DEPLOY_APP_SERVICE", "app") // #21 — 블루-그린 모드에서는 필수
+	setWorkspaceEnv(t)
+	t.Setenv("DEPLOY_HOST_PORT_BLUE", "18081")
+	t.Setenv("DEPLOY_HOST_PORT_GREEN", "18082")
 
 	t.Setenv("DEPLOY_COMPOSE_FILE_BLUE", "/x/blue.yml")
 	t.Setenv("DEPLOY_COMPOSE_PROJECT_BLUE", "core-blue")
@@ -260,6 +283,7 @@ func setSingleVars(t *testing.T, project string) {
 	t.Setenv("DEPLOY_COMPOSE_FILE", "/x/compose.yml")
 	t.Setenv("DEPLOY_COMPOSE_PROJECT", project)
 	t.Setenv("DEPLOY_HEALTH_URL", "http://127.0.0.1:8080/ready")
+	t.Setenv("DEPLOY_HOST_PORT", "18080")
 }
 
 // S9: compose project는 single·blue·green 3자 **쌍별로** 달라야 한다 — down이 프로젝트
