@@ -58,6 +58,9 @@ const (
 	CodeStorageIntegrity = "STORAGE_INTEGRITY_ERROR"
 	// CodeWorkspace는 workspace 배선 자체가 계약을 만족하지 않는 것이다(경로·권한·소유·.env).
 	CodeWorkspace = "COMPOSE_WORKSPACE"
+	// CodeRevision은 revision 값이 sha256 64소문자hex 형식이 아닌 것이다. **요청에서 온 값**의
+	// 형식 위반이므로 저장 무결성 장애와 분류가 갈린다(422 vs 500).
+	CodeRevision = "COMPOSE_REVISION"
 )
 
 // Error는 기계 판독 코드를 가진 거절이다. 문면은 사람을 위한 것이고, 판정은 Code가 소유한다.
