@@ -556,3 +556,80 @@ func TestGCStopsWithoutDeletingWhenPinUnknown(t *testing.T) {
 		}
 	}
 }
+
+// H-1: 스냅샷 재사용 분기의 심볼릭 링크 거절. os.ReadFile은 링크를 따라가므로, 같은 이름의
+// 링크가 **같은 바이트를 가리키면** 내용 대조를 통과한다 — 그러나 compose가 실제로 여는 것은
+// 링크가 가리키는 파일이고 그 대상은 언제든 바뀔 수 있어 결박이 통째로 무의미해진다.
+func TestWriteSnapshotRejectsNonRegularReuse(t *testing.T) {
+	w := newWorkspace(t)
+	content := []byte("services: {}\n")
+
+	// 먼저 정상 스냅샷을 만들어 두고, 그 자리를 같은 내용을 가리키는 링크로 바꾼다.
+	path, err := w.WriteSnapshot("core", "down-blue-abc.yml", content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realFile := filepath.Join(filepath.Dir(path), "real.yml")
+	if werr := os.WriteFile(realFile, content, 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	if rerr := os.Remove(path); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if serr := os.Symlink(realFile, path); serr != nil {
+		t.Skipf("심볼릭 링크를 만들 수 없는 환경: %v", serr)
+	}
+
+	_, err = w.WriteSnapshot("core", "down-blue-abc.yml", content)
+	if CodeOf(err) != CodeStorageIntegrity {
+		t.Fatalf("동일 바이트를 가리키는 심볼릭 링크가 재사용됐다(코드=%q): %v", CodeOf(err), err)
+	}
+}
+
+// H-3: 잔재 회수. GC가 tmp를 통째로 건너뛰므로 아무도 치우지 않으면 영구 누적된다 —
+// 오래된 것만 지우고 지금 도는 배포의 파일은 건드리지 않는다.
+func TestSweepStaleSnapshots(t *testing.T) {
+	w := newWorkspace(t)
+	mk := func(name string, age time.Duration) string {
+		p, err := w.WriteSnapshot("core", name, []byte("services: {} # "+name+"\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mod := time.Now().Add(-age)
+		if cerr := os.Chtimes(p, mod, mod); cerr != nil {
+			t.Fatal(cerr)
+		}
+		return p
+	}
+	oldA := mk("down-blue-aaaa.yml", 3*time.Hour)
+	oldB := mk("down-green-bbbb.yml", 2*time.Hour)
+	fresh := mk("down-blue-cccc.yml", time.Minute)
+	// 스냅샷 접두사가 아닌 파일은 회수 대상이 아니다(남의 파일을 치우지 않는다).
+	other := filepath.Join(filepath.Dir(fresh), "keep.yml")
+	if err := os.WriteFile(other, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mod := time.Now().Add(-5 * time.Hour)
+	if err := os.Chtimes(other, mod, mod); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, failed := w.SweepStaleSnapshots("core", time.Hour)
+	if removed != 2 || failed != 0 {
+		t.Fatalf("회수 결과 removed=%d failed=%d, 2·0 기대", removed, failed)
+	}
+	for _, p := range []string{oldA, oldB} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("오래된 잔재가 남았다: %q (err=%v)", p, err)
+		}
+	}
+	for _, p := range []string{fresh, other} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("회수 대상이 아닌 파일이 지워졌다: %q: %v", p, err)
+		}
+	}
+	// 디렉터리가 없어도 조용히 no-op이다(첫 배포).
+	if r, f := w.SweepStaleSnapshots("gateway", time.Hour); r != 0 || f != 0 {
+		t.Fatalf("빈 대상 회수 결과 removed=%d failed=%d", r, f)
+	}
+}

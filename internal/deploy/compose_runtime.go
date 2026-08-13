@@ -305,6 +305,14 @@ func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecut
 		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일이 기록된 revision과 다르다(기대=%s 실제=%s) — 변조·절단된 정의로 down하지 않는다(legacy 폴백도 하지 않는다)", ErrComposeStorage, slot, shortRev(found.Revision), shortRev(hex.EncodeToString(sum[:])))
 	}
 
+	// 잔재 회수(위생) — 프로세스가 down 도중 죽거나 삭제가 실패하면 tmp에 스냅샷이 남고,
+	// GC는 이 디렉터리를 통째로 건너뛰므로(세대가 아니다) 아무도 치우지 않으면 영구 누적된다.
+	// **이번 요청 파일을 만들기 전에** 돌려 이름 충돌 여지를 없앤다. 실패는 배포를 막지
+	// 않는다 — 남은 파일은 어떤 판정에도 들지 않으므로 청소 실패가 무결성 문제가 아니다.
+	if _, failed := p.rt.Workspace.SweepStaleSnapshots(target, snapshotSweepAge); failed > 0 {
+		log.Printf("경고: 오래된 실행 스냅샷 %d건을 회수하지 못했다(누적만 남는다 · 배포는 진행) target=%s", failed, target)
+	}
+
 	// 검증한 **바이트 자체**를 실행 전용 스냅샷으로 굳혀 결박한다. 세대 파일 경로를 그대로
 	// 넘기면 검증(지금)과 사용(전환·드레인 뒤의 down) 사이에 창이 남는데, 그 창에는 idle
 	// 기동·헬스·라우트 전환·드레인이 통째로 들어간다 — 재검증을 뒤로 미루는 것으로는 좁아질
@@ -315,6 +323,14 @@ func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecut
 		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 스냅샷을 만들 수 없다 — 검증한 바이트를 결박하지 못한 채 down하지 않는다: %v", ErrComposeStorage, slot, serr)
 	}
 	cleanup := func() { p.rt.Workspace.RemoveSnapshot(snapPath) }
+
+	// 실행 기준 디렉터리가 tmp로 옮겨졌으므로 `.env` 부재도 그 자리에서 다시 본다 —
+	// compose는 --project-directory의 .env를 자동으로 읽고, 그 값은 서명 밖이다. candidate
+	// 디렉터리에서만 확인하고 여기를 빠뜨리면 결박이 한 조각 비어 있게 된다.
+	if eerr := p.rt.Workspace.CheckNoDotEnv(target, compose.SnapshotDir); eerr != nil {
+		cleanup()
+		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 기준 디렉터리에 .env가 있다: %v", ErrComposeStorage, slot, eerr)
+	}
 
 	kv := make([]string, 0, len(found.Injected))
 	for k, v := range found.Injected {
@@ -334,6 +350,11 @@ func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecut
 	}
 	return exec, cleanup, nil
 }
+
+// snapshotSweepAge는 잔재 스냅샷을 회수하기 시작하는 나이다. 배포 창 락 lease 기본값(6분)의
+// 열 배로 둔다 — 지금 도는 배포(락 안에서 lease를 넘길 수 없다)의 파일을 절대 건드리지 않을
+// 만큼 넉넉하면서, 죽은 프로세스가 남긴 것을 다음 배포가 치울 만큼은 짧다. 선언값이다.
+const snapshotSweepAge = time.Hour
 
 // downSnapshotName은 스냅샷 파일명을 만든다. requestId를 파일명에 그대로 쓰지 않는 이유:
 // 그 값은 외부에서 오는 문자열이라 경로 구분자·`..`이 들어올 수 있다. 해시로 접으면 길이와

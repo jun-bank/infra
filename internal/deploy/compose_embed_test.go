@@ -1109,3 +1109,27 @@ func TestSnapshotIsolatedFromGenerationsAndIndex(t *testing.T) {
 		t.Fatalf("스냅샷이 applied 인덱스에 섞였다: %+v err=%v", list, lerr)
 	}
 }
+
+// H-2: 실행 기준 디렉터리가 tmp로 옮겨졌으므로 `.env` 부재도 그 자리에서 확인해야 한다 —
+// compose는 --project-directory의 .env를 자동으로 읽고 그 값은 서명 밖이다. candidate
+// 디렉터리에서만 보고 여기를 빠뜨리면 결박이 한 조각 비어 있게 된다.
+func TestSnapshotProjectDirDotEnvBlocksDeploy(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue)
+	r.seedActive(t, "blue", "18081")
+
+	tmpDir := filepath.Join(r.root, "core", compose.SnapshotDir)
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".env"), []byte("DEPLOY_IMAGE_REF=evil\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateUnexecuted || !errors.Is(err, ErrComposeStorage) {
+		t.Fatalf("state=%v err=%v, UNEXECUTED·저장 무결성 기대", st, err)
+	}
+	if r.blue.downs != 0 || r.green.ups != 0 {
+		t.Fatalf(".env 거절인데 실행이 일어났다: blue.down=%d green.up=%d", r.blue.downs, r.green.ups)
+	}
+}
