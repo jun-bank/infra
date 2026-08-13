@@ -52,29 +52,46 @@ func testManifest(target deploy.Target, requestID string) deploy.Manifest {
 	}
 }
 
-// newTestSatellite는 페이크 dispatcher를 붙인 위성 Handler를 httptest 서버로 띄우고, /agent/status
-// 호출 횟수를 세는 카운터를 함께 준다(자동 재개 없음 실증용).
-func newTestSatellite(t *testing.T, target deploy.Target, key []byte, disp deploy.Dispatcher) (*httptest.Server, *int32) {
+// newTestLedger는 journal·lock을 temp 디렉터리에 두고 원장을 연다.
+func newTestLedger(t *testing.T) *Ledger {
 	t.Helper()
-	ledger, err := OpenLedger(filepath.Join(t.TempDir(), "ledger.journal"))
+	dir := t.TempDir()
+	l, err := OpenLedger(filepath.Join(dir, "journal"), filepath.Join(dir, "lock"))
 	if err != nil {
 		t.Fatalf("OpenLedger: %v", err)
 	}
-	t.Cleanup(func() { _ = ledger.Close() })
-	h, err := Handler(ServerConfig{Target: target, Key: key, Dispatcher: disp, Ledger: ledger, ExecBudget: 10 * time.Second})
-	if err != nil {
-		t.Fatalf("Handler: %v", err)
-	}
+	t.Cleanup(func() { _ = l.Close() })
+	return l
+}
+
+// newTestSatellite는 페이크 dispatcher를 붙인 위성 Server를 httptest 서버로 띄우고, /agent/status
+// 호출 횟수를 세는 카운터를 함께 준다(자동 재개 없음 실증용).
+func newTestSatellite(t *testing.T, target deploy.Target, key []byte, disp deploy.Dispatcher) (*httptest.Server, *int32) {
+	t.Helper()
+	s := newTestServer(t, target, key, disp, newTestLedger(t))
 	var statusHits int32
 	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == PathStatus {
 			atomic.AddInt32(&statusHits, 1)
 		}
-		h.ServeHTTP(w, r)
+		s.ServeHTTP(w, r)
 	})
 	srv := httptest.NewServer(wrapped)
 	t.Cleanup(srv.Close)
 	return srv, &statusHits
+}
+
+// newTestServer는 표준 테스트 ServerConfig로 위성 Server를 만든다(넉넉한 skew·exec budget).
+func newTestServer(t *testing.T, target deploy.Target, key []byte, disp deploy.Dispatcher, ledger *Ledger) *Server {
+	t.Helper()
+	s, err := NewServer(ServerConfig{
+		Target: target, Key: key, Dispatcher: disp, Ledger: ledger,
+		ExecBudget: 10 * time.Second, Skew: 60 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	return s
 }
 
 // TestRoundtripValidCompleted는 유효 서명 왕복이 COMPLETED를 만들고 위성이 정확히 1회 실행함을

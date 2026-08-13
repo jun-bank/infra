@@ -1,19 +1,23 @@
 package agentrpc
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
+// openTempLedger는 journal·lock을 같은 temp 디렉터리에 두고 원장을 연다(단위 테스트용).
 func openTempLedger(t *testing.T) (*Ledger, string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "ledger.journal")
-	l, err := OpenLedger(path)
+	dir := t.TempDir()
+	journal := filepath.Join(dir, "ledger.journal")
+	lock := filepath.Join(dir, "ledger.lock")
+	l, err := OpenLedger(journal, lock)
 	if err != nil {
 		t.Fatalf("OpenLedger: %v", err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	return l, path
+	return l, journal
 }
 
 // TestLedgerAcceptFinalizeHappy는 정상 흐름을 본다: 첫 Accept=Proceed, 같은 command 재수신=
@@ -69,8 +73,9 @@ func TestLedgerQuarantineOnePerTarget(t *testing.T) {
 // TestLedgerRestartAcceptedIsUnknown은 R3 핵심 불변식이다: ACCEPTED 뒤 재기동(원장 재열기)하면
 // 그 requestId는 **UNEXECUTED가 아니라 UNKNOWN**으로 회복된다(미실행 오인 → 중복 배포 차단).
 func TestLedgerRestartAcceptedIsUnknown(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ledger.journal")
-	l, err := OpenLedger(path)
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	l, err := OpenLedger(journal, lock)
 	if err != nil {
 		t.Fatalf("OpenLedger: %v", err)
 	}
@@ -81,7 +86,7 @@ func TestLedgerRestartAcceptedIsUnknown(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	l2, err := OpenLedger(path)
+	l2, err := OpenLedger(journal, lock)
 	if err != nil {
 		t.Fatalf("재열기: %v", err)
 	}
@@ -100,13 +105,14 @@ func TestLedgerRestartAcceptedIsUnknown(t *testing.T) {
 // TestLedgerRestartResolvedReplays는 terminal까지 간 뒤 재기동하면 그 상태가 복원됨을 본다
 // (journal replay — 마지막 줄이 이긴다).
 func TestLedgerRestartResolvedReplays(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ledger.journal")
-	l, _ := OpenLedger(path)
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	l, _ := OpenLedger(journal, lock)
 	l.Accept("req-1", "sha256:aaa")
 	_ = l.Finalize("req-1", "sha256:aaa", StateCompleted)
 	_ = l.Close()
 
-	l2, err := OpenLedger(path)
+	l2, err := OpenLedger(journal, lock)
 	if err != nil {
 		t.Fatalf("재열기: %v", err)
 	}
@@ -116,16 +122,134 @@ func TestLedgerRestartResolvedReplays(t *testing.T) {
 	}
 }
 
-// TestLedgerFlockExcludesSecondOpener는 파일락이 두 번째 실행자의 열기를 막음을 본다(한 실행자 선점).
-func TestLedgerFlockExcludesSecondOpener(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ledger.journal")
-	l, err := OpenLedger(path)
+// TestLedgerLockExcludesSameTargetDifferentJournal은 C3 핵심이다: 같은 target 파생 lock 경로면
+// **journal 경로가 달라도** 두 번째 실행자가 배제된다(경로 우회로 target당 1을 깨지 못한다).
+func TestLedgerLockExcludesSameTargetDifferentJournal(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "settlement.lock") // target 파생 고정 lock
+	l1, err := OpenLedger(filepath.Join(dir, "journalA"), lock)
 	if err != nil {
-		t.Fatalf("OpenLedger: %v", err)
+		t.Fatalf("첫 OpenLedger: %v", err)
+	}
+	t.Cleanup(func() { _ = l1.Close() })
+	// 다른 journal 경로지만 같은 lock — 두 번째는 배제돼야 한다.
+	if l2, err := OpenLedger(filepath.Join(dir, "journalB"), lock); err == nil {
+		_ = l2.Close()
+		t.Fatal("같은 target lock인데 다른 journal 경로로 두 번째 실행자가 열렸다(C3 · target당 하나 붕괴)")
+	}
+	// 첫 실행자가 닫으면 다시 열린다(락 해제).
+	_ = l1.Close()
+	l3, err := OpenLedger(filepath.Join(dir, "journalB"), lock)
+	if err != nil {
+		t.Fatalf("락 해제 후 재열기 실패: %v", err)
+	}
+	_ = l3.Close()
+}
+
+// TestLedgerSyncsParentDirOnCreateOnly는 C5다: 최초 journal 생성 시에만 부모 디렉터리를 fsync하고
+// 재열기 시엔 하지 않음을 본다(전원 장애 시 디렉터리 엔트리 유실 방지 · 불필요한 fsync 회피).
+func TestLedgerSyncsParentDirOnCreateOnly(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+
+	orig := syncDir
+	t.Cleanup(func() { syncDir = orig })
+	var calls int
+	syncDir = func(d string) error { calls++; return orig(d) }
+
+	l, err := OpenLedger(journal, lock)
+	if err != nil {
+		t.Fatalf("최초 OpenLedger: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("최초 생성 시 부모 디렉터리 fsync 1회여야 한다: calls=%d", calls)
+	}
+	_ = l.Close()
+
+	l2, err := OpenLedger(journal, lock) // 이미 존재 → fsync 없음
+	if err != nil {
+		t.Fatalf("재열기: %v", err)
+	}
+	t.Cleanup(func() { _ = l2.Close() })
+	if calls != 1 {
+		t.Fatalf("재열기 시 부모 디렉터리 fsync가 다시 불렸다(최초에만이어야): calls=%d", calls)
+	}
+}
+
+// TestLedgerTornTailTolerated는 C6다: 마지막 줄이 개행 없이 잘린 원장(정상 crash 결과)을 열면
+// 그 줄만 버리고 진행하며, 이전 ACCEPTED는 UNKNOWN으로 회복됨을 본다(기동 거부 아님).
+func TestLedgerTornTailTolerated(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	// 완전한 ACCEPTED 한 줄 + 개행 없이 잘린 부분 줄(torn tail).
+	content := `{"requestId":"req-1","digest":"sha256:aaa","state":"ACCEPTED","ts":"t"}` + "\n" + `{"requestId":"req-2","dig`
+	if err := os.WriteFile(journal, []byte(content), 0o600); err != nil {
+		t.Fatalf("write journal: %v", err)
+	}
+	l, err := OpenLedger(journal, lock)
+	if err != nil {
+		t.Fatalf("torn tail은 관용돼야 한다(기동 거부 아님): %v", err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	if _, err := OpenLedger(path); err == nil {
-		t.Fatal("이미 열린 원장을 두 번째 실행자가 열었다(flock 배제 실패 · target당 하나 위반)")
+	if st, ok := l.Status("req-1"); !ok || st != StateUnknown {
+		t.Fatalf("완전한 ACCEPTED는 UNKNOWN으로 회복돼야 한다: st=%q ok=%v", st, ok)
+	}
+	if _, ok := l.Status("req-2"); ok {
+		t.Fatal("torn tail(req-2)은 버려져야 한다 — 존재하면 안 된다")
+	}
+}
+
+// TestLedgerMidCorruptionFatal은 C6다: 개행으로 끝난 완전한 줄이 손상됐거나 중간 줄이 손상되면
+// 치명(기동 거부)임을 본다 — append-only 단일 writer에서 그런 손상은 torn이 아니라 진짜 오염이다.
+func TestLedgerMidCorruptionFatal(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	// 손상된 줄(개행 종료) + 그 뒤 완전한 줄 → 손상이 마지막이 아니다 = 치명.
+	content := "garbage-not-json\n" + `{"requestId":"req-2","digest":"d","state":"COMPLETED","ts":"t"}` + "\n"
+	if err := os.WriteFile(journal, []byte(content), 0o600); err != nil {
+		t.Fatalf("write journal: %v", err)
+	}
+	if l, err := OpenLedger(journal, lock); err == nil {
+		_ = l.Close()
+		t.Fatal("중간 줄 손상인데 기동됐다(치명이어야 한다 · fail-closed)")
+	}
+}
+
+// TestLedgerPoisonAfterWriteError는 C6다: 내구 기록에 실패하면 원장이 오염돼 이후 Accept를 전부
+// 거절함을 본다(부분 기록 위에 새 실행을 얹지 않는다 · 실행자 중단). journal fd를 닫아 write
+// 실패를 유도한다.
+func TestLedgerPoisonAfterWriteError(t *testing.T) {
+	l, _ := openTempLedger(t)
+	// journal fd를 닫아 다음 Accept의 append(write)가 실패하게 한다.
+	_ = l.journal.Close()
+	dec := l.Accept("req-1", "sha256:aaa")
+	if dec.Err == nil {
+		t.Fatal("write 실패인데 Accept가 오류를 내지 않았다(poison 실패)")
+	}
+	// 이후 Accept는 poison으로 전부 거절.
+	if dec2 := l.Accept("req-2", "sha256:bbb"); dec2.Err == nil {
+		t.Fatalf("poison 뒤 Accept가 거절되지 않았다: %+v", dec2)
+	}
+}
+
+// TestLedgerPermanentQuarantine은 재기동 후 남은 ACCEPTED가 사후조건 해소 전 새 배포를 영구히
+// 막음을 본다(quarantine — 반복 Accept가 계속 Busy). 사람이 해소해야 풀린다(조각 A는 자동 해소 없음).
+func TestLedgerPermanentQuarantine(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	l, _ := OpenLedger(journal, lock)
+	l.Accept("stuck", "sha256:aaa") // ACCEPTED 남긴 채 crash
+	_ = l.Close()
+
+	l2, err := OpenLedger(journal, lock)
+	if err != nil {
+		t.Fatalf("재열기: %v", err)
+	}
+	t.Cleanup(func() { _ = l2.Close() })
+	for i := 0; i < 3; i++ {
+		if dec := l2.Accept("new", "sha256:ccc"); !dec.Busy {
+			t.Fatalf("미해소 ACCEPTED가 있는 동안 새 requestId는 매번 Busy여야 한다(영구 격리): try=%d %+v", i, dec)
+		}
 	}
 }
 

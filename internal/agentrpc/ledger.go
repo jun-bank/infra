@@ -1,11 +1,13 @@
 package agentrpc
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -29,10 +31,13 @@ import (
 //     자동 재개는 조각 C).
 //   - **target당 하나만 실행**(quarantine): 비terminal 레코드가 있으면 다른 requestId의 새
 //     배포를 거절한다 — 재기동 후 남은 ACCEPTED가 사후조건 해소 전 새 배포를 막는 것과 같은
-//     불변식이다(R3 "실행 중 레코드 남은 채 재기동 = 새 배포 금지").
-//   - 파일락(flock LOCK_EX)으로 **한 실행자만** 이 원장을 연다 — 두 프로세스가 같은 위성에서
-//     동시에 배포하는 것을 프로세스 경계에서 막는다. 원장 부재/손상/권한/열기 실패는 빈 원장이
-//     아니라 **열기 거부**로 드러난다(fail-closed — 위성 기동이 거부된다).
+//     불변식이다(R3 "실행 중 레코드 남은 채 재기동 = 새 배포 금지"). 해소 전까지 영구 격리다.
+//   - **파일락은 target에 결박된다**(C3). journal 경로가 아니라 target 파생 고정 lock 경로에
+//     flock을 건다 — 같은 AGENT_TARGET을 다른 journal 경로로 두 번 띄워도 같은 lock을 놓고
+//     경합해 한 실행자만 연다. 원장 부재/손상/권한/열기 실패는 빈 원장이 아니라 **열기 거부**로
+//     드러난다(fail-closed — 위성 기동이 거부된다).
+//   - **write/fsync 오류 = poison**(C6): 한 번 내구 기록에 실패하면 원장을 오염 표시하고 이후
+//     모든 Accept를 거절한다(부분 기록 위에 새 실행을 얹지 않는다 — 실행자 중단).
 //
 // ⚠️ 조각 A 단순화(판단): R3의 ACCEPTED→RUNNING 중간 전이는 별도로 materialize하지 않는다 —
 // 조각 A는 재기동 시 ACCEPTED·RUNNING을 **동일하게 UNKNOWN**으로 회복하므로(둘 다 비terminal)
@@ -62,6 +67,20 @@ func (s LedgerState) terminal() bool {
 	}
 }
 
+// errLedgerPoisoned는 원장이 내구 기록 실패로 오염됐을 때 Accept가 싣는 오류다(실행자 중단).
+var errLedgerPoisoned = errors.New("agentrpc: 원장 오염(이전 내구 기록 실패) — 새 실행을 받지 않는다(fail-closed)")
+
+// syncDir는 디렉터리 엔트리를 fsync한다(C5 · 최초 원장 생성 시 부모 디렉터리 내구성). 패키지
+// 변수로 둔 것은 테스트가 "최초 생성 시에만 호출"을 관측하기 위해서다.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 // record는 journal 한 줄이다(JSON). 마지막 줄이 그 requestId의 현재 상태다.
 type record struct {
 	RequestID string      `json:"requestId"`
@@ -70,66 +89,109 @@ type record struct {
 	TS        string      `json:"ts"` // RFC3339 — 진단용(판정엔 쓰지 않는다)
 }
 
-// Ledger는 append-only journal 위의 crash-safe 상태 저장소다. 파일락으로 한 실행자만 연다.
+// Ledger는 append-only journal 위의 crash-safe 상태 저장소다. target 파생 lock 파일로 한
+// 실행자만 연다(journal과 lock은 별개 파일 — C3).
 type Ledger struct {
-	mu      sync.Mutex
-	f       *os.File
-	records map[string]record // requestId → 최신 레코드(재기동 시 journal replay로 복원)
-	now     func() time.Time
+	mu       sync.Mutex
+	journal  *os.File
+	lock     *os.File
+	records  map[string]record // requestId → 최신 레코드(재기동 시 journal replay로 복원)
+	now      func() time.Time
+	poisoned bool // 내구 기록 실패 후 true — 이후 Accept를 전부 거절(C6)
 }
 
-// OpenLedger는 원장 파일을 열고 배타 flock을 걸고 기존 journal을 replay한다. 이미 다른
-// 실행자가 락을 쥐고 있거나 파일을 열 수 없으면 오류다(fail-closed — 위성이 기동을 거부한다).
-func OpenLedger(path string) (*Ledger, error) {
-	// O_APPEND: 모든 쓰기가 원자적으로 파일 끝에 붙는다(부분 쓰기 중 재기동에도 이전 줄은 온전).
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+// OpenLedger는 target 파생 lock 파일에 배타 flock을 걸고(C3), journal을 열어 replay한다.
+// journalPath와 lockPath는 별개다: lockPath는 target에서 파생된 **고정** 경로여야 하며(경로가
+// 바뀌면 같은 target의 두 실행자가 서로 다른 lock을 잡아 배제가 무너진다), journalPath는 그
+// target의 상태가 쌓이는 곳이다. 최초 journal 생성 시 부모 디렉터리를 fsync한다(C5).
+func OpenLedger(journalPath, lockPath string) (*Ledger, error) {
+	// 1. target 파생 lock에 배타 락 — 같은 target의 두 번째 실행자를 프로세스 경계에서 막는다.
+	lf, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("agentrpc: 원장 열기 실패(fail-closed): %w", err)
+		return nil, fmt.Errorf("agentrpc: 원장 lock 파일 열기 실패(fail-closed): %w", err)
 	}
-	// 비블로킹 배타 락 — 같은 위성의 두 번째 실행자를 프로세스 경계에서 막는다(target당 하나).
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("agentrpc: 원장 파일락 획득 실패 — 다른 실행자가 이미 열었다(target당 하나 · fail-closed): %w", err)
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lf.Close()
+		return nil, fmt.Errorf("agentrpc: 원장 락 획득 실패 — 같은 target의 다른 실행자가 이미 쥐고 있다(target당 하나 · fail-closed): %w", err)
 	}
-	records, err := replay(f)
+
+	// 2. journal 열기 + 최초 생성이면 부모 디렉터리 fsync(C5 — 디렉터리 엔트리 유실 방지).
+	newlyCreated := false
+	if _, statErr := os.Stat(journalPath); errors.Is(statErr, os.ErrNotExist) {
+		newlyCreated = true
+	}
+	// O_APPEND: 모든 쓰기가 파일 끝에 붙는다(부분 쓰기 중 재기동에도 이전 줄은 온전).
+	jf, err := os.OpenFile(journalPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("agentrpc: 원장 replay 실패(손상 — fail-closed): %w", err)
+		_ = lf.Close()
+		return nil, fmt.Errorf("agentrpc: 원장 journal 열기 실패(fail-closed): %w", err)
 	}
-	return &Ledger{f: f, records: records, now: time.Now}, nil
+	if newlyCreated {
+		if err := syncDir(filepath.Dir(journalPath)); err != nil {
+			_ = jf.Close()
+			_ = lf.Close()
+			return nil, fmt.Errorf("agentrpc: 원장 부모 디렉터리 fsync 실패(디렉터리 엔트리 내구성 미보장 — 전원 장애 시 빈 원장 재생성·중복 실행 위험 · fail-closed): %w", err)
+		}
+	}
+
+	records, err := replay(jf)
+	if err != nil {
+		_ = jf.Close()
+		_ = lf.Close()
+		return nil, fmt.Errorf("agentrpc: 원장 replay 실패(중간 손상 — fail-closed): %w", err)
+	}
+	return &Ledger{journal: jf, lock: lf, records: records, now: time.Now}, nil
 }
 
 // replay는 journal을 처음부터 읽어 requestId별 최신 레코드를 복원한다(마지막 줄이 이긴다).
+// torn tail 관용(C6): **마지막 줄이 개행 없이 잘린 경우**(정상 crash 결과 — append 도중 종료)만
+// 그 줄을 버리고 진행한다. 그 requestId는 이전 ACCEPTED 레코드가 남아 UNKNOWN으로 회복된다.
+// 개행으로 끝난 완전한 줄이 손상됐거나(디스크 비트 손상) **중간** 줄이 손상되면 치명(기동 거부)
+// — append-only 단일 writer에서 torn은 언제나 맨 끝에만 생기므로, 그 밖의 손상은 진짜 오염이다.
 func replay(f *os.File) (map[string]record, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]record{}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
+	if len(data) == 0 {
+		return out, nil
+	}
+	endsNL := data[len(data)-1] == '\n'
+	parts := bytes.Split(data, []byte{'\n'})
+	if endsNL {
+		parts = parts[:len(parts)-1] // 마지막 개행 뒤 빈 조각 제거(깔끔한 끝)
+	}
+	for i, line := range parts {
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var r record
-		if err := json.Unmarshal(line, &r); err != nil {
-			// 손상된 줄 = 원장 신뢰 불가. 빈 원장으로 삼키지 않고 오류를 낸다(fail-closed).
-			return nil, fmt.Errorf("journal 줄 파싱 불가: %w", err)
-		}
-		if r.RequestID == "" {
-			return nil, fmt.Errorf("journal 줄에 requestId가 없다")
+		if err := json.Unmarshal(line, &r); err != nil || r.RequestID == "" {
+			isLast := i == len(parts)-1
+			if isLast && !endsNL {
+				// torn tail — 마지막 줄이 개행 없이 잘렸다(정상 crash) → 버리고 진행.
+				break
+			}
+			return nil, fmt.Errorf("journal 손상(치명): 줄 %d 파싱 불가(개행종료=%v · 마지막=%v)", i, endsNL, isLast)
 		}
 		out[r.RequestID] = r
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
 	}
 	return out, nil
 }
 
-// Close는 원장 파일을 닫는다(flock도 해제된다).
-func (l *Ledger) Close() error { return l.f.Close() }
+// Close는 journal·lock 파일을 닫는다(flock도 해제된다).
+func (l *Ledger) Close() error {
+	err1 := l.journal.Close()
+	err2 := l.lock.Close()
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
 
 // Decision은 Accept의 판정이다. 정확히 한 필드만 참이거나 Proceed다.
 type Decision struct {
@@ -141,7 +203,7 @@ type Decision struct {
 	Conflict bool
 	// Busy면 다른 requestId가 비terminal이라 target이 점유·격리됐다(거절 · 부작용 0).
 	Busy bool
-	// Err는 내구 기록 실패다(ACCEPTED fsync 실패 — 실행하면 안 된다 · fail-closed).
+	// Err는 내구 기록 실패·원장 오염이다(실행하면 안 된다 · fail-closed).
 	Err error
 }
 
@@ -151,6 +213,9 @@ func (l *Ledger) Accept(requestID, digest string) Decision {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.poisoned {
+		return Decision{Err: errLedgerPoisoned}
+	}
 	if r, ok := l.records[requestID]; ok {
 		if r.Digest != digest {
 			return Decision{Conflict: true}
@@ -211,17 +276,20 @@ func (l *Ledger) hasNonTerminalLocked() bool {
 
 // appendLocked는 레코드 한 줄을 append + fsync하고 in-memory 맵을 갱신한다(mu 보유 전제).
 // fsync가 crash-safety의 핵심이다 — 페이지 캐시에만 있으면 재기동 시 사라져 상태가 되감긴다.
+// write·fsync 오류는 원장을 poison해 이후 Accept를 전부 거절하게 한다(부분 기록 위에 실행 금지 · C6).
 func (l *Ledger) appendLocked(r record) error {
 	line, err := json.Marshal(r)
 	if err != nil {
 		return err
 	}
 	line = append(line, '\n')
-	if _, err := l.f.Write(line); err != nil {
-		return err
+	if _, err := l.journal.Write(line); err != nil {
+		l.poisoned = true
+		return fmt.Errorf("agentrpc: 원장 write 실패(poison · fail-closed): %w", err)
 	}
-	if err := l.f.Sync(); err != nil {
-		return fmt.Errorf("agentrpc: 원장 fsync 실패(내구 기록 불가 · fail-closed): %w", err)
+	if err := l.journal.Sync(); err != nil {
+		l.poisoned = true
+		return fmt.Errorf("agentrpc: 원장 fsync 실패(내구 기록 불가 · poison · fail-closed): %w", err)
 	}
 	l.records[r.RequestID] = r
 	return nil

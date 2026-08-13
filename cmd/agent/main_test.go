@@ -468,3 +468,51 @@ func TestRunUnsetRoleFailsClosed(t *testing.T) {
 		t.Error("run(\"\"): 오류 기대했으나 nil — ROLE 없이 기동되면 안 된다")
 	}
 }
+
+// TestLeaseCoversRemote는 C1②다: 원격 route 등록 시 lease가 RPC_TIMEOUT+slack보다 짧으면
+// 거절하고 충분하면 통과함을 본다(coordinator가 락 보유 중 RPC_TIMEOUT까지 블로킹).
+func TestLeaseCoversRemote(t *testing.T) {
+	rpc := 4 * time.Minute
+	// lease가 rpc+slack과 동률보다 1ns 부족 = 거절(음수 여유 방지).
+	if err := leaseCoversRemote(rpc+dispatchLeaseSlack-time.Nanosecond, rpc); err == nil {
+		t.Fatal("lease < RPC_TIMEOUT + slack인데 통과(fail-closed 위반)")
+	}
+	// 정확히 rpc+slack = 통과.
+	if err := leaseCoversRemote(rpc+dispatchLeaseSlack, rpc); err != nil {
+		t.Fatalf("lease = RPC_TIMEOUT + slack인데 거절: %v", err)
+	}
+	// RPC_TIMEOUT이 overflow 범위면 거절.
+	if err := leaseCoversRemote(time.Hour, 2*maxDispatchDuration); err == nil {
+		t.Fatal("RPC_TIMEOUT이 상한 초과인데 통과(overflow 방어 위반)")
+	}
+}
+
+// TestDefaultConfigLeaseCoversRemote는 기본 설정끼리 원격 하한을 만족함을 본다(기본 lease가
+// 기본 RPC_TIMEOUT+slack을 덮는다 — 기본값 자기정합).
+func TestDefaultConfigLeaseCoversRemote(t *testing.T) {
+	if err := leaseCoversRemote(defaultDeployLease, defaultRPCTimeout); err != nil {
+		t.Fatalf("기본 lease가 기본 RPC_TIMEOUT+slack을 덮지 못한다(기본값 부정합): %v", err)
+	}
+}
+
+// TestBuildRoutingDispatcherRejectsOneSidedRemote는 위성 키·URL 중 한쪽만 설정하면 오설정으로
+// 기동을 거부함을 본다(fail-closed). 둘 다 없으면 미등록으로 통과(라우터에서 fail-closed 거절).
+func TestBuildRoutingDispatcherRejectsOneSidedRemote(t *testing.T) {
+	local := deploy.StubDispatcher{}
+	t.Setenv("AGENT_RPC_KEY_SETTLEMENT", "some-key")
+	t.Setenv("AGENT_REMOTE_URL_SETTLEMENT", "") // 한쪽만 설정
+	if _, _, _, err := buildRoutingDispatcher(local); err == nil {
+		t.Fatal("위성 키만 있고 URL이 없는데 통과(오설정 fail-closed 위반)")
+	}
+
+	// 둘 다 미설정(ledger) + settlement도 정리 → 미등록으로 통과, remoteRegistered=false.
+	t.Setenv("AGENT_RPC_KEY_SETTLEMENT", "")
+	t.Setenv("AGENT_REMOTE_URL_SETTLEMENT", "")
+	_, remoteReg, _, err := buildRoutingDispatcher(local)
+	if err != nil {
+		t.Fatalf("원격 미설정은 통과해야 한다(미등록): %v", err)
+	}
+	if remoteReg {
+		t.Fatal("원격 미설정인데 remoteRegistered=true")
+	}
+}

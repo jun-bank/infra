@@ -8,16 +8,17 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jun-bank/infra/internal/deploy"
 	"github.com/jun-bank/infra/internal/store"
 )
 
-// maxRequestBytes는 수신 body 상한이다(서명된 manifest+token — 동봉 compose 포함해도 작다).
-const maxRequestBytes = 1 << 20
+// defaultMaxBodyBytes는 수신 body 상한 기본값이다(서명된 manifest+token — 동봉 compose 포함해도 작다).
+const defaultMaxBodyBytes int64 = 1 << 20
 
-// ServerConfig는 위성 실행자(Handler)의 배선이다. main이 아니라 위성(ROLE=agent)이 조립한다.
+// ServerConfig는 위성 실행자(Server)의 배선이다. main이 아니라 위성(ROLE=agent)이 조립한다.
 type ServerConfig struct {
 	// Target은 이 위성이 담당하는 유일 대상이다(AGENT_TARGET ∈ {settlement,ledger}). manifest의
 	// target이 이것과 다르면 부작용 전에 거절한다(R5 오배선 방어).
@@ -25,20 +26,32 @@ type ServerConfig struct {
 	// Key는 이 위성의 개별 RPC 키다(AGENT_RPC_KEY). 수신 요청 서명 검증·응답 서명에 쓴다.
 	Key []byte
 	// Dispatcher는 로컬 실행 지점이다 — 위성은 internal/dispatch를 재사용하는 deploy.LocalDispatcher를
-	// 주입받아 자기 호스트를 배포한다(B5/G2 · 실행 로직 중복 0). settlement/ledger는 단일 경로
-	// (Gateway 없음)라 fencing token을 쓰지 않는다.
+	// 주입받아 자기 호스트를 배포한다(B5/G2 · 실행 로직 중복 0).
 	Dispatcher deploy.Dispatcher
 	// Ledger는 crash-safe 원장이다(멱등·재기동 안전·quarantine).
 	Ledger *Ledger
 	// ExecBudget은 요청 ctx와 분리된 background 실행의 상한이다(R7). 요청이 끊겨도 ACCEPTED 이후
 	// 실행은 취소되지 않아야 하므로, 요청 ctx가 아니라 이 상한이 dispatch를 감싼다.
 	ExecBudget time.Duration
-	now        func() time.Time
+	// Skew는 RPC timestamp 신선도 허용 창이다(C4). 서명이 유효해도 이 창 밖이면 거절한다 —
+	// 가로챈 유효 요청을 락 만료 후 재생하는 것을 막는다(replay 방어). >0 필수(fail-closed).
+	Skew time.Duration
+	// MaxBodyBytes는 수신 body 상한이다(C7 · slow-body/거대 body DoS 방어). ≤0이면 기본값.
+	MaxBodyBytes int64
+	now          func() time.Time
 }
 
-// Handler는 위성 실행자의 HTTP 핸들러를 만든다: POST /agent/deploy · GET /agent/status.
-// 설정 검증은 fail-closed다 — 키·dispatcher·원장·target·budget 중 하나라도 없으면 오류.
-func Handler(cfg ServerConfig) (http.Handler, error) {
+// Server는 위성 실행자다. HTTP 핸들러(ServeHTTP)와 in-flight 실행 배수(WaitInFlight)를 함께
+// 제공해, 종료 시 ACCEPTED된 배포가 terminal을 내구 기록할 때까지 소유·대기하게 한다(C1①).
+type Server struct {
+	cfg      ServerConfig
+	mux      http.Handler
+	inflight sync.WaitGroup
+}
+
+// NewServer는 위성 실행자를 만든다: POST /agent/deploy · GET /agent/status. 설정 검증은
+// fail-closed다 — 키·dispatcher·원장·target·budget·skew 중 하나라도 없으면 오류.
+func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := ValidateKey(cfg.Key); err != nil {
 		return nil, err
 	}
@@ -46,7 +59,6 @@ func Handler(cfg ServerConfig) (http.Handler, error) {
 		return nil, fmt.Errorf("agentrpc: AGENT_TARGET이 닫힌 집합 밖(fail-closed): %q", cfg.Target)
 	}
 	if cfg.Target != deploy.TargetSettlement && cfg.Target != deploy.TargetLedger {
-		// 위성은 settlement·ledger만 담당한다(core·gateway는 .9 로컬 배포다 — 오배선 방어).
 		return nil, fmt.Errorf("agentrpc: 위성 AGENT_TARGET은 settlement|ledger여야 한다(core·gateway는 .9 로컬): %q", cfg.Target)
 	}
 	if cfg.Dispatcher == nil {
@@ -58,6 +70,12 @@ func Handler(cfg ServerConfig) (http.Handler, error) {
 	if cfg.ExecBudget <= 0 {
 		return nil, fmt.Errorf("agentrpc: ExecBudget은 >0 이어야 한다(fail-closed): %s", cfg.ExecBudget)
 	}
+	if cfg.Skew <= 0 {
+		return nil, fmt.Errorf("agentrpc: RPC skew는 >0 이어야 한다(신선도 창 · fail-closed): %s", cfg.Skew)
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = defaultMaxBodyBytes
+	}
 	if cfg.now == nil {
 		cfg.now = time.Now
 	}
@@ -65,27 +83,47 @@ func Handler(cfg ServerConfig) (http.Handler, error) {
 	copy(k, cfg.Key)
 	cfg.Key = k
 
-	s := &server{cfg: cfg}
+	s := &Server{cfg: cfg}
 	mux := http.NewServeMux()
 	mux.HandleFunc(PathDeploy, s.handleDeploy)
 	mux.HandleFunc(PathStatus, s.handleStatus)
-	return mux, nil
+	s.mux = mux
+	return s, nil
 }
 
-type server struct{ cfg ServerConfig }
+// ServeHTTP는 내부 mux로 위임한다(Server가 http.Handler).
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
-// handleDeploy는 배포 명령을 수신·검증·실행한다. 순서(부작용은 target 결박·멱등 통과 뒤에만):
+// WaitInFlight는 진행 중인(ACCEPTED된) 배포 실행이 전부 terminal을 기록하고 끝날 때까지
+// 기다린다(C1① — 종료 시 in-flight 소유). ctx가 먼저 끝나면 ctx.Err()를 낸다. 호출자(runAgent)는
+// 리스너를 닫아 새 요청을 막은 뒤 이 함수를 ExecBudget까지 기다려, SIGTERM이 pull/up 도중
+// dispatch·terminal 기록을 끊지 않게 한다.
+func (s *Server) WaitInFlight(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() { s.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// handleDeploy는 배포 명령을 수신·검증·실행한다. 순서(부작용은 신선도·target 결박·멱등 통과 뒤에만):
 //
-//	RPC 서명 검증(위성 자기 키) → manifest 파싱 → AGENT_TARGET 결박(R5) → 원장 Accept(멱등·
-//	quarantine·충돌) → background context로 로컬 dispatch(R7) → terminal 내구 기록 → 응답 서명(R1).
-func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
+//	body 상한(C7) → RPC 서명 검증(위성 자기 키) → 신선도 창(C4) → manifest 파싱 → requestId 결박
+//	→ AGENT_TARGET 결박(R5) → 원장 Accept(멱등·quarantine·충돌) → background dispatch(R7) →
+//	(COMPLETED,err)=UNKNOWN 정규화(C2) → terminal 내구 기록 → 응답 서명(R1).
+func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes))
+	// C7 — HMAC 검증 **전에** body를 상한한다(거대·slow body가 handler·FD를 무기한 점유하는 것 방지).
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
+		http.Error(w, "body too large or read error", http.StatusRequestEntityTooLarge)
 		return
 	}
 	requestID := r.Header.Get(HeaderRequestID)
@@ -93,11 +131,16 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	reqDigest := BodyDigest(body)
 
 	// RPC 서명 검증(위성 자기 키). 실패면 서명 없는 401 — main은 검증 불가 응답을 UNKNOWN으로
-	// 접는다(R2). main은 정상적으로 이 경로를 트리거하지 않는다(같은 코드가 서명한다) — 위조·
-	// 키불일치·비인가 프로세스만 여기 온다. 부작용 전이므로 원장을 건드리지 않는다.
+	// 접는다(R2). 부작용 전이므로 원장을 건드리지 않는다.
 	canonical := RequestCanonical(http.MethodPost, PathDeploy, reqDigest, requestID, ts)
 	if requestID == "" || !Verify(s.cfg.Key, canonical, r.Header.Get(HeaderSignature)) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// C4 — 신선도 창. 서명이 유효해도 timestamp가 창 밖이면 거절한다(가로챈 유효 POST를 락 만료
+	// 후 재생하면 원장에 없어 신규 ACCEPTED로 실행되는 stale 실행 차단). 부작용 전이다.
+	if !s.freshOK(ts) {
+		http.Error(w, "stale request (freshness window)", http.StatusUnauthorized)
 		return
 	}
 
@@ -130,8 +173,8 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	dec := s.cfg.Ledger.Accept(requestID, reqDigest)
 	switch {
 	case dec.Err != nil:
-		// ACCEPTED fsync 실패 = 상태를 내구 기록할 수 없다. 실행하지 않았으나 원장이 손상됐을 수
-		// 있어 UNKNOWN으로 접는다(사람 개입 — fail-closed).
+		// ACCEPTED fsync 실패·원장 오염 = 상태를 내구 기록할 수 없다. 실행하지 않았으나 원장이
+		// 손상됐을 수 있어 UNKNOWN으로 접는다(사람 개입 — fail-closed).
 		s.respond(w, requestID, reqDigest, ActionDeploy, string(StateUnknown), "원장 기록 실패(실행 안 함): "+dec.Err.Error())
 		return
 	case dec.Conflict:
@@ -148,19 +191,28 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Proceed — ACCEPTED가 내구 기록됐다. 로컬 dispatch를 **background context**로 실행한다(R7):
-	// main 요청 ctx가 끊겨도(응답 타임아웃 등) 이미 수락한 실행을 취소하지 않는다. 취소로 docker를
-	// 중간에 죽이면 부분 상태가 남는다 — WithoutCancel로 취소 축만 끊고 ExecBudget으로 상한한다.
+	// Proceed — ACCEPTED가 내구 기록됐다. 이 실행을 in-flight로 표시해 종료 시 소유·대기하게 한다(C1①).
+	s.inflight.Add(1)
+	defer s.inflight.Done()
+
+	// 로컬 dispatch를 **background context**로 실행한다(R7): main 요청 ctx가 끊겨도(응답 타임아웃
+	// 등) 이미 수락한 실행을 취소하지 않는다. 취소로 docker를 중간에 죽이면 부분 상태가 남는다 —
+	// WithoutCancel로 취소 축만 끊고 ExecBudget으로 상한한다.
 	execCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.cfg.ExecBudget)
 	defer cancel()
 	state, derr := s.cfg.Dispatcher.Dispatch(execCtx, m, store.FencingToken(env.FencingToken))
 
-	// dispatch가 정의 밖 상태를 내면 UNKNOWN으로 접는다(coordinator와 같은 방어 — 미실행 오인 금지).
-	ledgerState := toLedgerState(state)
-	detail := "composePath dispatch"
-	if derr != nil {
+	// C2 — 모순 조합 정규화(coordinator.go:265와 동일 규칙). (COMPLETED, err≠nil)은 완료와 실패를
+	// 동시에 주장하는 조합이라 완료를 신뢰할 수 없다 → UNKNOWN. 이 정규화를 위성이 하지 않으면
+	// main이 COMPLETED,nil로 받아 성공·락 해제해 coordinator의 같은 정규화를 우회한다(greenwashing).
+	detail := "dispatch 완료"
+	if state == deploy.StateCompleted && derr != nil {
+		state = deploy.StateUnknown
+		detail = "모순 조합(dispatch가 COMPLETED와 오류를 함께 보고) — 완료를 신뢰할 수 없다: " + derr.Error()
+	} else if derr != nil {
 		detail = derr.Error()
 	}
+	ledgerState := toLedgerState(state)
 
 	// terminal을 내구 기록(fsync)한 **뒤에만** 응답한다. 기록 실패면 실행은 했으나 상태를 증명할
 	// 수 없다 → UNKNOWN 응답(main이 락 유지·사람). crash window(dispatch 성공→기록 전 죽음)도
@@ -173,10 +225,9 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, requestID, reqDigest, ActionDeploy, string(ledgerState), detail)
 }
 
-// handleStatus는 requestId의 현재 상태를 조회한다(부작용 0 · 조회만 — 재개는 조각 C). 서명
-// 검증은 GET·PathStatus·빈 body digest로 한다. 없는 requestId는 UNEXECUTED로 보고한다
-// (아직 이 위성이 그 요청을 본 적이 없다는 뜻 — 위성 로컬엔 부작용이 없다).
-func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
+// handleStatus는 requestId의 현재 상태를 조회한다(부작용 0 · 조회만 — 재개는 조각 C). 본 적 없는
+// requestId는 **WireAbsent**로 보고한다(C8 — durable-UNEXECUTED와 서명 계약에서 구분).
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -189,19 +240,43 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if !s.freshOK(ts) {
+		http.Error(w, "stale request (freshness window)", http.StatusUnauthorized)
+		return
+	}
 	state, ok := s.cfg.Ledger.Status(requestID)
 	if !ok {
-		s.respond(w, requestID, emptyDigest, ActionStatus, string(StateUnexecuted), "이 위성이 본 적 없는 requestId(부작용0)")
+		// ABSENT — 이 위성이 본 적 없는 requestId. durable-UNEXECUTED(실행 후 부작용0 증명)와
+		// 다른 별도 wire 상태로 서명한다(C8 · 조각 C가 재개 근거로 오인하지 않게).
+		s.respond(w, requestID, emptyDigest, ActionStatus, WireAbsent, "이 위성이 본 적 없는 requestId(부작용0)")
 		return
 	}
 	s.respond(w, requestID, emptyDigest, ActionStatus, string(state), "원장 상태 조회(조회만 · 재개 없음)")
+}
+
+// freshOK는 RPC timestamp를 엄격 파싱해 신선도 창 안인지 본다(C4). 엄격 10진(재직렬화 일치)이며,
+// 파싱 실패·창 밖은 거절이다. |now - ts| ≤ Skew.
+func (s *Server) freshOK(ts string) bool {
+	sec, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return false
+	}
+	// 엄격 10진 — 앞자리 0·부호·공백 등 canonical과 어긋나는 표기를 거른다(재직렬화 정확 일치).
+	if strconv.FormatInt(sec, 10) != ts {
+		return false
+	}
+	diff := s.cfg.now().Unix() - sec
+	if diff < 0 {
+		diff = -diff
+	}
+	return time.Duration(diff)*time.Second <= s.cfg.Skew
 }
 
 // respond는 서명된 응답을 쓴다(R1). 모든 인증된 응답은 HTTP 200이며 실제 결과는 state 필드가
 // 나른다 — httpStatus를 서명에 결박하므로 상태코드를 일관되게 두는 편이 검증을 단순하게 한다.
 // requestBodyDigest는 **수신 요청의 digest**다(응답을 그 요청에 결박 — R1). detail에 시크릿을
 // 담지 않는다(로그·응답 노출 금지 — 금지영역).
-func (s *server) respond(w http.ResponseWriter, requestID, requestBodyDigest, action, state, detail string) {
+func (s *Server) respond(w http.ResponseWriter, requestID, requestBodyDigest, action, state, detail string) {
 	const httpStatus = http.StatusOK
 	canonical := ResponseCanonical(requestID, requestBodyDigest, action, strconv.Itoa(httpStatus), state)
 	sig := Sign(s.cfg.Key, canonical)
