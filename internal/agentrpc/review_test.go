@@ -16,26 +16,35 @@ import (
 	"github.com/jun-bank/infra/internal/store"
 )
 
-// signedDeployReq는 지정 requestID·timestamp로 서명된 배포 요청(httptest.NewRequest)을 만든다.
+// testNonce는 서버측 단위 테스트가 쓰는 고정 per-query nonce다 — 서버는 nonce를 그대로 echo·결박만
+// 하므로(유일성은 main이 소유) 고정값으로 canonical 정합만 맞으면 된다. 응답 서명 재검증에도 쓴다.
+const testNonce = "0123456789abcdef0123456789abcdef"
+
+// signedDeployReq는 지정 requestID·timestamp로 서명된 배포 요청(httptest.NewRequest)을 만든다
+// (attempt=firstAttempt · nonce=testNonce 결박 — 조각 C R1·R2).
 func signedDeployReq(key []byte, requestID string, tsUnix int64, m deploy.Manifest, token uint64) *http.Request {
 	mb, _ := json.Marshal(m)
 	body, _ := json.Marshal(deployRequest{Manifest: mb, FencingToken: token})
 	ts := strconv.FormatInt(tsUnix, 10)
-	sig := Sign(key, RequestCanonical(http.MethodPost, PathDeploy, BodyDigest(body), requestID, ts))
+	attempt := strconv.Itoa(firstAttempt)
+	sig := Sign(key, RequestCanonical(http.MethodPost, PathDeploy, BodyDigest(body), requestID, ts, testNonce, attempt))
 	req := httptest.NewRequest(http.MethodPost, PathDeploy, bytes.NewReader(body))
 	req.Header.Set(HeaderRequestID, requestID)
 	req.Header.Set(HeaderTimestamp, ts)
+	req.Header.Set(HeaderNonce, testNonce)
+	req.Header.Set(HeaderAttempt, attempt)
 	req.Header.Set(HeaderSignature, sig)
 	return req
 }
 
-// signedStatusReq는 서명된 상태 조회 요청(GET)을 만든다.
+// signedStatusReq는 서명된 상태 조회 요청(GET)을 만든다(nonce=testNonce 결박 · attempt 없음).
 func signedStatusReq(key []byte, requestID string, tsUnix int64) *http.Request {
 	ts := strconv.FormatInt(tsUnix, 10)
-	sig := Sign(key, RequestCanonical(http.MethodGet, PathStatus, BodyDigest(nil), requestID, ts))
+	sig := Sign(key, RequestCanonical(http.MethodGet, PathStatus, BodyDigest(nil), requestID, ts, testNonce, ""))
 	req := httptest.NewRequest(http.MethodGet, PathStatus, nil)
 	req.Header.Set(HeaderRequestID, requestID)
 	req.Header.Set(HeaderTimestamp, ts)
+	req.Header.Set(HeaderNonce, testNonce)
 	req.Header.Set(HeaderSignature, sig)
 	return req
 }
@@ -186,12 +195,12 @@ func TestStatusAbsentDistinctFromDurableUnexecuted(t *testing.T) {
 		t.Fatalf("본 적 없는 requestId는 ABSENT여야 한다: %q", absent.State)
 	}
 	// 응답 서명이 그 상태에 결박됐는지도 확인(위조 방어).
-	if !Verify(key, ResponseCanonical("never", BodyDigest(nil), ActionStatus, "200", WireAbsent), rec.Header().Get(HeaderSignature)) {
+	if !Verify(key, ResponseCanonical("never", BodyDigest(nil), ActionStatus, "200", WireAbsent, testNonce), rec.Header().Get(HeaderSignature)) {
 		t.Fatal("ABSENT 응답 서명이 검증되지 않는다")
 	}
 
 	// 2) durable UNEXECUTED 기록 후 조회 → UNEXECUTED
-	if dec := ledger.Accept("req-u", "d"); !dec.Proceed {
+	if dec := ledger.Accept("req-u", "d", firstAttempt); !dec.Proceed {
 		t.Fatalf("Accept: %+v", dec)
 	}
 	if err := ledger.Finalize("req-u", "d", StateUnexecuted); err != nil {
