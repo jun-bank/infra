@@ -7,9 +7,10 @@ import (
 	"strconv"
 )
 
-// 위성 fence-confirm의 서명 형식·wire 타입(infra#37 조각 B · G-1 replay 방어). 조각 A의
-// RequestCanonical/ResponseCanonical과 **완전히 별도**다 — 조각 A canonical은 무변경이며,
-// 이 파일은 crypto/hmac·sha256 프리미티브와 위성별 키만 재사용한다(Sign/Verify/BodyDigest).
+// 위성 fence-confirm의 서명 형식·wire 타입(infra#37 조각 B · G-1 replay 방어). 배포용
+// RequestCanonical/ResponseCanonical과 **완전히 별도 함수·도메인**이다(조각 C가 그 두 함수에
+// nonce·attempt를 더했어도 이 파일은 무관·불변) — 이 파일은 crypto/hmac·sha256 프리미티브와
+// 위성별 키만 재사용한다(Sign/Verify/BodyDigest).
 //
 // 왜 별도 canonical인가(치명 G-1): 조각 A의 응답 canonical은 같은 requestId+digest면 매번
 // 동일한 바이트열을 서명한다. 그래서 락 상실 **전**에 서명된 HELD 응답을 가로채 두었다가

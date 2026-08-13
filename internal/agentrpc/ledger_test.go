@@ -459,3 +459,31 @@ func TestLedgerConflictDominatesAttempt(t *testing.T) {
 		t.Fatalf("다른 digest는 attempt와 무관하게 Conflict여야 한다: %+v", dec)
 	}
 }
+
+// TestLedgerLegacyRecordNormalizedToFirstAttempt는 C-C1 하위호환이다: attempt 필드가 **없는** 조각 A
+// legacy 레코드(UNEXECUTED)를 열면 attempt가 firstAttempt(1)로 정규화돼, 업그레이드 후 정상
+// execute#1(attempt 1)이 **중복 Report**(재개 아님)로 잡히고 재개(attempt 2)만 Proceed임을 본다.
+// 정규화가 없으면 execute#1이 0+1=1로 재개 조건을 만족해 중복 실행된다(조각 A "중복=Report" 파손).
+func TestLedgerLegacyRecordNormalizedToFirstAttempt(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	// 조각 A 시절 journal — attempt 필드 자체가 없다(그 시절엔 존재하지 않던 필드).
+	legacy := `{"requestId":"req-1","digest":"sha256:aaa","state":"UNEXECUTED","ts":"t"}` + "\n"
+	if err := os.WriteFile(journal, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write legacy journal: %v", err)
+	}
+	l, err := OpenLedger(journal, lock)
+	if err != nil {
+		t.Fatalf("legacy journal 열기 실패: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	// execute#1(attempt 1) = 정규화된 UNEXECUTED@1과 같은 attempt = 중복 → Report UNEXECUTED(재실행 없음).
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt); dec.Proceed || dec.Report != StateUnexecuted {
+		t.Fatalf("legacy UNEXECUTED에 대한 execute#1(attempt 1)은 중복 Report여야 한다(재개 아님 · 중복 실행 차단): %+v", dec)
+	}
+	// 재개(attempt 2)만 Proceed — 정규화 덕에 축이 정상(1→2)으로 선다.
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt+1); !dec.Proceed {
+		t.Fatalf("legacy UNEXECUTED@1에 대한 attempt 2는 재개 Proceed여야 한다: %+v", dec)
+	}
+}
