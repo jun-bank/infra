@@ -1,10 +1,14 @@
 package agentrpc
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// errTestDirSync는 dir fsync 실패 주입용 센티넬이다.
+var errTestDirSync = errors.New("test: dir sync fail")
 
 // openTempLedger는 journal·lock을 같은 temp 디렉터리에 두고 원장을 연다(단위 테스트용).
 func openTempLedger(t *testing.T) (*Ledger, string) {
@@ -146,9 +150,9 @@ func TestLedgerLockExcludesSameTargetDifferentJournal(t *testing.T) {
 	_ = l3.Close()
 }
 
-// TestLedgerSyncsParentDirOnCreateOnly는 C5다: 최초 journal 생성 시에만 부모 디렉터리를 fsync하고
-// 재열기 시엔 하지 않음을 본다(전원 장애 시 디렉터리 엔트리 유실 방지 · 불필요한 fsync 회피).
-func TestLedgerSyncsParentDirOnCreateOnly(t *testing.T) {
+// TestLedgerSyncsParentDirEveryOpen은 C5다: 부모 디렉터리 fsync를 **매 OpenLedger마다** 함을
+// 본다(최초 생성에만 하면 생성 시 fsync 실패가 한 번의 재시작으로 우회되기 때문 · 멱등).
+func TestLedgerSyncsParentDirEveryOpen(t *testing.T) {
 	dir := t.TempDir()
 	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
 
@@ -162,17 +166,30 @@ func TestLedgerSyncsParentDirOnCreateOnly(t *testing.T) {
 		t.Fatalf("최초 OpenLedger: %v", err)
 	}
 	if calls != 1 {
-		t.Fatalf("최초 생성 시 부모 디렉터리 fsync 1회여야 한다: calls=%d", calls)
+		t.Fatalf("최초 open 시 부모 디렉터리 fsync 1회여야 한다: calls=%d", calls)
 	}
 	_ = l.Close()
 
-	l2, err := OpenLedger(journal, lock) // 이미 존재 → fsync 없음
+	l2, err := OpenLedger(journal, lock) // 이미 존재해도 다시 fsync
 	if err != nil {
 		t.Fatalf("재열기: %v", err)
 	}
 	t.Cleanup(func() { _ = l2.Close() })
-	if calls != 1 {
-		t.Fatalf("재열기 시 부모 디렉터리 fsync가 다시 불렸다(최초에만이어야): calls=%d", calls)
+	if calls != 2 {
+		t.Fatalf("재열기 시에도 부모 디렉터리 fsync를 해야 한다(매 open · 우회 방지): calls=%d", calls)
+	}
+}
+
+// TestLedgerDirSyncFailFailsClosed는 dir fsync 실패 시 기동을 거부함을 본다(fail-closed).
+func TestLedgerDirSyncFailFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	orig := syncDir
+	t.Cleanup(func() { syncDir = orig })
+	syncDir = func(string) error { return errTestDirSync }
+	if l, err := OpenLedger(journal, lock); err == nil {
+		_ = l.Close()
+		t.Fatal("dir fsync 실패인데 기동됐다(fail-closed 위반)")
 	}
 }
 
@@ -186,6 +203,7 @@ func TestLedgerTornTailTolerated(t *testing.T) {
 	if err := os.WriteFile(journal, []byte(content), 0o600); err != nil {
 		t.Fatalf("write journal: %v", err)
 	}
+	firstLine := `{"requestId":"req-1","digest":"sha256:aaa","state":"ACCEPTED","ts":"t"}` + "\n"
 	l, err := OpenLedger(journal, lock)
 	if err != nil {
 		t.Fatalf("torn tail은 관용돼야 한다(기동 거부 아님): %v", err)
@@ -196,6 +214,44 @@ func TestLedgerTornTailTolerated(t *testing.T) {
 	}
 	if _, ok := l.Status("req-2"); ok {
 		t.Fatal("torn tail(req-2)은 버려져야 한다 — 존재하면 안 된다")
+	}
+	// C6 — torn tail이 **디스크에서도** 잘렸는지(파일 크기 = 마지막 정상 줄까지).
+	fi, ferr := os.Stat(journal)
+	if ferr != nil {
+		t.Fatalf("stat: %v", ferr)
+	}
+	if fi.Size() != int64(len(firstLine)) {
+		t.Fatalf("torn tail이 디스크에서 truncate되지 않았다: size=%d want=%d", fi.Size(), len(firstLine))
+	}
+}
+
+// TestLedgerTornTailTruncateSurvivesReopen은 C6 핵심이다: torn tail을 truncate한 뒤 이어 쓴
+// 레코드가 재기동에서 치명 손상으로 뒤집히지 않음을 본다(찢어진 조각 뒤 append 방지).
+func TestLedgerTornTailTruncateSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	content := `{"requestId":"req-1","digest":"sha256:aaa","state":"ACCEPTED","ts":"t"}` + "\n" + `{"requestId":"req-2","dig`
+	if err := os.WriteFile(journal, []byte(content), 0o600); err != nil {
+		t.Fatalf("write journal: %v", err)
+	}
+	l, err := OpenLedger(journal, lock) // torn tail truncate
+	if err != nil {
+		t.Fatalf("OpenLedger: %v", err)
+	}
+	// truncate 이후 이어 쓰기(req-1 terminal). truncate가 없으면 이 줄이 찢어진 조각 뒤에 붙는다.
+	if err := l.Finalize("req-1", "sha256:aaa", StateCompleted); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	_ = l.Close()
+
+	// 재기동 — truncate 덕에 중간 손상 없이 열려야 하고 COMPLETED가 복원돼야 한다.
+	l2, err := OpenLedger(journal, lock)
+	if err != nil {
+		t.Fatalf("재기동이 치명 손상으로 실패했다(truncate 누락 시 발생): %v", err)
+	}
+	t.Cleanup(func() { _ = l2.Close() })
+	if st, ok := l2.Status("req-1"); !ok || st != StateCompleted {
+		t.Fatalf("재기동 후 COMPLETED가 복원돼야 한다: st=%q ok=%v", st, ok)
 	}
 }
 

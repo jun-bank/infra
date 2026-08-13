@@ -44,9 +44,14 @@ type ServerConfig struct {
 // Server는 위성 실행자다. HTTP 핸들러(ServeHTTP)와 in-flight 실행 배수(WaitInFlight)를 함께
 // 제공해, 종료 시 ACCEPTED된 배포가 terminal을 내구 기록할 때까지 소유·대기하게 한다(C1①).
 type Server struct {
-	cfg      ServerConfig
-	mux      http.Handler
-	inflight sync.WaitGroup
+	cfg ServerConfig
+	mux http.Handler
+	// gate는 종료 gate와 in-flight 등록을 **원자로** 묶는다(C1). shuttingDown 확인과 inflight.Add를
+	// 같은 락 안에서 해, WaitInFlight가 gate를 닫은 뒤엔 어떤 새 실행도 등록되지 못하게 한다 —
+	// "Accept 직전 등록" + "gate 닫힘 뒤 신규 거절"로 shutdown race(등록 전 공백)를 없앤다.
+	gate         sync.Mutex
+	shuttingDown bool
+	inflight     sync.WaitGroup
 }
 
 // NewServer는 위성 실행자를 만든다: POST /agent/deploy · GET /agent/status. 설정 검증은
@@ -99,6 +104,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.Serve
 // 리스너를 닫아 새 요청을 막은 뒤 이 함수를 ExecBudget까지 기다려, SIGTERM이 pull/up 도중
 // dispatch·terminal 기록을 끊지 않게 한다.
 func (s *Server) WaitInFlight(ctx context.Context) error {
+	// 먼저 gate를 닫는다(C1) — 이 뒤 enter()는 전부 거절되므로, 지금 등록돼 있는 실행만 남는다.
+	// 등록(inflight.Add)이 shuttingDown 확인과 같은 락 안에서 일어나 "닫힌 뒤 등록"이 불가능하다.
+	s.gate.Lock()
+	s.shuttingDown = true
+	s.gate.Unlock()
+
 	done := make(chan struct{})
 	go func() { s.inflight.Wait(); close(done) }()
 	select {
@@ -108,6 +119,22 @@ func (s *Server) WaitInFlight(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+// enter는 종료 중이 아니면 이 실행을 in-flight로 등록한다(C1). shuttingDown 확인과 inflight.Add가
+// **같은 락 안에서** 원자로 일어나, WaitInFlight가 gate를 닫은 뒤에는 절대 등록되지 못한다. 등록에
+// 성공하면 호출자는 반드시 leave로 짝을 맞춰야 한다. false면 종료 중이므로 새 배포를 받지 않는다.
+func (s *Server) enter() bool {
+	s.gate.Lock()
+	defer s.gate.Unlock()
+	if s.shuttingDown {
+		return false
+	}
+	s.inflight.Add(1)
+	return true
+}
+
+// leave는 in-flight 등록을 해제한다(enter 성공과 짝).
+func (s *Server) leave() { s.inflight.Done() }
 
 // handleDeploy는 배포 명령을 수신·검증·실행한다. 순서(부작용은 신선도·target 결박·멱등 통과 뒤에만):
 //
@@ -169,6 +196,14 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// C1 — Accept **직전에** in-flight로 등록한다(ACCEPTED 기록·실행이 이 창 안에 든다). 종료
+	// 중이면 등록이 거절되어(gate 닫힘) 503으로 새 배포를 받지 않는다 — 부작용 전이라 원장 무접촉.
+	if !s.enter() {
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.leave()
+
 	// 원장 Accept — 멱등·quarantine·충돌 판정 + Proceed 시 ACCEPTED 내구 기록(docker 전).
 	dec := s.cfg.Ledger.Accept(requestID, reqDigest)
 	switch {
@@ -191,10 +226,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Proceed — ACCEPTED가 내구 기록됐다. 이 실행을 in-flight로 표시해 종료 시 소유·대기하게 한다(C1①).
-	s.inflight.Add(1)
-	defer s.inflight.Done()
-
+	// Proceed — ACCEPTED가 내구 기록됐다(in-flight 등록은 Accept 직전 enter로 이미 이뤄졌다 · C1).
 	// 로컬 dispatch를 **background context**로 실행한다(R7): main 요청 ctx가 끊겨도(응답 타임아웃
 	// 등) 이미 수락한 실행을 취소하지 않는다. 취소로 docker를 중간에 죽이면 부분 상태가 남는다 —
 	// WithoutCancel로 취소 축만 끊고 ExecBudget으로 상한한다.
@@ -256,6 +288,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // freshOK는 RPC timestamp를 엄격 파싱해 신선도 창 안인지 본다(C4). 엄격 10진(재직렬화 일치)이며,
 // 파싱 실패·창 밖은 거절이다. |now - ts| ≤ Skew.
+//
+// ⚠️ overflow 안전(C4): 유효 unix 타임스탬프는 현 epoch에서 **양수**이므로 sec ≤ 0을 먼저
+// 거절한다 — 이렇게 하면 now·sec가 둘 다 양수라 now−sec·sec−now가 int64 overflow하지 않는다
+// (반대로 sec=MinInt64를 허용하면 now−sec가 wrap해 음수 diff가 되어 stale이 창 안으로 위장된다).
+// 비교는 초 단위 int64로 하고 time.Duration 곱셈을 쓰지 않는다(거대 diff × time.Second overflow 회피).
 func (s *Server) freshOK(ts string) bool {
 	sec, err := strconv.ParseInt(ts, 10, 64)
 	if err != nil {
@@ -265,11 +302,18 @@ func (s *Server) freshOK(ts string) bool {
 	if strconv.FormatInt(sec, 10) != ts {
 		return false
 	}
-	diff := s.cfg.now().Unix() - sec
-	if diff < 0 {
-		diff = -diff
+	if sec <= 0 {
+		return false // 유효 unix 타임스탬프는 양수 — 음수·0·MinInt64를 여기서 차단(overflow 방어의 뿌리)
 	}
-	return time.Duration(diff)*time.Second <= s.cfg.Skew
+	now := s.cfg.now().Unix() // 현 벽시계도 양수
+	var diff int64
+	if now >= sec {
+		diff = now - sec // 양수 − 양수(now≥sec) → overflow 없음
+	} else {
+		diff = sec - now // 양수 − 양수(sec>now) → overflow 없음
+	}
+	skewSec := int64(s.cfg.Skew / time.Second) // 초 단위 비교(Duration 곱셈 없음)
+	return diff <= skewSec
 }
 
 // respond는 서명된 응답을 쓴다(R1). 모든 인증된 응답은 HTTP 200이며 실제 결과는 state 필드가

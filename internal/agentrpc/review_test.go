@@ -272,3 +272,67 @@ func TestServerFsyncOrdering(t *testing.T) {
 		t.Fatalf("응답 state COMPLETED 기대: %q", r.State)
 	}
 }
+
+// --- C1 잔여 — shutdown gate ---
+
+// TestServerShutdownGateRejectsAfterClose는 WaitInFlight가 gate를 닫은 뒤 도착한 배포가 503으로
+// 거절되고 실행·원장 기록이 없음을 본다(등록과 gate 확인이 원자라 "닫힌 뒤 등록" 불가).
+func TestServerShutdownGateRejectsAfterClose(t *testing.T) {
+	key := []byte("k")
+	ledger := newTestLedger(t)
+	fake := &fakeLocalDispatcher{state: deploy.StateCompleted}
+	s := newTestServer(t, deploy.TargetSettlement, key, fake, ledger)
+
+	// in-flight가 없으므로 즉시 반환하며 gate를 닫는다.
+	if err := s.WaitInFlight(context.Background()); err != nil {
+		t.Fatalf("WaitInFlight(빈 in-flight): %v", err)
+	}
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, signedDeployReq(key, "req-1", time.Now().Unix(), testManifest(deploy.TargetSettlement, "req-1"), 1))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("gate 닫힌 뒤 배포는 503이어야 한다: code=%d", rec.Code)
+	}
+	if fake.callCount() != 0 {
+		t.Fatalf("gate 닫힌 뒤인데 실행됐다: calls=%d", fake.callCount())
+	}
+	if _, ok := ledger.Status("req-1"); ok {
+		t.Fatal("gate 닫힌 뒤인데 원장에 기록됐다(부작용)")
+	}
+}
+
+// --- C4 잔여 — overflow-safe freshOK ---
+
+// TestFreshOKOverflowSafe는 극단 timestamp(MinInt64·0·MaxInt64)가 신선도를 우회하지 못함을
+// 본다 — sec≤0 선거절 + 초 단위 int64 비교로 wrap을 없앤다.
+func TestFreshOKOverflowSafe(t *testing.T) {
+	key := []byte("k")
+	s := newTestServer(t, deploy.TargetSettlement, key, &fakeLocalDispatcher{}, newTestLedger(t))
+	fixed := time.Unix(1_700_000_000, 0)
+	s.cfg.now = func() time.Time { return fixed }
+
+	reject := []string{
+		"-9223372036854775808", // MinInt64 — now-sec가 wrap돼 stale이 창 안으로 위장되던 케이스
+		"0",                    // 양수 아님
+		"-1",                   // 음수
+		"9223372036854775807",  // MaxInt64 — 먼 미래
+		"01700000000",          // 앞자리 0(엄격 10진 위반)
+		"abc",                  // 파싱 불가
+	}
+	for _, ts := range reject {
+		if s.freshOK(ts) {
+			t.Errorf("극단/비정상 timestamp %q가 신선도를 통과했다(overflow 우회)", ts)
+		}
+	}
+	// 창 안(정확·경계)은 통과. Skew=60s.
+	for _, ts := range []string{"1700000000", "1699999940", "1700000060"} {
+		if !s.freshOK(ts) {
+			t.Errorf("창 안 timestamp %q가 거절됐다", ts)
+		}
+	}
+	// 창 밖(경계 +1초)은 거절.
+	for _, ts := range []string{"1699999939", "1700000061"} {
+		if s.freshOK(ts) {
+			t.Errorf("창 밖 timestamp %q가 통과했다", ts)
+		}
+	}
+}
