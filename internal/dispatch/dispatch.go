@@ -64,7 +64,7 @@ type Config struct {
 	// 대상으로 한다 — 공유·무범위 down 금지(blue를 죽이지 않게 — Q2).
 	Project string
 	// ImageEnvVar는 compose up이 digest 고정 참조를 읽는 env 변수명이다. compose 파일이
-	// image: ${<ImageEnvVar>} 로 이 값을 참조한다. 비면 defaultImageEnvVar를 쓴다.
+	// image: ${<ImageEnvVar>} 로 이 값을 참조한다. 비면 DefaultImageEnvVar를 쓴다.
 	ImageEnvVar string
 	// --- 동봉 compose 실행 위생(infra#19 · 설계 rev.2 R3). 셋은 함께 켜진다: 실행되는
 	// compose가 이번 서명 바이트(candidate)일 때만 의미가 있기 때문이다.
@@ -103,8 +103,11 @@ type Config struct {
 // compose 구조가 바뀌면 DEPLOY_APP_SERVICE 값도 함께 바뀐다(잔여-6/#19와 같은 축).
 const composeServiceLabel = "com.docker.compose.service"
 
-// defaultImageEnvVar는 ImageEnvVar 미지정 시의 기본 env 변수명이다.
-const defaultImageEnvVar = "DEPLOY_IMAGE_REF"
+// DefaultImageEnvVar는 ImageEnvVar 미지정 시의 기본 env 변수명이다. exported인 이유:
+// 동봉 compose의 `image: ${...}` 정확일치 검증이 **같은 이름**을 봐야 하기 때문이다 —
+// 이 값이 두 곳에 따로 적히면 한쪽만 바뀌는 날 검증기가 통과시킨 compose를 실행기가
+// 다른 변수로 채우게 된다(주입 실패 = 빈 image = 조용한 기동 실패).
+const DefaultImageEnvVar = "DEPLOY_IMAGE_REF"
 
 // composeImagePlaceholder는 image가 무관한 compose 하위 명령(down·ps·status)이 프로젝트를
 // 파싱하도록 image env에 넣는 비어있지 않은 값이다. compose 파일의 image: ${VAR} 는 프로젝트
@@ -118,7 +121,7 @@ const composeImagePlaceholder = "noncreate.invalid/unused:noncreate-ops-only"
 // imageEnvVar는 설정된 env 변수명(없으면 기본)을 준다.
 func (c Config) imageEnvVar() string {
 	if c.ImageEnvVar == "" {
-		return defaultImageEnvVar
+		return DefaultImageEnvVar
 	}
 	return c.ImageEnvVar
 }

@@ -32,6 +32,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/jun-bank/infra/internal/auth"
+	"github.com/jun-bank/infra/internal/compose"
 	"github.com/jun-bank/infra/internal/deploy"
 	"github.com/jun-bank/infra/internal/dispatch"
 	"github.com/jun-bank/infra/internal/httpentry"
@@ -428,6 +429,10 @@ func buildDispatcher() (dispatcherBuild, error) {
 		fmt.Printf("사후조건 결박: 대상 app compose 서비스=%q (이미지 대조·부분기동·재시작 검사 대상)\n", appService)
 	}
 
+	// slotBase는 슬롯 이름 → (기본 실행기·헬스 URL)이다. 동봉 경로에서 candidate에 결박된
+	// 실행기를 파생할 때 이 표에서 그 슬롯의 정체성(compose project·sudo·서비스명)을 물려받는다.
+	slotBase := map[string]slotWiring{}
+
 	var singleExec deploy.HostExecutor
 	var singleHealth deploy.HealthChecker
 	if composeFile != "" || project != "" || healthURL != "" || gatewayURL == "" {
@@ -440,12 +445,19 @@ func buildDispatcher() (dispatcherBuild, error) {
 		}
 		singleExec = execr
 		singleHealth = newSlotProber(healthCfg, healthURL, execr)
+		slotBase[compose.SlotSingle] = slotWiring{exec: execr, healthURL: healthURL}
 	}
 
 	disp := deploy.LocalDispatcher{Exec: singleExec, Health: singleHealth, Repos: repos, PhaseBudget: phaseBudget}
 
-	// 게이트웨이 미설정 = 기존 동작 그대로(전환 단계 없음 · 전환 예산 0).
+	// 게이트웨이 미설정 = 기존 동작 그대로(전환 단계 없음 · 전환 예산 0). 동봉 배선은 이
+	// 경로에도 붙는다 — target=gateway 재기동 교체도 서명 바이트로 결박돼야 한다.
 	if gatewayURL == "" {
+		rt, rerr := composeRuntimeFor(appService, slotBase, healthCfg)
+		if rerr != nil {
+			return b, rerr
+		}
+		disp.Compose = rt
 		b.disp, b.healthDeadline, b.phaseBudget = disp, healthDeadline, phaseBudget
 		return b, nil
 	}
@@ -479,6 +491,7 @@ func buildDispatcher() (dispatcherBuild, error) {
 		slotExec[s] = execr
 		slotHealth[s] = newSlotProber(healthCfg, probeURL, execr)
 		slotProject[s] = proj
+		slotBase[string(s)] = slotWiring{exec: execr, healthURL: probeURL}
 	}
 	// compose project가 겹치면 down 하나가 남의 컨테이너를 철거한다(down은 프로젝트 단위다 —
 	// BG-3 ⑶). 겹칠 수 있는 쌍은 셋이며(blue·green·단일), **쌍별로** 다 본다:
@@ -504,10 +517,16 @@ func buildDispatcher() (dispatcherBuild, error) {
 		return b, fmt.Errorf("게이트웨이 라우트 클라이언트 조립(fail-closed): %w", err)
 	}
 
+	rt, rerr := composeRuntimeFor(appService, slotBase, healthCfg)
+	if rerr != nil {
+		return b, rerr
+	}
+
 	disp.Gateway = gw
 	disp.SlotExec = slotExec
 	disp.SlotHealth = slotHealth
 	disp.DrainWait = drain
+	disp.Compose = rt
 
 	cutover, err := cutoverBudget(gwTimeout, drain)
 	if err != nil {
@@ -543,6 +562,59 @@ func newSlotExecutor(composeFile, project, appService string) (*dispatch.Executo
 func newSlotProber(cfg dispatch.HealthConfig, url string, execr *dispatch.Executor) *dispatch.Prober {
 	cfg.URL = url
 	return dispatch.NewProber(cfg, execr)
+}
+
+// slotWiring은 한 슬롯의 기본 배선이다(동봉 결박이 여기서 파생된다).
+type slotWiring struct {
+	exec      *dispatch.Executor
+	healthURL string
+}
+
+// composeRuntimeFor는 동봉 실행 배선을 조립하고, candidate 결박 실행기·프로버를 만드는
+// Bind 클로저를 채운다. 이 클로저가 main에 있는 이유는 import 방향 때문이다 — deploy는
+// dispatch를 import하지 않으므로(IA-5), 둘을 다 아는 조립 지점만이 구체 타입을 소비 지점
+// 인터페이스로 이어 붙일 수 있다.
+//
+// 프로버도 함께 새로 만드는 것이 요점이다: 재시작 검사는 `compose ps -q`로 대상 컨테이너를
+// 파생하므로, 실행기만 candidate에 결박하고 프로버를 놔두면 헬스 판정이 옛 compose 파일로
+// 컨테이너를 찾는다(동봉 필수 호스트에는 그 파일이 아예 없을 수도 있다).
+func composeRuntimeFor(appService string, slotBase map[string]slotWiring, healthCfg dispatch.HealthConfig) (*deploy.ComposeRuntime, error) {
+	imageEnvVar := os.Getenv("DEPLOY_IMAGE_ENV")
+	if imageEnvVar == "" {
+		imageEnvVar = dispatch.DefaultImageEnvVar
+	}
+
+	hostPorts := map[string]string{}
+	for _, s := range []string{compose.SlotSingle, string(deploy.SlotBlue), string(deploy.SlotGreen)} {
+		key := envHostPort
+		if s != compose.SlotSingle {
+			key = envHostPortPrefix + strings.ToUpper(s)
+		}
+		if _, wired := slotBase[s]; !wired {
+			continue
+		}
+		port, err := hostPort(key)
+		if err != nil {
+			return nil, err
+		}
+		if port != "" {
+			hostPorts[s] = port
+		}
+	}
+
+	bind := func(slot string, b deploy.ComposeBinding) (deploy.HostExecutor, deploy.HealthChecker, error) {
+		base, ok := slotBase[slot]
+		if !ok {
+			return nil, nil, fmt.Errorf("슬롯 %q의 기본 배선이 없다 — compose project·헬스 URL이 있어야 candidate에 결박할 수 있다(fail-closed)", slot)
+		}
+		execr, err := base.exec.WithCompose(b.ComposeFile, b.ProjectDirectory, b.Injected)
+		if err != nil {
+			return nil, nil, err
+		}
+		return execr, newSlotProber(healthCfg, base.healthURL, execr), nil
+	}
+
+	return buildComposeRuntime(appService, imageEnvVar, hostPorts, bind)
 }
 
 // envInt는 env를 정수로 읽는다. 부재 시 def, 설정됐으나 정수가 아니면 오류(무음 삼킴 금지 — P8).
