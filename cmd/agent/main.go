@@ -32,6 +32,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"net"
+	"path/filepath"
 
 	"github.com/jun-bank/infra/internal/agentrpc"
 	"github.com/jun-bank/infra/internal/auth"
@@ -46,8 +47,27 @@ import (
 // ⚠️ [구현 검증]: 실제 위성 dispatch(pull+up+헬스)가 이 안에 끝나야 COMPLETED가 돌아온다 —
 // 넘으면 main은 dial 후 timeout으로 UNKNOWN을 받고 락을 유지한다(위성은 background로 계속
 // 실행해 원장에 terminal을 남기지만 조각 A는 자동 재조회가 없어 사람이 받는다). 위성 배포
-// 소요와 함께 sizing한다(기본 6분은 defaultDeployLease와 같은 축의 합리 가정).
-const defaultRPCTimeout = 6 * time.Minute
+// 소요와 함께 sizing한다. **4분인 이유(C1②)**: coordinator가 락을 쥔 채 이 시간까지 Dispatch에서
+// 블로킹하므로 lease가 이를 덮어야 한다(leaseCoversRemote: lease ≥ RPC_TIMEOUT + slack). 기본
+// lease 6분이 4분+slack을 덮고, 4분은 위성 기본 exec budget(≈220s)을 넉넉히 감싼다.
+const defaultRPCTimeout = 4 * time.Minute
+
+// defaultRPCSkew는 위성이 받는 RPC timestamp 신선도 허용 창이다(C4 · AGENT_RPC_SKEW로 덮어쓴다).
+// ⚠️ [구현 검증]: main↔위성 시계 편차 실측으로 정한다 — 짧으면 정상 요청이 편차로 거절되고,
+// 길면 가로챈 유효 요청의 재생 창이 넓어진다(게이트1 DefaultClockSkew와 같은 축).
+const defaultRPCSkew = 60 * time.Second
+
+// agentReadTimeout은 위성 수신 요청 전체(헤더+body)의 읽기 상한이다(C7 · slow-body DoS 방어).
+// ReadHeaderTimeout만으로는 헤더 뒤 body를 느리게 흘려 handler·FD를 무기한 점유할 수 있다.
+const agentReadTimeout = 15 * time.Second
+
+// agentShutdownGrace는 종료 시 리스너를 닫고 idle 연결을 배수하는 짧은 유예다(C1①). 그 뒤
+// in-flight ACCEPTED 실행은 ExecBudget까지 별도로 기다린다.
+const agentShutdownGrace = 10 * time.Second
+
+// defaultAgentLockDir은 target 파생 원장 lock의 기본 디렉터리다(C3 · AGENT_LOCK_DIR로 덮어쓴다).
+// journal 경로와 무관한 **고정** 위치여야 같은 target의 두 실행자가 같은 lock을 놓고 경합한다.
+const defaultAgentLockDir = "/run/jun-agent"
 
 // defaultDeployLease는 배포 창 락의 기본 lease다(AGENT_DEPLOY_LEASE로 덮어쓴다). ⚠️ 이
 // 값은 [구현 검증]이다 — 한 배포 시퀀스를 넉넉히 덮으면서 죽은 주체를 오래 붙들지 않는
@@ -317,9 +337,19 @@ func buildCoordinator(st *store.SQLStore) (deploy.Coordinator, error) {
 	// target 라우팅(design D1 · 조각 A) — coordinator 앞에 RoutingDispatcher를 두어 core·gateway는
 	// 로컬 실행(.9 자기 배포), settlement·ledger는 원격 위성(HTTP+HMAC)으로 위임한다. coordinator·
 	// 락·모드·이력은 무접촉이다(대칭 인터페이스에 dispatcher만 교체).
-	routing, err := buildRoutingDispatcher(b.disp)
+	routing, remoteReg, rpcTimeout, err := buildRoutingDispatcher(b.disp)
 	if err != nil {
 		return nil, fmt.Errorf("target 라우팅 dispatcher 조립: %w", err)
+	}
+
+	// C1② — 원격 route가 등록되면 lease가 RPC 왕복도 덮어야 한다. coordinator는 락을 쥔 채
+	// RemoteDispatcher.Dispatch에서 최대 AGENT_RPC_TIMEOUT까지 블로킹하므로, lease가 그보다 짧으면
+	// Dispatch 반환 전 lease가 만료돼 다른 주체가 stale 락을 회수하고 그 위에 COMPLETED가 기록된다
+	// (CD-3/P3·P4 회귀). 로컬 하한(leaseCoversDispatch)과 별도로 원격 하한을 boot에서 강제한다.
+	if remoteReg {
+		if err := leaseCoversRemote(lease, rpcTimeout); err != nil {
+			return nil, err
+		}
 	}
 
 	return deploy.NewCoordinator(deploy.Deps{
@@ -338,13 +368,13 @@ func buildCoordinator(st *store.SQLStore) (deploy.Coordinator, error) {
 // 둘 다 없으면 미등록으로 두어 그 target 배포가 RoutingDispatcher에서 부작용 0으로 거절되게 한다
 // (design D4 "미설정 = 그 target 배포 거절"). 키는 게이트1(AGENT_HMAC_KEY)·gateway
 // (GATEWAY_INTERNAL_HMAC_KEY)와 **별도**다(신뢰 경계 분리).
-func buildRoutingDispatcher(local deploy.Dispatcher) (deploy.Dispatcher, error) {
+func buildRoutingDispatcher(local deploy.Dispatcher) (disp deploy.Dispatcher, remoteRegistered bool, rpcTimeout time.Duration, err error) {
 	timeout, err := envDuration("AGENT_RPC_TIMEOUT", defaultRPCTimeout)
 	if err != nil {
-		return nil, err
+		return nil, false, 0, err
 	}
 	if timeout <= 0 {
-		return nil, fmt.Errorf("AGENT_RPC_TIMEOUT은 >0 이어야 한다(fail-closed): %s", timeout)
+		return nil, false, 0, fmt.Errorf("AGENT_RPC_TIMEOUT은 >0 이어야 한다(fail-closed): %s", timeout)
 	}
 
 	routes := map[deploy.Target]deploy.Dispatcher{
@@ -366,16 +396,36 @@ func buildRoutingDispatcher(local deploy.Dispatcher) (deploy.Dispatcher, error) 
 			continue
 		}
 		if strings.TrimSpace(key) == "" || rawURL == "" {
-			return nil, fmt.Errorf("%s와 %s는 함께 설정한다(한쪽만 설정 = 오설정 · fail-closed)", sat.keyEnv, sat.urlEnv)
+			return nil, false, 0, fmt.Errorf("%s와 %s는 함께 설정한다(한쪽만 설정 = 오설정 · fail-closed)", sat.keyEnv, sat.urlEnv)
 		}
 		rd, rerr := agentrpc.NewRemoteDispatcher(rawURL, []byte(key), timeout, sat.target)
 		if rerr != nil {
-			return nil, fmt.Errorf("원격 dispatcher 조립(%s): %w", sat.target, rerr)
+			return nil, false, 0, fmt.Errorf("원격 dispatcher 조립(%s): %w", sat.target, rerr)
 		}
 		routes[sat.target] = rd
+		remoteRegistered = true
 	}
 
-	return deploy.NewRoutingDispatcher(routes)
+	rd, err := deploy.NewRoutingDispatcher(routes)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	return rd, remoteRegistered, timeout, nil
+}
+
+// leaseCoversRemote는 원격 route가 등록됐을 때 배포 창 락 lease가 RPC 왕복을 덮는지 본다(C1②·
+// CD-3 하한식의 원격 축). coordinator는 락 보유 중 RemoteDispatcher.Dispatch에서 최대 RPC_TIMEOUT
+// 까지 블로킹하므로 lease ≥ RPC_TIMEOUT + slack이어야 반환 전 락 만료가 없다. 미달이면 오류(boot
+// fail-closed). ⚠️ 이 보증은 slack이 락 획득~Dispatch 진입 오버헤드를 덮는다는 전제 위에 선다.
+func leaseCoversRemote(lease, rpcTimeout time.Duration) error {
+	if rpcTimeout <= 0 || rpcTimeout > maxDispatchDuration {
+		return fmt.Errorf("AGENT_RPC_TIMEOUT은 (0, %s] 범위여야 한다(fail-closed · overflow 방지): %s", maxDispatchDuration, rpcTimeout)
+	}
+	min := rpcTimeout + dispatchLeaseSlack
+	if lease < min {
+		return fmt.Errorf("원격 route 등록 시 배포 창 락 lease가 RPC 왕복을 덮지 못한다(fail-closed): lease=%s < AGENT_RPC_TIMEOUT(%s) + slack(%s) = %s — coordinator가 락 보유 중 Dispatch가 RPC_TIMEOUT까지 블로킹하므로 lease가 그보다 짧으면 반환 전 락 만료(CD-3/P3·P4 회귀). lease를 늘리거나 AGENT_RPC_TIMEOUT을 줄여라", lease, rpcTimeout, dispatchLeaseSlack, min)
+	}
+	return nil
 }
 
 // defaultHealth*는 CD-1 준비성 프로브의 기본값이다(모두 [구현 검증] CDV-1 — 실측으로
@@ -769,26 +819,46 @@ func runAgent() error {
 		return fmt.Errorf("위성 로컬 실행 지점(dispatcher) 조립: %w", err)
 	}
 
-	ledger, err := agentrpc.OpenLedger(ledgerPath)
+	// C3 — 원장 lock은 target 파생 **고정** 경로에 건다(journal 경로와 무관). 같은 AGENT_TARGET을
+	// 다른 journal·포트로 두 번 띄워도 같은 lock을 놓고 경합해 한 실행자만 연다.
+	lockDir := strings.TrimSpace(os.Getenv("AGENT_LOCK_DIR"))
+	if lockDir == "" {
+		lockDir = defaultAgentLockDir
+	}
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return fmt.Errorf("위성 lock 디렉터리 생성 실패(%s) — AGENT_LOCK_DIR로 쓰기 가능한 경로를 지정하라(fail-closed): %w", lockDir, err)
+	}
+	lockPath := filepath.Join(lockDir, "jun-agent-"+string(target)+".lock")
+
+	ledger, err := agentrpc.OpenLedger(ledgerPath, lockPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = ledger.Close() }()
+
+	skew, err := envDuration("AGENT_RPC_SKEW", defaultRPCSkew)
+	if err != nil {
+		return err
+	}
+	if skew <= 0 {
+		return fmt.Errorf("AGENT_RPC_SKEW은 >0 이어야 한다(신선도 창 · fail-closed): %s", skew)
+	}
 
 	// background 실행 상한(R7) — 요청 ctx와 분리된 dispatch가 한 배포를 넉넉히 덮게 한다:
 	// pull+up(phaseBudget) + 헬스(D) + 실패 시 cleanup + slack. lease가 아니라 이 예산이 위성
 	// 실행을 감싼다(위성엔 배포 창 락이 없다 — 그건 main coordinator 소유).
 	execBudget := b.phaseBudget + b.healthDeadline + deploy.CleanupTimeout + dispatchLeaseSlack
 
-	handler, err := agentrpc.Handler(agentrpc.ServerConfig{
+	srvObj, err := agentrpc.NewServer(agentrpc.ServerConfig{
 		Target:     deploy.Target(target),
 		Key:        []byte(key),
 		Dispatcher: b.disp,
 		Ledger:     ledger,
 		ExecBudget: execBudget,
+		Skew:       skew,
 	})
 	if err != nil {
-		return fmt.Errorf("위성 RPC 핸들러 조립: %w", err)
+		return fmt.Errorf("위성 RPC 서버 조립: %w", err)
 	}
 
 	ln, err := net.Listen("tcp", listenAddr)
@@ -802,8 +872,9 @@ func runAgent() error {
 	}
 
 	srv := &http.Server{
-		Handler:           handler,
+		Handler:           srvObj,
 		ReadHeaderTimeout: 10 * time.Second, // slowloris 완화 — [구현 검증]
+		ReadTimeout:       agentReadTimeout, // C7 — body 포함 전체 읽기 상한(slow-body DoS 방어)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -823,9 +894,19 @@ func runAgent() error {
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		// C1① — 종료 시 ACCEPTED된 배포를 소유·대기한다. 1) 리스너를 닫아 새 요청을 막고 idle을
+		// 짧게 배수한 뒤, 2) in-flight ACCEPTED 실행이 terminal을 내구 기록할 때까지 ExecBudget까지
+		// 기다린다 — SIGTERM이 pull/up 도중 dispatch·terminal 기록을 끊지 않게 한다. 그래도 초과하면
+		// 원장 재기동 회복(ACCEPTED→UNKNOWN)에 의존한다.
+		shutCtx, cancel := context.WithTimeout(context.Background(), agentShutdownGrace)
+		_ = srv.Shutdown(shutCtx)
+		cancel()
+		drainCtx, cancel2 := context.WithTimeout(context.Background(), execBudget+agentShutdownGrace)
+		defer cancel2()
+		if werr := srvObj.WaitInFlight(drainCtx); werr != nil {
+			return fmt.Errorf("종료 중 in-flight 배포 배수 미완(ExecBudget 초과) — 원장 재기동 회복에 의존한다: %w", werr)
+		}
+		return nil
 	}
 }
 

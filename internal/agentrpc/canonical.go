@@ -50,6 +50,14 @@ const (
 	// ActionDeploy·ActionStatus는 응답 결박에 드는 action 값이다(응답 canonical 필드).
 	ActionDeploy = "deploy"
 	ActionStatus = "status"
+
+	// WireAbsent는 상태 조회에서 "이 위성이 그 requestId를 본 적이 없다"를 뜻하는 **별도 wire
+	// 상태**다(C8). durable-UNEXECUTED(위성이 실행했고 부작용0을 내구 증명)와 서명 계약 수준에서
+	// 구분한다 — 지금(조각 A)은 RemoteDispatcher가 status를 조회하지 않아 inert하지만, 조각 C의
+	// 자동 재개가 이 계약을 상속할 때 "execute보다 먼저 도착한 status 조회의 ABSENT"를
+	// durable-UNEXECUTED로 오인해 재개하는 것(중복 배포)을 막는다. 서명 계약은 나중보다 지금
+	// 정하는 게 싸다. deploy.RemoteState가 아니라 agentrpc wire 전용 값이다.
+	WireAbsent = "ABSENT"
 )
 
 // ErrNoKey는 RPC HMAC 키가 비었거나 공백뿐일 때 반환된다 — 키 없이 서명자·검증자를 만들지
