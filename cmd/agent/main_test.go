@@ -232,8 +232,9 @@ func setBlueGreenEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("IMAGE_CORE", "registry.example/core")
 	t.Setenv("DEPLOY_GATEWAY_URL", "http://127.0.0.1:8090")
-	t.Setenv("DEPLOY_APP_SERVICE", "app")      // #21 — 블루-그린 모드에서는 필수
-	t.Setenv("DEPLOY_IMAGE_ENV", "CORE_IMAGE") // E-4 — 동봉 필수 배선에서는 기동 필수
+	t.Setenv("GATEWAY_INTERNAL_HMAC_KEY", "test-internal-key-not-a-secret") // R4 — gatewayURL 설정 시 필수
+	t.Setenv("DEPLOY_APP_SERVICE", "app")                                   // #21 — 블루-그린 모드에서는 필수
+	t.Setenv("DEPLOY_IMAGE_ENV", "CORE_IMAGE")                              // E-4 — 동봉 필수 배선에서는 기동 필수
 	setWorkspaceEnv(t)
 	t.Setenv("DEPLOY_HOST_PORT_BLUE", "18081")
 	t.Setenv("DEPLOY_HOST_PORT_GREEN", "18082")
@@ -335,6 +336,9 @@ func TestBuildDispatcherBlueGreenFailClosed(t *testing.T) {
 		// 실행 중일 때 app이 틀린 이미지여도 통과하고 그 위로 라우트가 전환된다(H2 fail-open).
 		{"DEPLOY_APP_SERVICE 미설정", func(t *testing.T) { t.Setenv("DEPLOY_APP_SERVICE", "") }},
 		{"DEPLOY_APP_SERVICE 공백뿐", func(t *testing.T) { t.Setenv("DEPLOY_APP_SERVICE", "   ") }},
+		// R4: gatewayURL이 설정됐는데 /internal 서명 키가 없으면 agent가 무서명으로 전환을
+		// 호출하게 된다 — 무서명 폴백을 제거했으므로 기동을 거부한다(fail-closed).
+		{"GATEWAY_INTERNAL_HMAC_KEY 미설정", func(t *testing.T) { t.Setenv("GATEWAY_INTERNAL_HMAC_KEY", "") }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
