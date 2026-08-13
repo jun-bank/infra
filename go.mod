@@ -7,6 +7,13 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.43.0
+	// yaml.v3 — infra#19(compose 동봉 실행 결박)의 유일한 신규 직접 의존.
+	// 근거: 동봉 compose를 실행 전에 구조로 판정하려면 compose가 보는 것과 같은 구조를
+	// 봐야 한다. 정규식·문자열 스캔 대안은 앵커·병합 키·대체 표기(맵형 ports/volumes)를
+	// 놓치는 fail-open 지뢰다. internal/compose가 yaml.Node를 직접 순회하며(typed struct
+	// 디코드 금지 — 라이브러리 기본값에 판정을 위임하지 않는다) 그 밖에는 쓰지 않는다.
+	// 이미 testcontainers의 간접 의존으로 트리에 있던 모듈이라 새 코드가 늘지 않는다.
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -60,5 +67,4 @@ require (
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
