@@ -168,37 +168,261 @@ func TestWriteCandidateRejectsDotEnv(t *testing.T) {
 	}
 }
 
+// rec는 검증을 통과하는 온전한 record를 만든다(복원 재료로서 의미가 서는 최소 형태).
+func rec(rev, slot, digestSeed, request string) AppliedRecord {
+	return AppliedRecord{
+		Revision:    rev,
+		Slot:        slot,
+		ImageDigest: "sha256:" + strings.Repeat(digestSeed, 64),
+		CommitSHA:   "c1",
+		RequestID:   request,
+		TS:          "2026-08-13T00:00:00Z",
+		Injected:    map[string]string{"DEPLOY_HOST_PORT": "18080"},
+		Status:      StatusApplied,
+	}
+}
+
 // 승격은 배포 성공 뒤에만이고, applied[1]은 항상 "마지막 정상본"이다.
 func TestPromoteKeepsLastGoodRevision(t *testing.T) {
 	w := newWorkspace(t)
-	rec := func(rev, slot string) AppliedRecord {
-		return AppliedRecord{Revision: rev, Slot: slot, ImageDigest: "sha256:d" + rev[:3], Status: "applied"}
-	}
-	if err := w.Promote("core", rec(strings.Repeat("a", 64), "green")); err != nil {
+	revA, revB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	if err := w.Promote("core", rec(revA, "green", "1", "req-1")); err != nil {
 		t.Fatalf("첫 승격 실패: %v", err)
 	}
-	if err := w.Promote("core", rec(strings.Repeat("b", 64), "blue")); err != nil {
+	if err := w.Promote("core", rec(revB, "blue", "2", "req-2")); err != nil {
 		t.Fatalf("두 번째 승격 실패: %v", err)
 	}
 	list, err := w.Applied("core")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 2 || list[0].Revision != strings.Repeat("b", 64) || list[1].Revision != strings.Repeat("a", 64) {
+	if len(list) != 2 || list[0].Revision != revB || list[1].Revision != revA {
 		t.Fatalf("applied 목록이 최신순이 아니다: %+v", list)
 	}
+}
 
-	// G-08: 같은 revision 재배포는 무변경이어야 한다 — 밀어넣으면 [1](직전 정상본)이 밀려
-	// 나가 되돌릴 곳이 사라진다.
-	if err := w.Promote("core", rec(strings.Repeat("b", 64), "blue")); err != nil {
+// E-1: 승격의 no-op 판정은 revision이 **아니라 record 전체 상태**로 갈린다.
+//
+// compose 정의는 릴리스마다 바뀌지 않는다 — 같은 compose에 새 이미지를 올리는 것이 정상
+// 배포의 대다수다. revision만 비교하면 그 전부가 "같은 것"으로 접혀 승격이 통째로 삼켜지고,
+// applied[0]의 imageDigest가 옛 릴리스에 머문 채 복원 재료가 거짓이 된다.
+func TestPromoteRecordIdentity(t *testing.T) {
+	revA := strings.Repeat("a", 64)
+
+	t.Run("같은 compose + 새 이미지 = 새 record", func(t *testing.T) {
+		w := newWorkspace(t)
+		if err := w.Promote("core", rec(revA, "green", "1", "req-1")); err != nil {
+			t.Fatal(err)
+		}
+		newImage := rec(revA, "green", "2", "req-2") // revision 동일 · digest만 다르다
+		if err := w.Promote("core", newImage); err != nil {
+			t.Fatal(err)
+		}
+		list, err := w.Applied("core")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list) != 2 {
+			t.Fatalf("새 이미지 승격이 삼켜졌다(record %d개) — applied[0]이 옛 릴리스에 머문다: %+v", len(list), list)
+		}
+		if list[0].ImageDigest != newImage.ImageDigest {
+			t.Fatalf("applied[0].imageDigest=%q, 방금 배포한 %q 기대", list[0].ImageDigest, newImage.ImageDigest)
+		}
+		if list[1].ImageDigest == newImage.ImageDigest {
+			t.Fatal("직전 정상본이 새 것으로 덮였다")
+		}
+	})
+
+	t.Run("완전 동일 replay = 무변경", func(t *testing.T) {
+		w := newWorkspace(t)
+		same := rec(revA, "green", "1", "req-1")
+		if err := w.Promote("core", same); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Promote("core", rec(strings.Repeat("b", 64), "blue", "2", "req-0")); err != nil {
+			t.Fatal(err)
+		}
+		// 맨 앞을 다시 same으로 만들고, 같은 요청을 한 번 더 민다.
+		if err := w.Promote("core", same); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := w.Applied("core")
+		if err := w.Promote("core", same); err != nil {
+			t.Fatal(err)
+		}
+		after, _ := w.Applied("core")
+		if len(after) != len(before) {
+			t.Fatalf("완전 동일 replay가 목록을 늘렸다: %d → %d", len(before), len(after))
+		}
+		if after[0].TS != before[0].TS || after[0].RequestID != before[0].RequestID {
+			t.Fatalf("완전 동일 replay가 [0]을 건드렸다: %+v → %+v", before[0], after[0])
+		}
+	})
+
+	t.Run("상태 동일 + 새 requestId = [0] 제자리 갱신·[1] 불변", func(t *testing.T) {
+		w := newWorkspace(t)
+		old := rec(strings.Repeat("c", 64), "blue", "3", "req-0")
+		if err := w.Promote("core", old); err != nil {
+			t.Fatal(err)
+		}
+		first := rec(revA, "green", "1", "req-1")
+		if err := w.Promote("core", first); err != nil {
+			t.Fatal(err)
+		}
+		again := first
+		again.RequestID = "req-2"
+		again.TS = "2026-08-13T01:00:00Z"
+		if err := w.Promote("core", again); err != nil {
+			t.Fatal(err)
+		}
+		list, err := w.Applied("core")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list) != 2 {
+			t.Fatalf("제자리 갱신이 아니라 목록이 늘었다: %+v", list)
+		}
+		if list[0].RequestID != "req-2" || list[0].TS != again.TS {
+			t.Fatalf("[0]의 추적 메타가 갱신되지 않았다: %+v", list[0])
+		}
+		if list[1].Revision != old.Revision || list[1].RequestID != "req-0" {
+			t.Fatalf("직전 정상본이 밀려났다: %+v", list[1])
+		}
+	})
+}
+
+// W-06: 승격의 원자성. rename **직전**에 끊어도 원본은 온전해야 하고, 재기동 후 그대로
+// 파싱돼야 한다 — 그렇지 않으면 "반쪽 승격 창이 없다"가 성립하지 않는다.
+func TestPromoteAtomicityOnCrashBeforeRename(t *testing.T) {
+	w := newWorkspace(t)
+	good := rec(strings.Repeat("a", 64), "green", "1", "req-1")
+	if err := w.Promote("core", good); err != nil {
 		t.Fatal(err)
 	}
-	list, err = w.Applied("core")
+	before, err := os.ReadFile(filepath.Join(w.Root(), "core", "applied.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 2 || list[1].Revision != strings.Repeat("a", 64) {
-		t.Fatalf("동일 revision 재승격이 직전 정상본을 밀어냈다: %+v", list)
+
+	boom := errors.New("rename 직전 중단(시험 주입)")
+	w.beforeRename = func() error { return boom }
+	if perr := w.Promote("core", rec(strings.Repeat("b", 64), "blue", "2", "req-2")); !errors.Is(perr, boom) {
+		t.Fatalf("주입한 중단이 전파되지 않았다: %v", perr)
+	}
+	w.beforeRename = nil
+
+	// ⑴ 원본이 그대로다(바이트 단위).
+	after, err := os.ReadFile(filepath.Join(w.Root(), "core", "applied.json"))
+	if err != nil {
+		t.Fatalf("중단 후 원본이 사라졌다: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("중단이 원본을 바꿨다:\n전=%s\n후=%s", before, after)
+	}
+	// ⑵ 재기동(재파싱)이 여전히 유효하다 — 손상으로 읽히지 않는다.
+	list, lerr := w.Applied("core")
+	if lerr != nil {
+		t.Fatalf("중단 후 인덱스가 손상으로 읽힌다: %v", lerr)
+	}
+	if len(list) != 1 || list[0].Revision != good.Revision {
+		t.Fatalf("중단 후 내용이 바뀌었다: %+v", list)
+	}
+	// ⑶ temp 잔재가 남더라도 인덱스 파일이 아니다(정리는 defer가 하지만, 남아도 무해함을 못박는다).
+	ents, _ := os.ReadDir(filepath.Join(w.Root(), "core"))
+	for _, e := range ents {
+		if e.Name() != "applied.json" && !strings.HasPrefix(e.Name(), ".applied-") {
+			t.Fatalf("예상 밖 파일이 남았다: %q", e.Name())
+		}
+	}
+}
+
+// E-3/W-09: 파일 **부재만이** 첫 배포다. 파일이 있는데 의미가 서지 않으면 전부 손상이며,
+// 손상은 승격·GC를 중단시킨다 — 빈 목록으로 접으면 다음 승격이 "직전 정상본 없음"을
+// 사실로 만들어 복원할 곳을 조용히 지운다.
+func TestAppliedIndexSemanticValidation(t *testing.T) {
+	validRec := `{"revision":"` + strings.Repeat("a", 64) + `","slot":"green","imageDigest":"sha256:` + strings.Repeat("1", 64) + `","commitSha":"c1","requestId":"r1","ts":"t","injected":{},"status":"applied"}`
+
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"깨진 JSON", "{not json"},
+		{"빈 객체", "{}"},
+		{"빈 배열", `{"applied":[]}`},
+		{"applied null", `{"applied":null}`},
+		{"중복 키", `{"applied":[],"applied":[` + validRec + `]}`},
+		{"record 중복 키", `{"applied":[{"revision":"x","revision":"y"}]}`},
+		{"미지 최상위 필드", `{"applied":[` + validRec + `],"extra":1}`},
+		{"미지 record 필드", `{"applied":[{"revision":"` + strings.Repeat("a", 64) + `","slot":"green","imageDigest":"sha256:` + strings.Repeat("1", 64) + `","status":"applied","rogue":1}]}`},
+		{"후행 데이터", `{"applied":[` + validRec + `]}{"applied":[]}`},
+		{"revision 형식 위반", `{"applied":[{"revision":"abc","slot":"green","imageDigest":"sha256:` + strings.Repeat("1", 64) + `","status":"applied"}]}`},
+		{"revision 대문자", `{"applied":[{"revision":"` + strings.Repeat("A", 64) + `","slot":"green","imageDigest":"sha256:` + strings.Repeat("1", 64) + `","status":"applied"}]}`},
+		{"slot 닫힌 집합 밖", `{"applied":[{"revision":"` + strings.Repeat("a", 64) + `","slot":"purple","imageDigest":"sha256:` + strings.Repeat("1", 64) + `","status":"applied"}]}`},
+		{"slot 빈 값", `{"applied":[{"revision":"` + strings.Repeat("a", 64) + `","slot":"","imageDigest":"sha256:` + strings.Repeat("1", 64) + `","status":"applied"}]}`},
+		{"digest 형식 위반", `{"applied":[{"revision":"` + strings.Repeat("a", 64) + `","slot":"green","imageDigest":"latest","status":"applied"}]}`},
+		{"status 다른 값", `{"applied":[{"revision":"` + strings.Repeat("a", 64) + `","slot":"green","imageDigest":"sha256:` + strings.Repeat("1", 64) + `","status":"pending"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorkspace(t)
+			dir := filepath.Join(w.Root(), "core")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "applied.json"), []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Applied("core"); !errors.Is(err, ErrAppliedCorrupt) {
+				t.Fatalf("손상으로 읽히지 않았다: %v", err)
+			}
+			// 손상이면 승격·GC 둘 다 중단이다(삭제 0).
+			if err := w.Promote("core", rec(strings.Repeat("b", 64), "blue", "2", "r2")); !errors.Is(err, ErrAppliedCorrupt) {
+				t.Fatalf("손상인데 승격이 진행됐다: %v", err)
+			}
+			if err := w.GC("core", nil); !errors.Is(err, ErrAppliedCorrupt) {
+				t.Fatalf("손상인데 GC가 진행됐다: %v", err)
+			}
+		})
+	}
+
+	t.Run("파일 부재 = 첫 승격", func(t *testing.T) {
+		w := newWorkspace(t)
+		list, err := w.Applied("core")
+		if err != nil || len(list) != 0 {
+			t.Fatalf("부재가 첫 배포로 읽히지 않았다: list=%+v err=%v", list, err)
+		}
+		if err := w.Promote("core", rec(strings.Repeat("a", 64), "green", "1", "r1")); err != nil {
+			t.Fatalf("첫 승격이 막혔다: %v", err)
+		}
+	})
+}
+
+// W-07: applied·candidate는 target별로 격리된다 — 한 대상의 이력이 다른 대상의 복원 재료나
+// GC pin 판정에 섞이면 "이 대상의 직전 정상본"이 거짓이 된다.
+func TestTargetScopeIsolation(t *testing.T) {
+	w := newWorkspace(t)
+	if err := w.Promote("core", rec(strings.Repeat("a", 64), "green", "1", "r1")); err != nil {
+		t.Fatal(err)
+	}
+	gwList, err := w.Applied("gateway")
+	if err != nil || len(gwList) != 0 {
+		t.Fatalf("다른 대상의 이력이 새어 들어왔다: %+v err=%v", gwList, err)
+	}
+
+	content := []byte("services: {}\n")
+	rev := revOf(content)
+	if _, err := w.WriteCandidate("core", "green", rev, content); err != nil {
+		t.Fatal(err)
+	}
+	if _, serr := os.Stat(w.CandidatePath("gateway", "green", rev)); !os.IsNotExist(serr) {
+		t.Fatalf("candidate가 대상 경계를 넘었다: %v", serr)
+	}
+	// gateway 쪽 GC는 core의 세대 파일을 건드리지 않는다.
+	if err := w.GC("gateway", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, serr := os.Stat(w.CandidatePath("core", "green", rev)); serr != nil {
+		t.Fatalf("다른 대상의 GC가 core 세대를 지웠다: %v", serr)
 	}
 }
 
@@ -213,7 +437,7 @@ func TestCorruptAppliedStopsPromoteAndGC(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "applied.json"), []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := w.Promote("core", AppliedRecord{Revision: strings.Repeat("c", 64)})
+	err := w.Promote("core", rec(strings.Repeat("c", 64), "green", "1", "r1"))
 	if !errors.Is(err, ErrAppliedCorrupt) {
 		t.Fatalf("손상 인덱스인데 승격이 진행됐다: %v", err)
 	}
@@ -242,10 +466,10 @@ func TestGCPinsLastGoodAndRunning(t *testing.T) {
 		p := w.CandidatePath("core", "green", revs[len(revs)-1])
 		touch(t, p, i)
 	}
-	if err := w.Promote("core", AppliedRecord{Revision: revs[1]}); err != nil {
+	if err := w.Promote("core", rec(revs[1], "green", "1", "r1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Promote("core", AppliedRecord{Revision: revs[0]}); err != nil {
+	if err := w.Promote("core", rec(revs[0], "green", "2", "r2")); err != nil {
 		t.Fatal(err)
 	}
 	running := revs[2]
@@ -303,4 +527,32 @@ func countGenerations(t *testing.T, dir string) int {
 		}
 	}
 	return n
+}
+
+// W-09(pin 실패 = 삭제 0): pin 대상을 확정하지 못하면 GC는 **아무것도 지우지 않는다**.
+// "모르면 지우지 않는다"가 성립하지 않으면, 인덱스가 깨진 순간 복원 재료가 함께 사라진다.
+func TestGCStopsWithoutDeletingWhenPinUnknown(t *testing.T) {
+	w := newWorkspace(t)
+	var paths []string
+	for i := 1; i <= 6; i++ {
+		content := []byte(strings.Repeat("y", i) + "\n")
+		cand, err := w.WriteCandidate("core", "green", revOf(content), content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, cand.Path)
+	}
+	dir := filepath.Join(w.Root(), "core")
+	if err := os.WriteFile(filepath.Join(dir, "applied.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.GC("core", nil); !errors.Is(err, ErrAppliedCorrupt) {
+		t.Fatalf("손상 인덱스인데 GC가 진행됐다: %v", err)
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("pin 확정 실패인데 세대가 지워졌다: %q: %v", p, err)
+		}
+	}
 }

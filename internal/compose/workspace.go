@@ -1,11 +1,13 @@
 package compose
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -68,7 +70,12 @@ type Workspace struct {
 	root string
 	// uid는 Open 시점의 소유자 검사에 쓴 uid다(진단용).
 	uid int
+	// beforeRename은 applied 원자 교체 직전에 불리는 시험용 훅이다(테스트 전용 — 프로덕션 nil).
+	beforeRename func() error
 }
+
+// StatusApplied는 정상 승격된 record의 상태값이다(닫힌 값 — 다른 값은 손상으로 읽는다).
+const StatusApplied = "applied"
 
 // Root는 workspace 루트 절대경로다(compose 실행의 --project-directory 산정에 쓰인다).
 func (w *Workspace) Root() string { return w.root }
@@ -260,39 +267,170 @@ func (w *Workspace) appliedPath(target string) string {
 	return filepath.Join(w.root, target, "applied.json")
 }
 
-// Applied는 target의 적용 이력을 최신순으로 읽는다. 파일 부재는 빈 목록(첫 배포)이고,
-// 깨진 JSON은 ErrAppliedCorrupt다 — 빈 목록으로 접으면 다음 승격이 "이전 정상본 없음"을
-// 사실로 만들어 복원 재료를 조용히 지운다.
+// appliedSlots는 record의 slot이 가질 수 있는 닫힌 값이다.
+var appliedSlots = map[string]bool{"blue": true, "green": true, SlotSingle: true}
+
+// Applied는 target의 적용 이력을 최신순으로 읽는다. **파일 부재만이 "첫 배포"**이고,
+// 파일이 있는데 의미가 서지 않으면(파싱 불가·중복 키·미지 필드·빈 목록·record 필드 위반)
+// 전부 ErrAppliedCorrupt다.
+//
+// 이 구분이 엄격한 이유: 이 목록은 수동 비상 복원의 유일한 재료다. 손상을 "빈 목록"으로
+// 접으면 다음 승격이 그 자리에 새 record 하나만 남기고, 그 순간 **직전 정상본이 존재한
+// 적 없다는 것이 사실이 된다** — 복원할 곳이 조용히 사라진다. 그래서 빈 배열·`{}`도
+// 부재가 아니라 손상으로 읽는다: 정상 경로는 빈 목록을 기록하지 않으므로, 빈 목록이
+// 파일로 존재한다는 것 자체가 무언가 잘못됐다는 신호다.
 func (w *Workspace) Applied(target string) ([]AppliedRecord, error) {
-	b, err := os.ReadFile(w.appliedPath(target)) //nolint:gosec // workspace 내부 경로
+	path := w.appliedPath(target)
+	b, err := os.ReadFile(path) //nolint:gosec // workspace 내부 경로
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: 읽기 실패 %q: %v", ErrAppliedCorrupt, w.appliedPath(target), err)
+		return nil, fmt.Errorf("%w: 읽기 실패 %q: %v", ErrAppliedCorrupt, path, err)
 	}
+	if derr := rejectDuplicateJSONKeys(b); derr != nil {
+		return nil, fmt.Errorf("%w: %q: %v", ErrAppliedCorrupt, path, derr)
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
 	var idx appliedIndex
-	if err := json.Unmarshal(b, &idx); err != nil {
-		return nil, fmt.Errorf("%w: JSON 파싱 실패 %q: %v", ErrAppliedCorrupt, w.appliedPath(target), err)
+	if derr := dec.Decode(&idx); derr != nil {
+		return nil, fmt.Errorf("%w: JSON 파싱 실패 %q: %v", ErrAppliedCorrupt, path, derr)
+	}
+	if _, terr := dec.Token(); !errors.Is(terr, io.EOF) {
+		return nil, fmt.Errorf("%w: 첫 JSON 값 뒤에 데이터가 남아 있다 %q", ErrAppliedCorrupt, path)
+	}
+	if len(idx.Applied) == 0 {
+		return nil, fmt.Errorf("%w: applied 목록이 비어 있다 %q — 정상 경로는 빈 목록을 기록하지 않는다(부재가 아니라 손상)", ErrAppliedCorrupt, path)
+	}
+	for i, rec := range idx.Applied {
+		if verr := rec.valid(); verr != nil {
+			return nil, fmt.Errorf("%w: applied[%d] %q: %v", ErrAppliedCorrupt, i, path, verr)
+		}
 	}
 	return idx.Applied, nil
 }
 
+// valid는 한 record가 복원 재료로서 의미가 서는지 본다. 형식만 맞고 값이 비어 있는 record는
+// "무엇을 어느 슬롯에 어떤 이미지로 띄웠는가"에 답하지 못하므로 복원에 쓸 수 없다.
+func (r AppliedRecord) valid() error {
+	if err := validRevHex(r.Revision); err != nil {
+		return fmt.Errorf("revision: %v", err)
+	}
+	if !appliedSlots[r.Slot] {
+		return fmt.Errorf("slot이 닫힌 집합 밖이다: %q", r.Slot)
+	}
+	hex, ok := strings.CutPrefix(r.ImageDigest, "sha256:")
+	if !ok || validRevHex(hex) != nil {
+		return fmt.Errorf("imageDigest가 sha256:<64소문자hex>가 아니다: %q", r.ImageDigest)
+	}
+	if r.Status != StatusApplied {
+		return fmt.Errorf("status가 %q가 아니다: %q", StatusApplied, r.Status)
+	}
+	return nil
+}
+
+// rejectDuplicateJSONKeys는 중복 키를 토큰 수준에서 거절한다(중첩 포함). encoding/json의
+// 구조체 디코드는 중복 키에서 뒤엣것을 조용히 채택하므로, 손상된(또는 조작된) 인덱스가
+// "읽히기는 하는" 상태로 통과한다.
+func rejectDuplicateJSONKeys(b []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	return scanJSONValue(dec)
+}
+
+func scanJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("JSON 토큰 읽기 실패: %v", err)
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch d {
+	case '{':
+		seen := map[string]bool{}
+		for dec.More() {
+			kt, kerr := dec.Token()
+			if kerr != nil {
+				return fmt.Errorf("JSON 키 읽기 실패: %v", kerr)
+			}
+			key, kok := kt.(string)
+			if !kok {
+				return fmt.Errorf("JSON 객체 키가 문자열이 아니다")
+			}
+			if seen[key] {
+				return fmt.Errorf("중복 키: %q", key)
+			}
+			seen[key] = true
+			if verr := scanJSONValue(dec); verr != nil {
+				return verr
+			}
+		}
+	case '[':
+		for dec.More() {
+			if verr := scanJSONValue(dec); verr != nil {
+				return verr
+			}
+		}
+	}
+	if _, cerr := dec.Token(); cerr != nil {
+		return fmt.Errorf("JSON 닫는 구분자 읽기 실패: %v", cerr)
+	}
+	return nil
+}
+
+// sameState는 두 record의 **복원 상태**가 같은지 본다 — 다시 띄우는 데 필요한 값 전부다.
+// 추적 메타(requestId·ts)는 여기 들지 않는다: 그것들이 달라도 "무엇을 띄웠는가"는 같다.
+func (r AppliedRecord) sameState(o AppliedRecord) bool {
+	return r.Revision == o.Revision &&
+		r.ImageDigest == o.ImageDigest &&
+		r.Slot == o.Slot &&
+		r.CommitSHA == o.CommitSHA &&
+		sameInjected(r.Injected, o.Injected)
+}
+
+func sameInjected(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
 // Promote는 **배포가 성공한 뒤에만** 호출된다(B4' — 실패 candidate는 승격되지 않는다).
-// 목록 맨 앞에 한 항을 넣고 단일 파일을 원자 교체한다 — 반쪽 승격 창이 없다.
+// 단일 파일을 원자 교체하므로 반쪽 승격 창이 없다. 갈래는 셋이며, 판정 기준은 revision이
+// **아니라 record 전체의 상태**다:
 //
-// 같은 revision을 다시 배포한 경우(applied[0]과 revision이 같다)는 **무변경**이다(G-08):
-// 재전송·재배포가 목록을 같은 값으로 밀어 [1](직전 정상본)을 밀어내면, 복원 재료가
-// "같은 것 두 개"가 되어 되돌릴 곳이 사라진다.
+//   - 완전 동일(상태 + requestId까지 같다) = 같은 요청의 재실행 = **무변경**.
+//   - 상태만 동일(새 requestId) = 같은 것을 다시 띄웠다 = applied[0] **제자리 갱신**.
+//     [1](직전 정상본)은 건드리지 않는다 — 밀어넣으면 복원 재료가 "같은 것 두 개"가 되어
+//     되돌릴 곳이 사라진다.
+//   - 그 밖 = 새 record를 앞에 넣는다.
+//
+// ⚠️ revision만 비교하면 안 되는 이유(리뷰 E-1): compose 정의는 릴리스마다 바뀌지 않는다.
+// 같은 compose에 **새 이미지**를 올리는 것이 정상 배포의 대다수인데, revision 비교는 그
+// 전부를 "같은 것"으로 보고 승격을 통째로 삼킨다 — applied[0]의 imageDigest가 옛 릴리스에
+// 머물고, 그 목록을 보고 복원하면 방금 배포한 것이 아니라 예전 이미지가 뜬다.
 func (w *Workspace) Promote(target string, rec AppliedRecord) error {
 	cur, err := w.Applied(target)
 	if err != nil {
 		return err
 	}
-	if len(cur) > 0 && cur[0].Revision == rec.Revision {
+	var next []AppliedRecord
+	switch {
+	case len(cur) > 0 && cur[0].sameState(rec) && cur[0].RequestID == rec.RequestID:
 		return nil
+	case len(cur) > 0 && cur[0].sameState(rec):
+		next = append([]AppliedRecord{rec}, cur[1:]...)
+	default:
+		next = append([]AppliedRecord{rec}, cur...)
 	}
-	next := append([]AppliedRecord{rec}, cur...)
 	if len(next) > maxAppliedRecords {
 		next = next[:maxAppliedRecords]
 	}
@@ -321,6 +459,14 @@ func (w *Workspace) Promote(target string, rec AppliedRecord) error {
 	}
 	if cerr := os.Chmod(tmpName, appliedPerm); cerr != nil {
 		return errf(CodeStorageIntegrity, "applied 모드 설정 실패: %v", cerr)
+	}
+	// 원자성 시험용 훅 — 테스트가 rename **직전**에 프로세스 중단을 흉내 낸다. 프로덕션에서는
+	// 항상 nil이다. 이 지점이 원자성의 유일한 경계이므로(그 전은 temp 파일뿐, 그 후는 완료)
+	// 여기서 끊었을 때 원본이 온전한지가 곧 "반쪽 승격 창이 없다"의 증명이다.
+	if w.beforeRename != nil {
+		if herr := w.beforeRename(); herr != nil {
+			return herr
+		}
 	}
 	if rerr := os.Rename(tmpName, w.appliedPath(target)); rerr != nil {
 		return errf(CodeStorageIntegrity, "applied 원자 교체 실패: %v", rerr)
@@ -411,13 +557,16 @@ func (w *Workspace) GC(target string, pinned []string) error {
 }
 
 // validRevHex는 revision이 소문자 64자 hex인지 본다(파일명이 되므로 경로 주입 방지이기도 하다).
+// 코드가 CodeRevision인 이유(리뷰 E-11): 이 값은 **요청(manifest)에서 온다**. 저장 무결성
+// 장애로 분류하면 요청 형식 위반이 500으로 나가 CI가 자기 산출물 대신 이 호스트의 디스크를
+// 의심하게 된다 — 형식 위반은 422다.
 func validRevHex(revHex string) error {
 	if len(revHex) != 64 {
-		return errf(CodeStorageIntegrity, "revision hex 길이가 64가 아니다: %d", len(revHex))
+		return errf(CodeRevision, "revision hex 길이가 64가 아니다: %d", len(revHex))
 	}
 	for _, c := range revHex {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return errf(CodeStorageIntegrity, "revision hex에 허용되지 않는 문자가 있다: %q", revHex)
+			return errf(CodeRevision, "revision hex에 허용되지 않는 문자가 있다: %q", revHex)
 		}
 	}
 	return nil

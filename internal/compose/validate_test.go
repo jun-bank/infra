@@ -620,3 +620,32 @@ func itoa(n int64) string {
 	}
 	return string(b)
 }
+
+// U-35: 디코드 후 크기 상한의 **경계**. 상한 자체(64KiB)는 통과하고 1바이트 초과가 거절돼야
+// 한다 — 부등호가 한 칸 어긋나면 정상 compose가 거절되거나(운영 사고) 상한이 사실상 없어진다.
+func TestValidateSizeCapBoundary(t *testing.T) {
+	// baseCompose 뒤에 주석을 붙여 정확히 MaxComposeBytes / +1 바이트를 만든다.
+	pad := func(total int) []byte {
+		head := baseCompose + "# "
+		if len(head)+1 > total {
+			t.Fatalf("픽스처가 목표 크기보다 크다: %d > %d", len(head)+1, total)
+		}
+		return []byte(head + strings.Repeat("x", total-len(head)-1) + "\n")
+	}
+
+	exact := pad(MaxComposeBytes)
+	if len(exact) != MaxComposeBytes {
+		t.Fatalf("경계 픽스처 크기=%d, %d 기대", len(exact), MaxComposeBytes)
+	}
+	if _, err := Validate(exact, basePolicy()); err != nil {
+		t.Fatalf("상한 정확히 %d바이트가 거절됐다(경계 오프바이원): %v", MaxComposeBytes, err)
+	}
+
+	over := pad(MaxComposeBytes + 1)
+	if len(over) != MaxComposeBytes+1 {
+		t.Fatalf("초과 픽스처 크기=%d", len(over))
+	}
+	if got := CodeOf(mustErr(t, over)); got != CodeSize {
+		t.Fatalf("상한 +1바이트 거절 코드=%q, %q 기대", got, CodeSize)
+	}
+}
