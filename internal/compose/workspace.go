@@ -42,6 +42,9 @@ const (
 	// 호스트 값)을 담기 때문이다. 시크릿은 애초에 여기 오면 안 되지만(CF-6), 값이 담기는
 	// 파일을 값이 담기지 않는 파일과 같은 모드로 두지 않는다.
 	appliedPerm os.FileMode = 0o600
+	// 스냅샷은 실행 전용 임시 파일이라 candidate보다 좁게 연다(값을 담지 않지만, 수명이
+	// 짧고 아무도 읽을 필요가 없는 파일을 굳이 넓게 열 이유가 없다).
+	snapshotPerm os.FileMode = 0o600
 )
 
 // maxGenerations는 세대 파일 잔여 상한이다(rev.2.1 C1 선언값 — pin된 것은 이 상한과
@@ -203,6 +206,79 @@ func (w *Workspace) WriteCandidate(target, slot, revHex string, content []byte) 
 		return Candidate{}, errf(CodeStorageIntegrity, "기록된 candidate가 검증 바이트와 다르다: %q(기대 sha256=%s 실제=%x) — 저장 무결성 장애", path, revHex, sum)
 	}
 	return cand, nil
+}
+
+// snapshotDir는 실행 중 잠깐만 사는 파일들이 모이는 자리다(세대·인덱스와 분리). 이 격리가
+// 필요한 이유: 세대 파일은 "내용이 곧 이름"이고 applied 인덱스는 "성공한 것만"인데, 스냅샷은
+// 둘 다 아니다 — 같은 디렉터리에 섞으면 GC와 복원 재료 판정이 임시 파일을 세게 된다.
+const snapshotDir = "tmp"
+
+// WriteSnapshot은 **이미 검증된 바이트 버퍼**를 실행 전용 임시 파일로 고정한다.
+//
+// 무엇을 막는가: 검증(재해시)과 사용(compose 실행) 사이의 창이다. 세대 파일 경로를 그대로
+// 실행기에 넘기면, 검증한 순간과 `docker compose`가 그 파일을 여는 순간 사이에 내용이 바뀔
+// 수 있다 — 그 사이에는 idle 기동·헬스·라우트 전환·드레인이 통째로 들어간다(초 단위가 아니라
+// 분 단위 창이다). 재검증 시점을 뒤로 미루는 것으로는 창이 좁아질 뿐 없어지지 않는다.
+// 검증한 **바이트 자체**를 별도 파일로 굳혀 실행기에 결박하면, 원본이 그 뒤 어떻게 바뀌든
+// 실행되는 내용은 검증된 것 그대로다.
+//
+// name은 호출자가 만드는 파일시스템 안전 문자열이다(경로 구분자·`..` 금지 — 여기서 검사한다).
+// 같은 이름이 이미 있으면 내용이 같을 때만 재사용한다(중단된 시도의 잔재로 재전송이 막히지
+// 않게 하되, 다른 내용이면 거절 — candidate와 같은 규칙).
+func (w *Workspace) WriteSnapshot(target, name string, content []byte) (string, error) {
+	if name == "" || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+		return "", errf(CodeWorkspace, "스냅샷 이름이 안전하지 않다: %q", name)
+	}
+	dir := filepath.Join(w.root, target, snapshotDir)
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return "", errf(CodeStorageIntegrity, "스냅샷 디렉터리 생성 실패: %q: %v", dir, err)
+	}
+	if err := os.Chmod(dir, dirPerm); err != nil {
+		return "", errf(CodeStorageIntegrity, "스냅샷 디렉터리 모드 설정 실패: %q: %v", dir, err)
+	}
+	path := filepath.Join(dir, name)
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, snapshotPerm)
+	switch {
+	case err == nil:
+		if werr := writeAndSync(f, content); werr != nil {
+			f.Close()
+			return "", werr
+		}
+		if cerr := f.Close(); cerr != nil {
+			return "", errf(CodeStorageIntegrity, "스냅샷 닫기 실패: %q: %v", path, cerr)
+		}
+		if cerr := os.Chmod(path, snapshotPerm); cerr != nil {
+			return "", errf(CodeStorageIntegrity, "스냅샷 모드 설정 실패: %q: %v", path, cerr)
+		}
+		if serr := syncDir(dir); serr != nil {
+			return "", serr
+		}
+	case errors.Is(err, os.ErrExist):
+		// 중단된 앞선 시도의 잔재 — 내용이 같을 때만 재사용한다.
+	default:
+		return "", errf(CodeStorageIntegrity, "스냅샷 생성 실패: %q: %v", path, err)
+	}
+
+	got, rerr := os.ReadFile(path) //nolint:gosec // workspace 안의 우리가 만든 경로
+	if rerr != nil {
+		return "", errf(CodeStorageIntegrity, "스냅샷 재읽기 실패: %q: %v", path, rerr)
+	}
+	if !bytes.Equal(got, content) {
+		return "", errf(CodeStorageIntegrity, "기록된 스냅샷이 검증 바이트와 다르다: %q — 저장 무결성 장애", path)
+	}
+	return path, nil
+}
+
+// RemoveSnapshot은 실행이 끝난 스냅샷을 지운다(성공·실패 무관). 실패해도 오류를 올리지
+// 않는 이유: 이 파일은 tmp에 격리돼 있어 잔존해도 세대 회전·applied 인덱스·GC 어디에도
+// 들지 않고, 다음 실행은 같은 내용이면 재사용하고 다르면 거절한다 — 정리 실패가 배포
+// 결과를 뒤집을 근거가 없다.
+func (w *Workspace) RemoveSnapshot(path string) {
+	if path == "" {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // CheckNoDotEnv는 실행 기준 디렉터리에 `.env`가 없음을 확인한다. **기록 전과 실행 직전**
@@ -517,6 +593,11 @@ func (w *Workspace) GC(target string, pinned []string) error {
 	}
 	for _, slotEnt := range slots {
 		if !slotEnt.IsDir() {
+			continue
+		}
+		// 스냅샷 디렉터리는 세대 회전 밖이다 — 실행 중 잠깐 사는 파일이라 pin·잔여 상한의
+		// 대상이 아니고, 여기 섞이면 GC가 임시 파일을 세대로 세게 된다.
+		if slotEnt.Name() == snapshotDir {
 			continue
 		}
 		slotDir := filepath.Join(targetDir, slotEnt.Name())

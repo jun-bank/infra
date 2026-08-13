@@ -265,11 +265,12 @@ func (p *composePlan) promote(ctx context.Context, slot string, injected map[str
 //	applied 손상  — "record가 없다"가 아니라 "알 수 없다".
 //	record 부재 + opt-in 없음 — 위 창 밖의 record 부재는 정상 상태가 아니다.
 //	세대 파일 무결성 실패 — 아래 재해시 참조.
-func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecutor, error) {
+func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecutor, func(), error) {
+	noCleanup := func() {}
 	target := string(p.manifest.Target)
 	applied, err := p.rt.Workspace.Applied(target)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 정의를 확정할 수 없다(applied 인덱스 손상 — legacy 파일로 폴백하지 않는다): %v", ErrComposeStorage, slot, err)
+		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 정의를 확정할 수 없다(applied 인덱스 손상 — legacy 파일로 폴백하지 않는다): %v", ErrComposeStorage, slot, err)
 	}
 	var found *compose.AppliedRecord
 	for i := range applied {
@@ -282,14 +283,14 @@ func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecut
 		// 이 슬롯이 동봉 경로로 뜬 적이 없다. 이관 과도기(구 컨테이너가 legacy로 떠 있는
 		// 첫 동봉 배포)에서만 기존 배선으로 내린다 — 그 밖에서는 거절이다.
 		if !p.rt.AllowLegacy {
-			return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 applied record가 없다 — 동봉 배포에서 서명되지 않은 호스트 compose 파일로 down하지 않는다(이관 과도기라면 %s=1로 명시 허용한다 · fail-closed)", ErrComposeStorage, slot, "DEPLOY_ALLOW_LEGACY_COMPOSE")
+			return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 applied record가 없다 — 동봉 배포에서 서명되지 않은 호스트 compose 파일로 down하지 않는다(이관 과도기라면 %s=1로 명시 허용한다 · fail-closed)", ErrComposeStorage, slot, "DEPLOY_ALLOW_LEGACY_COMPOSE")
 		}
 		if fallback == nil {
-			return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 정의도, 기존 배선도 없다", ErrComposeWiring, slot)
+			return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 정의도, 기존 배선도 없다", ErrComposeWiring, slot)
 		}
 		log.Printf("경고: %s — 구 active 슬롯(%s)에 applied record가 없어 호스트 compose 파일로 내린다(이관 과도기 전용 · target=%s requestId=%s)",
 			ComposePathLegacy, slot, target, p.manifest.RequestID)
-		return fallback, nil
+		return fallback, noCleanup, nil
 	}
 	path := p.rt.Workspace.CandidatePath(target, slot, found.Revision)
 	// 존재 확인만으로는 부족하다: 세대 파일은 파일명이 곧 내용 해시라는 계약 위에 서 있고,
@@ -298,25 +299,48 @@ func (p *composePlan) bindActive(slot string, fallback HostExecutor) (HostExecut
 	// 정의"라고 부르는 것이 사실은 누군가 바꿔 놓은 것이 된다.
 	body, rerr := os.ReadFile(path) //nolint:gosec // workspace 안에서 해시로 결정된 경로
 	if rerr != nil {
-		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일을 읽을 수 없다(rev=%s) — 무엇을 내리는지 증명할 수 없다: %v", ErrComposeStorage, slot, shortRev(found.Revision), rerr)
+		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일을 읽을 수 없다(rev=%s) — 무엇을 내리는지 증명할 수 없다: %v", ErrComposeStorage, slot, shortRev(found.Revision), rerr)
 	}
 	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != found.Revision {
-		return nil, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일이 기록된 revision과 다르다(기대=%s 실제=%s) — 변조·절단된 정의로 down하지 않는다(legacy 폴백도 하지 않는다)", ErrComposeStorage, slot, shortRev(found.Revision), shortRev(hex.EncodeToString(sum[:])))
+		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 세대 파일이 기록된 revision과 다르다(기대=%s 실제=%s) — 변조·절단된 정의로 down하지 않는다(legacy 폴백도 하지 않는다)", ErrComposeStorage, slot, shortRev(found.Revision), shortRev(hex.EncodeToString(sum[:])))
 	}
+
+	// 검증한 **바이트 자체**를 실행 전용 스냅샷으로 굳혀 결박한다. 세대 파일 경로를 그대로
+	// 넘기면 검증(지금)과 사용(전환·드레인 뒤의 down) 사이에 창이 남는데, 그 창에는 idle
+	// 기동·헬스·라우트 전환·드레인이 통째로 들어간다 — 재검증을 뒤로 미루는 것으로는 좁아질
+	// 뿐 없어지지 않는다. 스냅샷을 쓰면 원본이 그 뒤 어떻게 바뀌든 실행되는 내용은 검증된
+	// 것 그대로다(불변 버퍼 결박).
+	snapPath, serr := p.rt.Workspace.WriteSnapshot(target, downSnapshotName(slot, p.manifest.RequestID), body)
+	if serr != nil {
+		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s)의 실행 스냅샷을 만들 수 없다 — 검증한 바이트를 결박하지 못한 채 down하지 않는다: %v", ErrComposeStorage, slot, serr)
+	}
+	cleanup := func() { p.rt.Workspace.RemoveSnapshot(snapPath) }
+
 	kv := make([]string, 0, len(found.Injected))
 	for k, v := range found.Injected {
 		kv = append(kv, k+"="+v)
 	}
 	sort.Strings(kv)
 	exec, _, berr := p.rt.Bind(slot, ComposeBinding{
-		ComposeFile:      path,
-		ProjectDirectory: filepath.Dir(path),
+		ComposeFile: snapPath,
+		// 실행 기준 디렉터리는 스냅샷이 있는 tmp다 — compose가 상대 경로·.env를 해석하는
+		// 기준까지 스냅샷과 함께 움직여야 결박이 한 조각으로 성립한다.
+		ProjectDirectory: filepath.Dir(snapPath),
 		Injected:         kv,
 	})
 	if berr != nil {
-		return nil, fmt.Errorf("%w: 구 active 슬롯(%s) 실행기 결박 실패: %v", ErrComposeWiring, slot, berr)
+		cleanup()
+		return nil, noCleanup, fmt.Errorf("%w: 구 active 슬롯(%s) 실행기 결박 실패: %v", ErrComposeWiring, slot, berr)
 	}
-	return exec, nil
+	return exec, cleanup, nil
+}
+
+// downSnapshotName은 스냅샷 파일명을 만든다. requestId를 파일명에 그대로 쓰지 않는 이유:
+// 그 값은 외부에서 오는 문자열이라 경로 구분자·`..`이 들어올 수 있다. 해시로 접으면 길이와
+// 문자 집합이 고정되면서도 요청마다 갈려, 동시에 도는 다른 요청의 스냅샷과 섞이지 않는다.
+func downSnapshotName(slot, requestID string) string {
+	sum := sha256.Sum256([]byte(requestID))
+	return "down-" + slot + "-" + hex.EncodeToString(sum[:])[:16] + ".yml"
 }
 
 // shortRev는 로그·오류 메시지용 축약 revision이다.

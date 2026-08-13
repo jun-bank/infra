@@ -548,6 +548,23 @@ type bgEmbedRig struct {
 	blueH, greenH fakeHealth
 	gw            *fakeGateway
 	bound         map[string]*fakeExec
+	// midDeploy는 idle 헬스 판정 직전에 불린다(기동 뒤·전환 앞) — 검증과 사용 사이의 창을
+	// 실제 시퀀스 안에서 흔들어 보기 위한 주입점이다.
+	midDeploy func()
+	// onActiveDown은 구 active를 내리는 순간 불린다(실행 시점의 파일 상태 포착).
+	onActiveDown func()
+}
+
+// activeBound는 구 active 슬롯에 결박된 실행기와 그 `-f` 경로를 찾는다.
+func (r *bgEmbedRig) activeBound(t *testing.T, slot string) (*fakeExec, string) {
+	t.Helper()
+	for k, ex := range r.bound {
+		if strings.HasPrefix(k, slot+"|") {
+			return ex, strings.TrimPrefix(k, slot+"|")
+		}
+	}
+	t.Fatalf("슬롯 %q에 결박된 실행기가 없다(결박된 것: %v)", slot, boundKeys(r.bound))
+	return nil, ""
 }
 
 func newBGEmbedRig(t *testing.T, active Slot) *bgEmbedRig {
@@ -576,6 +593,13 @@ func newBGEmbedRig(t *testing.T, active Slot) *bgEmbedRig {
 			health.err = r.blueH.err
 		} else if slot == string(SlotGreen) {
 			health.err = r.greenH.err
+		}
+		// idle 슬롯의 헬스는 시퀀스 중간이고, active 슬롯의 down은 시퀀스 끝이다 —
+		// 그 둘 사이가 정확히 검증과 사용 사이의 창이다.
+		if slot != string(r.gw.active) {
+			health.hook = r.midDeploy
+		} else {
+			ex.onDown = r.onActiveDown
 		}
 		return ex, health, nil
 	}
@@ -700,17 +724,21 @@ func TestActiveSlotDownBoundToAppliedRecord(t *testing.T) {
 		t.Fatalf("state=%v err=%v", st, err)
 	}
 
-	// blue(구 active)를 내린 실행기는 **그 record의 세대 파일**로 결박됐어야 한다.
-	oldPath := r.ws.CandidatePath("core", "blue", oldRev)
-	downExec, ok := r.bound["blue|"+oldPath]
-	if !ok {
-		t.Fatalf("구 active 슬롯이 applied record의 정의로 결박되지 않았다(결박된 것: %v)", boundKeys(r.bound))
-	}
+	// blue(구 active)를 내린 실행기는 그 record의 정의에 결박됐어야 한다. `-f`가 가리키는
+	// 것은 세대 파일 자체가 아니라 **검증된 바이트의 스냅샷**이다(TOCTOU 창 차단 — 아래
+	// TestActiveSlotDownUsesImmutableSnapshot 참조).
+	downExec, boundPath := r.activeBound(t, "blue")
 	if downExec.downs != 1 {
 		t.Fatalf("결박된 실행기가 down하지 않았다(%d회)", downExec.downs)
 	}
 	if r.blue.downs != 0 {
 		t.Fatalf("호스트 옛 compose 파일 실행기가 down했다(%d회) — 결박이 우회됐다", r.blue.downs)
+	}
+	if boundPath == r.ws.CandidatePath("core", "blue", oldRev) {
+		t.Fatal("세대 파일 경로를 그대로 결박했다 — 검증과 사용 사이의 창이 열려 있다")
+	}
+	if !strings.Contains(boundPath, filepath.Join("core", "tmp")) {
+		t.Fatalf("스냅샷이 tmp 격리 밖이다: %q", boundPath)
 	}
 }
 
@@ -792,13 +820,13 @@ func TestActiveSlotGenerationFileIsRehashed(t *testing.T) {
 	}
 
 	t.Run("정상 세대 파일은 통과", func(t *testing.T) {
-		r, oldRev, path := setup(t)
+		r, oldRev, _ := setup(t)
 		st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
 		if st != StateCompleted || err != nil {
 			t.Fatalf("state=%v err=%v", st, err)
 		}
-		if downExec, ok := r.bound["blue|"+path]; !ok || downExec.downs != 1 {
-			t.Fatalf("정상 세대 파일인데 결박 down이 일어나지 않았다(rev=%s · 결박된 것 %v)", oldRev[:8], boundKeys(r.bound))
+		if downExec, _ := r.activeBound(t, "blue"); downExec.downs != 1 {
+			t.Fatalf("정상 세대 파일인데 결박 down이 일어나지 않았다(rev=%s)", oldRev[:8])
 		}
 	})
 
@@ -968,4 +996,116 @@ func boundKeys(m map[string]*fakeExec) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// E-7b(TOCTOU): 세대 파일을 재해시하는 것만으로는 부족하다 — 검증은 bindActive 시점이고
+// 실제 사용은 idle 기동·헬스·라우트 전환·드레인을 지난 뒤의 down이다. 그 사이(분 단위 창)에
+// 원본이 바뀌면 검증되지 않은 내용으로 내리게 된다. 검증한 **바이트 자체**를 스냅샷으로
+// 굳혀 결박하면, 원본이 그 뒤 어떻게 바뀌든 실행되는 것은 검증된 내용 그대로다.
+func TestActiveSlotDownUsesImmutableSnapshot(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue)
+	oldCompose := embeddedCompose + "# blue 세대\n"
+	oldRev := revHexOf(oldCompose)
+	if _, err := r.ws.WriteCandidate("core", "blue", oldRev, []byte(oldCompose)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ws.Promote("core", compose.AppliedRecord{
+		Revision: oldRev, Slot: "blue", ImageDigest: validDigest, CommitSHA: "c0",
+		RequestID: "req-0", TS: "t", Injected: map[string]string{"DEPLOY_HOST_PORT": "18081"},
+		Status: compose.StatusApplied,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	genPath := r.ws.CandidatePath("core", "blue", oldRev)
+
+	// ⑴ 시퀀스 중간(기동 뒤·전환 앞)에 원본 세대 파일을 통째로 갈아치운다.
+	const evil = "services:\n  app:\n    image: \"evil/image:latest\"\n"
+	r.midDeploy = func() {
+		if err := os.WriteFile(genPath, []byte(evil), 0o644); err != nil {
+			t.Errorf("변조 실패: %v", err)
+		}
+	}
+	// ⑵ down이 실제로 실행되는 순간, 결박된 파일의 내용을 그대로 포착한다.
+	var seenAtDown string
+	var seenPath string
+	r.onActiveDown = func() {
+		_, p := r.activeBound(t, "blue")
+		seenPath = p
+		body, err := os.ReadFile(p)
+		if err != nil {
+			t.Errorf("down 시점에 결박 파일을 읽을 수 없다: %v", err)
+			return
+		}
+		seenAtDown = string(body)
+	}
+
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateCompleted || err != nil {
+		t.Fatalf("state=%v err=%v", st, err)
+	}
+
+	if seenAtDown == "" {
+		t.Fatal("down 훅이 불리지 않았다 — 시험이 실제 실행 시점을 보지 못했다")
+	}
+	if seenAtDown == evil {
+		t.Fatalf("down이 변조된 내용으로 실행됐다(TOCTOU 창) — 결박 파일=%q", seenPath)
+	}
+	if seenAtDown != oldCompose {
+		t.Fatalf("down이 검증된 바이트로 실행되지 않았다:\n기대=%q\n실제=%q", oldCompose, seenAtDown)
+	}
+	// 원본은 실제로 변조돼 있다 — 시험이 무음으로 통과한 것이 아님을 못박는다.
+	if got, _ := os.ReadFile(genPath); string(got) != evil {
+		t.Fatalf("변조 주입이 일어나지 않았다(시험 자체가 무효): %q", got)
+	}
+
+	// ⑶ 사용 후 스냅샷은 지워진다(tmp 격리 + 정리).
+	if _, serr := os.Stat(seenPath); !os.IsNotExist(serr) {
+		t.Fatalf("사용 후 스냅샷이 남았다: %q (err=%v)", seenPath, serr)
+	}
+}
+
+// 스냅샷을 만들 수 없으면 배포를 시작하지 않는다 — 검증한 바이트를 결박하지 못한 채
+// down하는 것이 이 결박이 막으려는 동작이다.
+func TestActiveSlotSnapshotFailureIsFailClosed(t *testing.T) {
+	r := newBGEmbedRig(t, SlotBlue)
+	r.seedActive(t, "blue", "18081")
+
+	// tmp 자리를 **파일**로 막아 디렉터리 생성을 실패시킨다.
+	if err := os.WriteFile(filepath.Join(r.root, "core", "tmp"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := r.dispatcher().Dispatch(context.Background(), embeddedManifest(embeddedCompose), store.FencingToken(7))
+	if st != StateUnexecuted || !errors.Is(err, ErrComposeStorage) {
+		t.Fatalf("state=%v err=%v, UNEXECUTED·저장 무결성 기대", st, err)
+	}
+	if r.blue.downs != 0 || r.green.ups != 0 {
+		t.Fatalf("스냅샷 실패인데 실행이 일어났다: blue.down=%d green.up=%d", r.blue.downs, r.green.ups)
+	}
+}
+
+// 스냅샷은 세대 회전·applied 인덱스 밖이다 — 잔존하더라도 GC가 세대로 세거나 복원 재료
+// 판정에 끼어들지 않아야 한다.
+func TestSnapshotIsolatedFromGenerationsAndIndex(t *testing.T) {
+	w := newEmbedRig(t).ws
+	path, err := w.WriteSnapshot("core", "down-blue-abc.yml", []byte("services: {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Promote("core", compose.AppliedRecord{
+		Revision: strings.Repeat("a", 64), Slot: "green", ImageDigest: validDigest,
+		CommitSHA: "c1", RequestID: "r1", TS: "t", Status: compose.StatusApplied,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.GC("core", nil); err != nil {
+		t.Fatalf("스냅샷이 GC를 깨뜨렸다: %v", err)
+	}
+	if _, serr := os.Stat(path); serr != nil {
+		t.Fatalf("GC가 tmp 스냅샷을 건드렸다: %v", serr)
+	}
+	list, lerr := w.Applied("core")
+	if lerr != nil || len(list) != 1 {
+		t.Fatalf("스냅샷이 applied 인덱스에 섞였다: %+v err=%v", list, lerr)
+	}
 }
