@@ -68,11 +68,6 @@ const fenceMutationRoundTrips = 2
 // 덮어쓴다 · defaultRPCSkew와 같은 축). 가로챈 유효 fence 요청의 락 만료 후 재생을 완화한다.
 const defaultFenceSkew = 60 * time.Second
 
-// defaultFenceListenAddr는 main의 **별도** fence-confirm LAN 리스너 기본 주소다(G-5 · CI
-// /deploy와 분리 · AGENT_FENCE_LISTEN_ADDR로 덮어쓴다). loopback 기본은 통합/로컬용이며 실
-// 배선(#36)은 .9 LAN literal을 준다. private-literal만 허용된다(ValidateListenAddr).
-const defaultFenceListenAddr = "127.0.0.1:9443"
-
 // defaultRPCSkew는 위성이 받는 RPC timestamp 신선도 허용 창이다(C4 · AGENT_RPC_SKEW로 덮어쓴다).
 // ⚠️ [구현 검증]: main↔위성 시계 편차 실측으로 정한다 — 짧으면 정상 요청이 편차로 거절되고,
 // 길면 가로챈 유효 요청의 재생 창이 넓어진다(게이트1 DefaultClockSkew와 같은 축).
@@ -287,31 +282,30 @@ func runMain() error {
 }
 
 // buildFenceListener는 main의 별도 fence-confirm LAN 리스너를 조립한다(infra#37 조각 B · G-5).
-// AGENT_FENCE_LISTEN_ADDR가 없으면 (nil, nil, nil)을 내 fencing 없이 기동한다(원격 위성 없는
-// dev). 설정되면:
-//   - 리스너 주소는 private-literal LAN만 허용하고(ValidateListenAddr), bind 후 실제 주소를
-//     한 번 더 검증한다(공개 bind 누수 방지 · CI 수신과 분리).
-//   - 위성별 키는 AGENT_RPC_KEY_SETTLEMENT/LEDGER에서 온다(main이 위성에 명령할 때 쓰는 키와
-//     같음 — 신뢰 경계 재사용). 최소 하나 필수(fail-closed).
+// 원격 위성 키(AGENT_RPC_KEY_SETTLEMENT/LEDGER)가 하나도 없으면 (nil, nil, nil)을 내 fencing
+// 없이 기동한다(원격 위성 없는 dev). 원격 위성이 있으면 fence 리스너는 **필수 배선**이다(C-B2 ·
+// 방어심층):
+//   - 주소는 **non-loopback private-literal LAN**이 필수다 — 위성 .158/.164가 도달할 .9 LAN
+//     주소여야 한다. loopback(127.0.0.1)으로 조용히 축소하면 위성이 도달 못 해 전건 fail하므로,
+//     축소 대신 요란하게 boot 거부한다(fenceBootConfig).
+//   - 출발지 allowlist(AGENT_FENCE_SOURCE_ALLOW)가 **필수**다(설계 G-5 — 방화벽이 1차 방어이나
+//     애플리케이션 2차 방어를 요구). 비었거나 private/loopback literal이 아닌 항목이면 boot 거부.
+//   - 위성별 키는 AGENT_RPC_KEY_SETTLEMENT/LEDGER에서 온다(main이 위성에 명령할 때 쓰는 키와 같음).
 //   - holderID는 buildCoordinator와 같은 os.Hostname()이다 — 위성은 token만 보내고 main은 자기
 //     holderID로 "이 lock이 여전히 내 것인가"를 판정한다(G-4).
-//   - 출발지 제한(.158/.164)은 AGENT_FENCE_SOURCE_ALLOW(콤마 구분 IP)로 선택 설정한다(G-5 ·
-//     방화벽이 1차 방어 · "가능 범위"). 미설정이면 경고만 남기고 키·서명·신선도로 방어한다.
 func buildFenceListener(st *store.SQLStore) (*http.Server, net.Listener, error) {
-	rawAddr := strings.TrimSpace(os.Getenv("AGENT_FENCE_LISTEN_ADDR"))
-	// 리스너 주소가 없고 위성 키도 하나도 없으면 fencing 미배선(dev) — 조용히 건너뛴다.
 	settleKey := os.Getenv("AGENT_RPC_KEY_SETTLEMENT")
 	ledgerKey := os.Getenv("AGENT_RPC_KEY_LEDGER")
-	if rawAddr == "" && strings.TrimSpace(settleKey) == "" && strings.TrimSpace(ledgerKey) == "" {
-		fmt.Println("경고: AGENT_FENCE_LISTEN_ADDR·위성 키 미설정 — fence-confirm 리스너 미기동(원격 위성 배포는 라우터에서 fail-closed). 원격 위성을 쓰면 조각 B fence 리스너를 배선한다")
-		return nil, nil, nil
-	}
-	if rawAddr == "" {
-		rawAddr = defaultFenceListenAddr
-	}
-	addr, err := agentrpc.ValidateListenAddr(rawAddr)
+	hasKeys := strings.TrimSpace(settleKey) != "" || strings.TrimSpace(ledgerKey) != ""
+
+	addr, allowed, enabled, err := fenceBootConfig(
+		os.Getenv("AGENT_FENCE_LISTEN_ADDR"), hasKeys, os.Getenv("AGENT_FENCE_SOURCE_ALLOW"))
 	if err != nil {
 		return nil, nil, err
+	}
+	if !enabled {
+		fmt.Println("경고: 원격 위성 키 미설정 — fence-confirm 리스너 미기동(원격 위성 배포는 라우터에서 fail-closed). 원격 위성을 쓰면 조각 B fence 리스너를 배선한다")
+		return nil, nil, nil
 	}
 
 	keys := map[deploy.Target][]byte{}
@@ -320,9 +314,6 @@ func buildFenceListener(st *store.SQLStore) (*http.Server, net.Listener, error) 
 	}
 	if strings.TrimSpace(ledgerKey) != "" {
 		keys[deploy.TargetLedger] = []byte(ledgerKey)
-	}
-	if len(keys) == 0 {
-		return nil, nil, errors.New("AGENT_FENCE_LISTEN_ADDR이 설정되면 AGENT_RPC_KEY_SETTLEMENT·AGENT_RPC_KEY_LEDGER 중 최소 하나가 필요하다(위성 서명 검증 키 · fail-closed)")
 	}
 
 	holderID, err := os.Hostname()
@@ -336,18 +327,6 @@ func buildFenceListener(st *store.SQLStore) (*http.Server, net.Listener, error) 
 	}
 	if skew <= 0 {
 		return nil, nil, fmt.Errorf("AGENT_FENCE_SKEW은 >0 이어야 한다(신선도 창 · fail-closed): %s", skew)
-	}
-
-	var allowed map[string]bool
-	if raw := strings.TrimSpace(os.Getenv("AGENT_FENCE_SOURCE_ALLOW")); raw != "" {
-		allowed = map[string]bool{}
-		for _, ip := range strings.Split(raw, ",") {
-			if ip = strings.TrimSpace(ip); ip != "" {
-				allowed[ip] = true
-			}
-		}
-	} else {
-		fmt.Println("경고: AGENT_FENCE_SOURCE_ALLOW 미설정 — fence 출발지 IP 제한 없음(방화벽이 1차 방어). 위성 IP(.158/.164)를 두면 애플리케이션 계층 2차 방어가 켜진다(G-5)")
 	}
 
 	handler, err := agentrpc.NewFenceHandler(agentrpc.FenceHandlerConfig{
@@ -372,6 +351,65 @@ func buildFenceListener(st *store.SQLStore) (*http.Server, net.Listener, error) 
 		ReadTimeout:       agentReadTimeout,
 	}
 	return fenceSrv, ln, nil
+}
+
+// fenceBootConfig는 fence 리스너의 boot 입력을 **네트워크 없이** 검증한다(C-B2 · 순수 함수라
+// 단위 테스트가 bind 없이 거절/허용을 관측한다). hasKeys=false(원격 위성 없음)면 enabled=false로
+// fencing을 끈다(dev) — 단 그때 addr만 있으면 검증할 위성이 없는 오배선이라 거부한다. hasKeys=
+// true면 리스너는 필수 배선이므로: addr은 non-loopback private-literal LAN이어야 하고(loopback
+// 조용한 축소 금지), allowlist는 비어 있지 않은 private/loopback literal IP 집합이어야 한다.
+func fenceBootConfig(rawAddr string, hasKeys bool, rawAllow string) (addr string, allowed map[string]bool, enabled bool, err error) {
+	rawAddr = strings.TrimSpace(rawAddr)
+	if !hasKeys {
+		if rawAddr != "" {
+			return "", nil, false, errors.New("AGENT_FENCE_LISTEN_ADDR이 설정됐으나 위성 키(AGENT_RPC_KEY_SETTLEMENT/LEDGER)가 하나도 없다 — 검증할 위성이 없는 오배선(fail-closed)")
+		}
+		return "", nil, false, nil // 원격 위성 없음 — fencing 미배선(dev)
+	}
+
+	// --- 원격 위성 있음 → fence 리스너 필수(C-B2) ---
+	if rawAddr == "" {
+		return "", nil, false, errors.New("원격 위성 키가 설정됐으면 AGENT_FENCE_LISTEN_ADDR이 필수다 — 위성 .158/.164가 도달할 .9 LAN 주소여야 하며, loopback 기본으로 조용히 축소하지 않는다(fail-closed)")
+	}
+	addr, err = agentrpc.ValidateListenAddr(rawAddr)
+	if err != nil {
+		return "", nil, false, err
+	}
+	host, _, _ := net.SplitHostPort(addr)
+	if ip := net.ParseIP(host); ip == nil || ip.IsLoopback() || !ip.IsPrivate() {
+		return "", nil, false, fmt.Errorf("원격 위성이 있으면 AGENT_FENCE_LISTEN_ADDR은 non-loopback private-literal LAN IP여야 한다(위성이 도달할 .9 LAN · loopback·공개 금지 · fail-closed): %q", host)
+	}
+
+	allowed, err = parseFenceAllowlist(rawAllow)
+	if err != nil {
+		return "", nil, false, err
+	}
+	return addr, allowed, true, nil
+}
+
+// parseFenceAllowlist는 출발지 IP allowlist를 파싱·검증한다(G-5 · C-B2). 원격 위성이 있으면
+// 필수이므로 빈 값·빈 파싱(","·공백만)·private/loopback literal 아님은 전부 boot 거부다. 방화벽이
+// 1차 방어이나 설계 G-5가 애플리케이션 계층 2차 방어를 요구한다.
+func parseFenceAllowlist(raw string) (map[string]bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("원격 위성이 있으면 AGENT_FENCE_SOURCE_ALLOW(위성 .158/.164 출발지 IP allowlist)가 필수다 — 방화벽이 1차 방어이나 설계 G-5가 2차 방어를 요구한다(fail-closed)")
+	}
+	allowed := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		ipStr := strings.TrimSpace(part)
+		if ipStr == "" {
+			continue
+		}
+		ip := net.ParseIP(ipStr)
+		if ip == nil || !(ip.IsPrivate() || ip.IsLoopback()) {
+			return nil, fmt.Errorf("AGENT_FENCE_SOURCE_ALLOW 항목이 private/loopback literal IP가 아니다(공개 IP·hostname 금지 · fail-closed): %q", ipStr)
+		}
+		allowed[ipStr] = true
+	}
+	if len(allowed) == 0 {
+		return nil, errors.New("AGENT_FENCE_SOURCE_ALLOW이 비었다(콤마·공백만) — 최소 하나의 위성 출발지 IP가 필요하다(fail-closed)")
+	}
+	return allowed, nil
 }
 
 // buildDeps는 진입 층이 판정을 위임할 협력자들을 환경에서 조립한다: 게이트 1
@@ -560,6 +598,9 @@ func buildRoutingDispatcher(local deploy.Dispatcher) (disp deploy.Dispatcher, re
 //     전제 위에서다(defaultRPCTimeout 4분이 위성 기본 exec budget ≈220s + fence 왕복을 감싼다).
 //     위성 exec budget은 위성 자기 설정이라 main이 정확히 알 수 없으므로, 이 커버리지는
 //     [구현 검증]이며 강제되는 불변식은 lease ≥ RPC_TIMEOUT + slack이다.
+//     ⚠️ #36 실배선 검증 항목: 원격 route 등록 시 RPC_TIMEOUT이 위성 mutation 총예산(pull+up+
+//     헬스+cleanup) + 각 mutation의 fence 왕복 대기를 덮도록 sizing됐는지 실측으로 확인한다 —
+//     main은 위성 .env를 구조적으로 관측할 수 없어 이 sizing은 운영 전제다.
 //   - fsync는 상한을 둘 수 없다(디스크가 임의로 느릴 수 있다). 그래서 계약을 정직하게 하향한다:
 //     위성 응답이 RPC_TIMEOUT을 넘으면 main은 dial-후 timeout으로 **UNKNOWN**을 받아 락을
 //     유지하고(사람 개입), 그 뒤 위성의 늦은 mutation은 lease 만료 후엔 fence 확인이 STALE을
