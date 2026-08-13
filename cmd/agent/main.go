@@ -88,12 +88,16 @@ const defaultAgentLockDir = "/run/jun-agent"
 // defaultDeployLease는 배포 창 락의 기본 lease다(AGENT_DEPLOY_LEASE로 덮어쓴다). ⚠️ 이
 // 값은 [구현 검증]이다 — 한 배포 시퀀스를 넉넉히 덮으면서 죽은 주체를 오래 붙들지 않는
 // 실측 값은 배포 시간과 함께 정해진다. store.MinLease(1초) 이상이어야 하고, 기본 설정끼리
-// leaseCoversDispatch를 통과해야 한다(기본 phaseBudget 120s + D 60s + cleanup 30s + 전환
-// 예산 65s + slack 10s = 285s 하한 — TestDefaultConfigLeaseCoversDispatch가 이 정합성을
-// 지킨다). ⚠️ 전환 단계(CD-4 ⑤⑥⑨)가 dispatch에 들어오면서 4분으로는 기본 설정이
-// 자기정합하지 않게 되어 6분으로 올렸다 — lease가 길수록 죽은 주체를 오래 붙드는 대가를
-// 함께 진다(CD-3 stale 회수가 그만큼 늦다).
-const defaultDeployLease = 6 * time.Minute
+// **두** 하한을 함께 통과해야 한다:
+//   - 로컬 leaseCoversDispatch(기본 phaseBudget 120s + D 60s + cleanup 30s + 전환 65s + slack
+//     10s = 285s) — TestDefaultConfigLeaseCoversDispatch.
+//   - 원격 leaseCoversRemote(조각 C 재개 사이클 = 3×RPC_TIMEOUT 4분 + slack 10s = 730s) —
+//     TestDefaultConfigLeaseCoversRemote. **이 원격 하한이 지배적**이다.
+//
+// ⚠️ 조각 C(위성 UNKNOWN 자동 재개)가 원격 하한을 1×→3×RPC_TIMEOUT으로 올리면서(R4) 6분으로는
+// 기본 설정이 자기정합하지 않게 되어 13분으로 올렸다 — 재개 사이클이 락 보유 시간을 늘린 직접
+// 대가다. lease가 길수록 죽은 주체를 오래 붙드는 대가를 함께 진다(CD-3 stale 회수가 그만큼 늦다).
+const defaultDeployLease = 13 * time.Minute
 
 // defaultDispatchPhaseBudget은 pull+up 단계 상한 phaseBudget의 기본값이다(P3). ⚠️ [구현 검증]:
 // 실제 이미지 pull(회수)·compose up(기동) 소요와 함께 sizing한다 — 이미지 pull이 이 budget
@@ -605,13 +609,25 @@ func buildRoutingDispatcher(local deploy.Dispatcher) (disp deploy.Dispatcher, re
 //     위성 응답이 RPC_TIMEOUT을 넘으면 main은 dial-후 timeout으로 **UNKNOWN**을 받아 락을
 //     유지하고(사람 개입), 그 뒤 위성의 늦은 mutation은 lease 만료 후엔 fence 확인이 STALE을
 //     내어 sticky guard가 막는다 — "늦은 응답 = main timeout UNKNOWN · 이후 mutation 없음".
+//
+// resumeNetworkOps는 조각 C 해소 사이클의 최대 순차 네트워크 op 수다(R4): execute#1 + status왕복
+// + 재개 execute#2 = 3. coordinator는 이 셋이 끝날 때까지 한 Dispatch 호출에 블로킹하며 락을 쥐므로,
+// 각 op가 RPC_TIMEOUT까지 늘어나는 최악에서 lease가 3×RPC_TIMEOUT을 덮어야 재개 도중 락이 만료되지
+// 않는다(만료 시 "UNKNOWN=락 유지"가 이미 탈취된 락 위에서 벌어지는 F4 재개방). status·execute#2의
+// 위성측 2차 dispatch·fsync는 execute#2의 RPC_TIMEOUT 창 안에서 일어나 이 셋에 전이적으로 포함된다.
+const resumeNetworkOps = 3
+
 func leaseCoversRemote(lease, rpcTimeout time.Duration) error {
 	if rpcTimeout <= 0 || rpcTimeout > maxDispatchDuration {
 		return fmt.Errorf("AGENT_RPC_TIMEOUT은 (0, %s] 범위여야 한다(fail-closed · overflow 방지): %s", maxDispatchDuration, rpcTimeout)
 	}
-	min := rpcTimeout + dispatchLeaseSlack
+	// 3×RPC_TIMEOUT + slack. resumeNetworkOps × maxDispatchDuration = 3시간으로 int64 overflow가
+	// 없다(위 상한 검사가 rpcTimeout ≤ 1시간을 보장하므로). B5(coordinator 무접촉)는 **코드**의
+	// 성질이지 lease **duration** 요구가 그대로란 뜻이 아니다 — 재개 사이클이 락 보유 시간을 늘려
+	// duration 하한이 3배로 커진다(R4 · 조각 A의 1×에서 재유도).
+	min := resumeNetworkOps*rpcTimeout + dispatchLeaseSlack
 	if lease < min {
-		return fmt.Errorf("원격 route 등록 시 배포 창 락 lease가 RPC 왕복을 덮지 못한다(fail-closed): lease=%s < AGENT_RPC_TIMEOUT(%s) + slack(%s) = %s — coordinator가 락 보유 중 Dispatch가 RPC_TIMEOUT까지 블로킹하므로 lease가 그보다 짧으면 반환 전 락 만료(CD-3/P3·P4 회귀). lease를 늘리거나 AGENT_RPC_TIMEOUT을 줄여라", lease, rpcTimeout, dispatchLeaseSlack, min)
+		return fmt.Errorf("원격 route 등록 시 배포 창 락 lease가 재개 해소 사이클을 덮지 못한다(fail-closed): lease=%s < %d×AGENT_RPC_TIMEOUT(%s) + slack(%s) = %s — coordinator가 락 보유 중 Dispatch가 execute#1+status+execute#2로 최대 3×RPC_TIMEOUT까지 블로킹하므로 lease가 그보다 짧으면 재개 도중 락 만료(F4·CD-3/P3·P4 회귀). lease를 늘리거나 AGENT_RPC_TIMEOUT을 줄여라", lease, resumeNetworkOps, rpcTimeout, dispatchLeaseSlack, min)
 	}
 	return nil
 }

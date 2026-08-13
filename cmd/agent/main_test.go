@@ -473,13 +473,18 @@ func TestRunUnsetRoleFailsClosed(t *testing.T) {
 // 거절하고 충분하면 통과함을 본다(coordinator가 락 보유 중 RPC_TIMEOUT까지 블로킹).
 func TestLeaseCoversRemote(t *testing.T) {
 	rpc := 4 * time.Minute
-	// lease가 rpc+slack과 동률보다 1ns 부족 = 거절(음수 여유 방지).
-	if err := leaseCoversRemote(rpc+dispatchLeaseSlack-time.Nanosecond, rpc); err == nil {
-		t.Fatal("lease < RPC_TIMEOUT + slack인데 통과(fail-closed 위반)")
+	min := resumeNetworkOps*rpc + dispatchLeaseSlack // 조각 C 재개 사이클(3×RPC_TIMEOUT + slack)
+	// lease가 하한보다 1ns 부족 = 거절(음수 여유 방지).
+	if err := leaseCoversRemote(min-time.Nanosecond, rpc); err == nil {
+		t.Fatal("lease < 3×RPC_TIMEOUT + slack인데 통과(fail-closed 위반)")
 	}
-	// 정확히 rpc+slack = 통과.
-	if err := leaseCoversRemote(rpc+dispatchLeaseSlack, rpc); err != nil {
-		t.Fatalf("lease = RPC_TIMEOUT + slack인데 거절: %v", err)
+	// 정확히 하한 = 통과.
+	if err := leaseCoversRemote(min, rpc); err != nil {
+		t.Fatalf("lease = 3×RPC_TIMEOUT + slack인데 거절: %v", err)
+	}
+	// 조각 A 하한(1×RPC_TIMEOUT + slack)은 이제 재개 사이클을 못 덮으므로 거절돼야 한다(회귀 방지).
+	if err := leaseCoversRemote(rpc+dispatchLeaseSlack, rpc); err == nil {
+		t.Fatal("1×RPC_TIMEOUT + slack로는 재개 사이클을 못 덮는데 통과(R4 재유도 위반)")
 	}
 	// RPC_TIMEOUT이 overflow 범위면 거절.
 	if err := leaseCoversRemote(time.Hour, 2*maxDispatchDuration); err == nil {

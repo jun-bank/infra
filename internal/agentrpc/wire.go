@@ -19,8 +19,10 @@ type deployRequest struct {
 }
 
 // deployResponse는 배포·상태 응답 body다. 위성이 서명하고(HeaderSignature) main이 검증한다.
-// 서명은 body가 아니라 ResponseCanonical(requestId·요청bodyDigest·action·httpStatus·state)을
-// 결박하므로, body 필드는 사람이 읽는 사본이자 state 전달이고 신뢰의 뿌리는 서명이다.
+// 서명은 body가 아니라 ResponseCanonical(requestId·요청bodyDigest·action·httpStatus·state·nonce)을
+// 결박하므로, body 필드는 사람이 읽는 사본이자 state 전달이고 신뢰의 뿌리는 서명이다. nonce는
+// body에 싣지 않는다 — main이 **자기가 보낸 nonce**로 canonical을 재구성해 검증하므로(조각 C R2
+// replay 방어), 응답 body의 nonce를 신뢰할 이유가 없다(오히려 신뢰하면 replay 표면이 된다).
 type deployResponse struct {
 	RequestID string `json:"requestId"`
 	Action    string `json:"action"`

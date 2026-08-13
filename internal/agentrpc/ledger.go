@@ -17,18 +17,22 @@ import (
 // requestId 단위 멱등·재기동 안전을 준다. "원자 JSON 하나"로 불충분한 이유는 상태 전이 중
 // 재기동을 견뎌야 하기 때문이다(쓰다 만 파일 = 손상). 각 전이는 한 줄 append + fsync다.
 //
-// 상태기계(R3):
+// 상태기계(R3 + 조각 C 재개 축):
 //
-//	ABSENT → ACCEPTED(requestId+command digest fsync) → COMPLETED|UNEXECUTED|UNKNOWN(fsync)
+//	ABSENT → ACCEPTED(requestId+command digest+attempt fsync) → COMPLETED|UNEXECUTED|UNKNOWN(fsync)
+//	         └─ terminal UNEXECUTED(attempt N) --재개 요청(attempt N+1, 같은 digest)--> ACCEPTED(N+1)
 //
 // 불변식:
 //   - ACCEPTED를 fsync한 **뒤에만** docker(dispatch)를 시작한다. terminal을 fsync한 **뒤에만**
 //     응답한다 — 그 사이(crash window)에 죽으면 재기동 후 ACCEPTED로 남아 UNKNOWN이 된다.
 //   - 재기동 시 ACCEPTED(비terminal) → **절대 UNEXECUTED가 아니라 UNKNOWN**이다(부작용이
 //     있었을 수 있다 — 미실행으로 접으면 중복 배포). Status·Accept 양쪽이 이를 지킨다.
-//   - 같은 requestId + **다른** command digest = 충돌(거절 · 부작용 0). 같은 digest 재수신은
-//     멱등: terminal이면 그 상태를 보고하고 비terminal이면 UNKNOWN을 보고한다(재실행 없음 —
-//     자동 재개는 조각 C).
+//   - 같은 requestId + **다른** command digest = 충돌(거절 · 부작용 0 · attempt와 무관 — 충돌 축).
+//     같은 digest 재수신은 attempt로 갈린다(조각 C R1 · 재개 vs 중복 축):
+//       · 같은 attempt(중복) = 멱등 보고(terminal이면 그 상태, 비terminal이면 UNKNOWN · 재실행 없음).
+//       · attempt N < 현재(지연·순서 뒤바뀜 M3) = 지금 상태를 stale 보고(재감기 없음).
+//       · terminal **UNEXECUTED**(attempt N) + attempt N+1 = **재개**: ACCEPTED(N+1) 내구 기록 후 실행.
+//       · terminal **COMPLETED/UNKNOWN** + attempt N+1 = 재개 금지, 그 상태 보고(옛 응답 replay 최후방어).
 //   - **target당 하나만 실행**(quarantine): 비terminal 레코드가 있으면 다른 requestId의 새
 //     배포를 거절한다 — 재기동 후 남은 ACCEPTED가 사후조건 해소 전 새 배포를 막는 것과 같은
 //     불변식이다(R3 "실행 중 레코드 남은 채 재기동 = 새 배포 금지"). 해소 전까지 영구 격리다.
@@ -86,9 +90,14 @@ var syncDir = func(dir string) error {
 type record struct {
 	RequestID string      `json:"requestId"`
 	Digest    string      `json:"digest"` // command digest(요청 body digest) — 같은 id 다른 digest=충돌
+	Attempt   int         `json:"attempt"`
 	State     LedgerState `json:"state"`
 	TS        string      `json:"ts"` // RFC3339 — 진단용(판정엔 쓰지 않는다)
 }
+
+// firstAttempt는 최초 배포의 attempt 번호다(조각 C R1). UNKNOWN 해소 후 재개는 firstAttempt+1이며,
+// 재개는 1회로 제한되므로(M2) attempt는 실제로 1→2 이상 올라가지 않는다.
+const firstAttempt = 1
 
 // Ledger는 append-only journal 위의 crash-safe 상태 저장소다. target 파생 lock 파일로 한
 // 실행자만 연다(journal과 lock은 별개 파일 — C3).
@@ -234,9 +243,12 @@ type Decision struct {
 	Err error
 }
 
-// Accept는 requestId·digest로 실행 진입을 판정하고, 진입 시 ACCEPTED를 내구 기록한다(fsync).
+// Accept는 requestId·digest·attempt로 실행 진입을 판정하고, 진입 시 ACCEPTED를 내구 기록한다(fsync).
 // **docker를 건드리기 전에** 부른다 — Proceed가 참일 때만, 그 뒤에만 dispatch를 시작한다.
-func (l *Ledger) Accept(requestID, digest string) Decision {
+//
+// attempt는 **재개 vs 중복** 축이다(조각 C R1). command digest(충돌 축)와 분리돼, 같은 manifest의
+// 재개(attempt+1)를 "다른 digest 충돌"로 접지 않으면서 "네트워크 중복(같은 attempt)"과는 구별한다.
+func (l *Ledger) Accept(requestID, digest string, attempt int) Decision {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -244,22 +256,52 @@ func (l *Ledger) Accept(requestID, digest string) Decision {
 		return Decision{Err: errLedgerPoisoned}
 	}
 	if r, ok := l.records[requestID]; ok {
+		// 충돌 축이 먼저다 — 다른 command digest는 attempt와 무관하게 거절(부작용 0).
 		if r.Digest != digest {
 			return Decision{Conflict: true}
 		}
-		if r.State.terminal() {
-			return Decision{Report: r.State} // 멱등 보고(재실행 없음)
+		switch {
+		case attempt == r.Attempt:
+			// 중복(같은 attempt) — 멱등 보고. terminal이면 그 상태, 비terminal(동시 중복·crash
+			// window)이면 UNKNOWN(미실행 아님 · 재실행 없음).
+			if r.State.terminal() {
+				return Decision{Report: r.State}
+			}
+			return Decision{Report: StateUnknown}
+		case attempt < r.Attempt:
+			// stale(M3) — 지연 도착·순서 뒤바뀜(옛 attempt가 새 attempt 기록 뒤 도착). 재감기 없이
+			// 지금 상태를 보고한다(비terminal이면 UNKNOWN).
+			if r.State.terminal() {
+				return Decision{Report: r.State}
+			}
+			return Decision{Report: StateUnknown}
+		default:
+			// attempt > 현재 — 재개 후보. **terminal UNEXECUTED + 정확히 N+1**일 때만 재개한다.
+			// 그 외(COMPLETED·UNKNOWN terminal, 비terminal, attempt 건너뜀)는 재개 금지 — 지금 상태
+			// 보고다. COMPLETED terminal의 재개 금지가 옛 응답 replay 최후방어다(R1).
+			if r.State == StateUnexecuted && attempt == r.Attempt+1 {
+				// 재개도 quarantine을 지킨다: **다른** requestId가 비terminal이면 거절(target당 하나).
+				// 이 req 자신은 terminal(UNEXECUTED)이라 아래 검사에 걸리지 않는다.
+				if l.hasNonTerminalLocked() {
+					return Decision{Busy: true}
+				}
+				if err := l.appendLocked(record{RequestID: requestID, Digest: digest, Attempt: attempt, State: StateAccepted, TS: l.nowStr()}); err != nil {
+					return Decision{Err: err}
+				}
+				return Decision{Proceed: true}
+			}
+			if r.State.terminal() {
+				return Decision{Report: r.State}
+			}
+			return Decision{Report: StateUnknown}
 		}
-		// 비terminal 재수신(동시 중복 또는 재기동 후 crash window) → UNKNOWN(미실행 아님 ·
-		// 자동 재개 없음 — 조각 C). 부작용이 있었을 수 있으므로 재실행하지 않는다.
-		return Decision{Report: StateUnknown}
 	}
 	// 새 requestId — quarantine 검사(target당 하나): 다른 requestId가 비terminal이면 거절.
 	if l.hasNonTerminalLocked() {
 		return Decision{Busy: true}
 	}
 	// ACCEPTED를 내구 기록(fsync)한 뒤에만 Proceed다 — 기록 실패면 실행하지 않는다(fail-closed).
-	if err := l.appendLocked(record{RequestID: requestID, Digest: digest, State: StateAccepted, TS: l.nowStr()}); err != nil {
+	if err := l.appendLocked(record{RequestID: requestID, Digest: digest, Attempt: attempt, State: StateAccepted, TS: l.nowStr()}); err != nil {
 		return Decision{Err: err}
 	}
 	return Decision{Proceed: true}
@@ -267,13 +309,19 @@ func (l *Ledger) Accept(requestID, digest string) Decision {
 
 // Finalize는 terminal 상태를 내구 기록한다(fsync). **응답을 서명·전송하기 전에** 부른다 —
 // 기록에 성공해야만 그 상태를 응답으로 주장할 수 있다(기록 실패 = 상태 주장 불가).
+//
+// attempt는 직전 ACCEPTED 레코드에서 그대로 이어받는다(조각 C R1) — terminal이 자기를 낳은
+// ACCEPTED와 같은 attempt를 갖도록 구조적으로 보장한다(재개 축이 finalize에서 0으로 되감겨
+// "UNEXECUTED@0"이 재개 판정을 깨는 것을 막는다). Finalize는 항상 Accept Proceed 뒤에 오므로
+// 레코드가 있으며, 없으면 attempt 0으로 기록한다(비정상 경로 · 방어).
 func (l *Ledger) Finalize(requestID, digest string, state LedgerState) error {
 	if !state.terminal() {
 		return fmt.Errorf("agentrpc: Finalize에 비terminal 상태(%s)는 올 수 없다", state)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.appendLocked(record{RequestID: requestID, Digest: digest, State: state, TS: l.nowStr()})
+	attempt := l.records[requestID].Attempt // 직전 ACCEPTED의 attempt를 이어받는다(없으면 0)
+	return l.appendLocked(record{RequestID: requestID, Digest: digest, Attempt: attempt, State: state, TS: l.nowStr()})
 }
 
 // Status는 requestId의 현재 상태를 조회한다(부작용 0). 없으면 (_, false). 비terminal(ACCEPTED)은

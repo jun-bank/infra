@@ -28,7 +28,7 @@ func openTempLedger(t *testing.T) (*Ledger, string) {
 // terminal 상태 멱등 보고(재실행 없음).
 func TestLedgerAcceptFinalizeHappy(t *testing.T) {
 	l, _ := openTempLedger(t)
-	dec := l.Accept("req-1", "sha256:aaa")
+	dec := l.Accept("req-1", "sha256:aaa", firstAttempt)
 	if !dec.Proceed {
 		t.Fatalf("첫 Accept는 Proceed여야 한다: %+v", dec)
 	}
@@ -36,7 +36,7 @@ func TestLedgerAcceptFinalizeHappy(t *testing.T) {
 		t.Fatalf("Finalize: %v", err)
 	}
 	// 같은 command 재수신 = 멱등 보고(재실행 없음).
-	dec2 := l.Accept("req-1", "sha256:aaa")
+	dec2 := l.Accept("req-1", "sha256:aaa", firstAttempt)
 	if dec2.Proceed || dec2.Report != StateCompleted {
 		t.Fatalf("완료된 requestId 재수신은 COMPLETED 보고여야 한다(재실행 없음): %+v", dec2)
 	}
@@ -45,10 +45,10 @@ func TestLedgerAcceptFinalizeHappy(t *testing.T) {
 // TestLedgerConflict는 같은 requestId 다른 digest를 충돌로 거절함을 본다(부작용 0).
 func TestLedgerConflict(t *testing.T) {
 	l, _ := openTempLedger(t)
-	if dec := l.Accept("req-1", "sha256:aaa"); !dec.Proceed {
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt); !dec.Proceed {
 		t.Fatalf("첫 Accept Proceed 기대: %+v", dec)
 	}
-	dec := l.Accept("req-1", "sha256:bbb")
+	dec := l.Accept("req-1", "sha256:bbb", firstAttempt)
 	if !dec.Conflict {
 		t.Fatalf("같은 requestId 다른 digest는 Conflict여야 한다: %+v", dec)
 	}
@@ -58,18 +58,18 @@ func TestLedgerConflict(t *testing.T) {
 // 거절함을 본다(target당 하나 · quarantine).
 func TestLedgerQuarantineOnePerTarget(t *testing.T) {
 	l, _ := openTempLedger(t)
-	if dec := l.Accept("req-1", "sha256:aaa"); !dec.Proceed {
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt); !dec.Proceed {
 		t.Fatalf("첫 Accept Proceed 기대: %+v", dec)
 	}
 	// req-1이 아직 비terminal(ACCEPTED)인 동안 req-2 = Busy.
-	if dec := l.Accept("req-2", "sha256:ccc"); !dec.Busy {
+	if dec := l.Accept("req-2", "sha256:ccc", firstAttempt); !dec.Busy {
 		t.Fatalf("선행 배포 미해소 중 새 requestId는 Busy여야 한다: %+v", dec)
 	}
 	// req-1이 terminal이 되면 req-2를 받는다.
 	if err := l.Finalize("req-1", "sha256:aaa", StateCompleted); err != nil {
 		t.Fatalf("Finalize: %v", err)
 	}
-	if dec := l.Accept("req-2", "sha256:ccc"); !dec.Proceed {
+	if dec := l.Accept("req-2", "sha256:ccc", firstAttempt); !dec.Proceed {
 		t.Fatalf("선행 해소 후 새 requestId는 Proceed여야 한다: %+v", dec)
 	}
 }
@@ -83,7 +83,7 @@ func TestLedgerRestartAcceptedIsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenLedger: %v", err)
 	}
-	if dec := l.Accept("req-1", "sha256:aaa"); !dec.Proceed {
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt); !dec.Proceed {
 		t.Fatalf("Accept Proceed 기대: %+v", dec)
 	}
 	// crash 시뮬레이션: terminal 없이 원장을 닫고 다시 연다(fsync된 ACCEPTED만 남는다).
@@ -100,7 +100,7 @@ func TestLedgerRestartAcceptedIsUnknown(t *testing.T) {
 	if st, ok := l2.Status("req-1"); !ok || st != StateUnknown {
 		t.Fatalf("재기동 후 ACCEPTED는 UNKNOWN이어야 한다(미실행 아님): st=%q ok=%v", st, ok)
 	}
-	dec := l2.Accept("req-1", "sha256:aaa")
+	dec := l2.Accept("req-1", "sha256:aaa", firstAttempt)
 	if dec.Proceed || dec.Report != StateUnknown {
 		t.Fatalf("재기동 후 같은 requestId 재수신은 UNKNOWN 보고여야 한다(재실행 없음): %+v", dec)
 	}
@@ -112,7 +112,7 @@ func TestLedgerRestartResolvedReplays(t *testing.T) {
 	dir := t.TempDir()
 	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
 	l, _ := OpenLedger(journal, lock)
-	l.Accept("req-1", "sha256:aaa")
+	l.Accept("req-1", "sha256:aaa", firstAttempt)
 	_ = l.Finalize("req-1", "sha256:aaa", StateCompleted)
 	_ = l.Close()
 
@@ -321,12 +321,12 @@ func TestLedgerPoisonAfterWriteError(t *testing.T) {
 	l, _ := openTempLedger(t)
 	// journal fd를 닫아 다음 Accept의 append(write)가 실패하게 한다.
 	_ = l.journal.Close()
-	dec := l.Accept("req-1", "sha256:aaa")
+	dec := l.Accept("req-1", "sha256:aaa", firstAttempt)
 	if dec.Err == nil {
 		t.Fatal("write 실패인데 Accept가 오류를 내지 않았다(poison 실패)")
 	}
 	// 이후 Accept는 poison으로 전부 거절.
-	if dec2 := l.Accept("req-2", "sha256:bbb"); dec2.Err == nil {
+	if dec2 := l.Accept("req-2", "sha256:bbb", firstAttempt); dec2.Err == nil {
 		t.Fatalf("poison 뒤 Accept가 거절되지 않았다: %+v", dec2)
 	}
 }
@@ -337,7 +337,7 @@ func TestLedgerPermanentQuarantine(t *testing.T) {
 	dir := t.TempDir()
 	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
 	l, _ := OpenLedger(journal, lock)
-	l.Accept("stuck", "sha256:aaa") // ACCEPTED 남긴 채 crash
+	l.Accept("stuck", "sha256:aaa", firstAttempt) // ACCEPTED 남긴 채 crash
 	_ = l.Close()
 
 	l2, err := OpenLedger(journal, lock)
@@ -346,7 +346,7 @@ func TestLedgerPermanentQuarantine(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = l2.Close() })
 	for i := 0; i < 3; i++ {
-		if dec := l2.Accept("new", "sha256:ccc"); !dec.Busy {
+		if dec := l2.Accept("new", "sha256:ccc", firstAttempt); !dec.Busy {
 			t.Fatalf("미해소 ACCEPTED가 있는 동안 새 requestId는 매번 Busy여야 한다(영구 격리): try=%d %+v", i, dec)
 		}
 	}
@@ -365,5 +365,97 @@ func TestFinalizeRejectsNonTerminal(t *testing.T) {
 	l, _ := openTempLedger(t)
 	if err := l.Finalize("req-1", "sha256:aaa", StateAccepted); err == nil {
 		t.Fatal("Finalize(ACCEPTED)인데 통과")
+	}
+}
+
+// resolveUnexecuted는 req를 attempt=1로 durable UNEXECUTED까지 몰고 간다(재개 테스트 baseline).
+func resolveUnexecuted(t *testing.T, l *Ledger, req, digest string) {
+	t.Helper()
+	if dec := l.Accept(req, digest, firstAttempt); !dec.Proceed {
+		t.Fatalf("최초 Accept Proceed 기대: %+v", dec)
+	}
+	if err := l.Finalize(req, digest, StateUnexecuted); err != nil {
+		t.Fatalf("Finalize UNEXECUTED: %v", err)
+	}
+}
+
+// TestLedgerResumeTransition은 조각 C R1 핵심이다: terminal UNEXECUTED(attempt 1) + 재개 요청
+// (attempt 2, 같은 digest)이 **ACCEPTED(2)로 재개**되고(Proceed), 그 뒤 Finalize가 attempt 2를
+// 이어받아 terminal을 기록함을 본다(attempt가 finalize에서 0으로 되감기지 않는다).
+func TestLedgerResumeTransition(t *testing.T) {
+	l, _ := openTempLedger(t)
+	resolveUnexecuted(t, l, "req-1", "sha256:aaa")
+
+	// 재개(attempt 2) → Proceed(ACCEPTED@2).
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt+1); !dec.Proceed {
+		t.Fatalf("terminal UNEXECUTED@1 + attempt2는 재개 Proceed여야 한다: %+v", dec)
+	}
+	// 재개 중 재수신(같은 attempt 2, 비terminal) → 중복 → UNKNOWN 보고(재실행 없음).
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt+1); dec.Proceed || dec.Report != StateUnknown {
+		t.Fatalf("재개 진행 중 같은 attempt 재수신은 UNKNOWN 보고여야 한다: %+v", dec)
+	}
+	// Finalize가 attempt 2를 이어받아 COMPLETED@2 기록 → 이후 조회는 COMPLETED.
+	if err := l.Finalize("req-1", "sha256:aaa", StateCompleted); err != nil {
+		t.Fatalf("Finalize COMPLETED: %v", err)
+	}
+	if st, ok := l.Status("req-1"); !ok || st != StateCompleted {
+		t.Fatalf("재개 완료 후 COMPLETED여야 한다: st=%q ok=%v", st, ok)
+	}
+}
+
+// TestLedgerResumeOnlyFromUnexecuted는 R1의 재개 대상 제한이다: terminal **COMPLETED**·**UNKNOWN**은
+// attempt N+1이 와도 재개하지 않고 그 상태를 보고한다(COMPLETED 재개 금지 = 옛 응답 replay 최후방어).
+func TestLedgerResumeOnlyFromUnexecuted(t *testing.T) {
+	// COMPLETED@1 + attempt2 → Report COMPLETED(재개 금지).
+	l1, _ := openTempLedger(t)
+	if dec := l1.Accept("c", "d", firstAttempt); !dec.Proceed {
+		t.Fatalf("Accept: %+v", dec)
+	}
+	if err := l1.Finalize("c", "d", StateCompleted); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if dec := l1.Accept("c", "d", firstAttempt+1); dec.Proceed || dec.Report != StateCompleted {
+		t.Fatalf("COMPLETED terminal + attempt2는 재개 금지·COMPLETED 보고여야 한다(replay 최후방어): %+v", dec)
+	}
+
+	// UNKNOWN@1 + attempt2 → Report UNKNOWN(재개 금지 — UNEXECUTED만 재개 대상).
+	l2, _ := openTempLedger(t)
+	if dec := l2.Accept("u", "d", firstAttempt); !dec.Proceed {
+		t.Fatalf("Accept: %+v", dec)
+	}
+	if err := l2.Finalize("u", "d", StateUnknown); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if dec := l2.Accept("u", "d", firstAttempt+1); dec.Proceed || dec.Report != StateUnknown {
+		t.Fatalf("UNKNOWN terminal + attempt2는 재개 금지·UNKNOWN 보고여야 한다: %+v", dec)
+	}
+}
+
+// TestLedgerStaleAttemptReported는 M3다: 현재보다 낮은 attempt(지연·순서 뒤바뀜)가 오면 재감기
+// 없이 지금 상태를 stale 보고함을 본다 — attempt 2 재개 기록 뒤 도착한 attempt 1이 되감지 못한다.
+func TestLedgerStaleAttemptReported(t *testing.T) {
+	l, _ := openTempLedger(t)
+	resolveUnexecuted(t, l, "req-1", "sha256:aaa")
+	// 재개(attempt 2) → COMPLETED@2.
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt+1); !dec.Proceed {
+		t.Fatalf("재개 Proceed 기대: %+v", dec)
+	}
+	if err := l.Finalize("req-1", "sha256:aaa", StateCompleted); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	// 이제 지연 도착한 attempt 1(< 현재 2) → stale, 지금 상태(COMPLETED) 보고 · 재감기 없음.
+	if dec := l.Accept("req-1", "sha256:aaa", firstAttempt); dec.Proceed || dec.Report != StateCompleted {
+		t.Fatalf("stale attempt(1 < 현재 2)는 지금 상태 보고여야 한다(재감기 없음): %+v", dec)
+	}
+}
+
+// TestLedgerConflictDominatesAttempt는 H2 축 분리다: 같은 requestId에 **다른 digest**면 attempt와
+// 무관하게 충돌이다(재개 attempt로 위장해도 다른 command는 재실행하지 않는다 · 부작용0).
+func TestLedgerConflictDominatesAttempt(t *testing.T) {
+	l, _ := openTempLedger(t)
+	resolveUnexecuted(t, l, "req-1", "sha256:aaa")
+	// 다른 digest + 재개 attempt → 여전히 Conflict(충돌 축이 attempt보다 앞선다).
+	if dec := l.Accept("req-1", "sha256:zzz", firstAttempt+1); !dec.Conflict {
+		t.Fatalf("다른 digest는 attempt와 무관하게 Conflict여야 한다: %+v", dec)
 	}
 }
