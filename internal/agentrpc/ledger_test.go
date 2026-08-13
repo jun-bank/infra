@@ -255,6 +255,49 @@ func TestLedgerTornTailTruncateSurvivesReopen(t *testing.T) {
 	}
 }
 
+// TestLedgerCompleteRecordMissingNewlineTruncated은 C6 근본이다: 완전한 JSON 레코드까지 다
+// 기록되고 **마지막 개행만 유실된** 경우(fsync 반환 직전 crash — 파싱은 성공)도 torn tail로 보고
+// 버려·truncate한다. 파싱 성공만으로 남기면 이후 append가 "}{"가 되어 다음 재기동에서 치명 손상.
+func TestLedgerCompleteRecordMissingNewlineTruncated(t *testing.T) {
+	dir := t.TempDir()
+	journal, lock := filepath.Join(dir, "j"), filepath.Join(dir, "l")
+	line1 := `{"requestId":"req-1","digest":"sha256:aaa","state":"ACCEPTED","ts":"t"}` + "\n"
+	// req-2는 **완전한 유효 JSON**이지만 trailing 개행이 없다(개행만 유실 — 파싱은 성공한다).
+	line2NoNL := `{"requestId":"req-2","digest":"sha256:bbb","state":"COMPLETED","ts":"t"}`
+	if err := os.WriteFile(journal, []byte(line1+line2NoNL), 0o600); err != nil {
+		t.Fatalf("write journal: %v", err)
+	}
+
+	l, err := OpenLedger(journal, lock)
+	if err != nil {
+		t.Fatalf("OpenLedger: %v", err)
+	}
+	// req-2는 파싱 성공하지만 개행 유실이므로 버려져야 한다(fsync 전 = durable 아님).
+	if _, ok := l.Status("req-2"); ok {
+		t.Fatal("개행 유실된 마지막 레코드(req-2)는 파싱 성공해도 버려져야 한다(fsync 전 · durable 아님)")
+	}
+	if st, ok := l.Status("req-1"); !ok || st != StateUnknown {
+		t.Fatalf("req-1은 UNKNOWN으로 회복돼야 한다: st=%q ok=%v", st, ok)
+	}
+	// 디스크도 line1까지 truncate.
+	if fi, _ := os.Stat(journal); fi.Size() != int64(len(line1)) {
+		t.Fatalf("개행 유실 tail이 디스크에서 truncate되지 않았다: size=%d want=%d", func() int64 { fi, _ := os.Stat(journal); return fi.Size() }(), len(line1))
+	}
+	// truncate 뒤 이어 쓰기 → 재기동이 clean해야 한다(truncate 없으면 "}{"로 중간 손상 치명).
+	if err := l.Finalize("req-1", "sha256:aaa", StateCompleted); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	_ = l.Close()
+	l2, err := OpenLedger(journal, lock)
+	if err != nil {
+		t.Fatalf("재기동이 실패했다(개행 유실 tail 미truncate 시 중간 손상): %v", err)
+	}
+	t.Cleanup(func() { _ = l2.Close() })
+	if st, ok := l2.Status("req-1"); !ok || st != StateCompleted {
+		t.Fatalf("재기동 후 COMPLETED 복원 기대: st=%q ok=%v", st, ok)
+	}
+}
+
 // TestLedgerMidCorruptionFatal은 C6다: 개행으로 끝난 완전한 줄이 손상됐거나 중간 줄이 손상되면
 // 치명(기동 거부)임을 본다 — append-only 단일 writer에서 그런 손상은 torn이 아니라 진짜 오염이다.
 func TestLedgerMidCorruptionFatal(t *testing.T) {
