@@ -229,7 +229,7 @@ func (d LocalDispatcher) runSinglePath(ctx context.Context, imageRef string, pla
 	}
 	st, err := d.runGreenPhases(ctx, imageRef, exec, health)
 	if st == StateCompleted && plan != nil {
-		plan.promote(compose.SlotSingle, injected)
+		plan.promote(ctx, compose.SlotSingle, injected)
 	}
 	return st, err
 }
@@ -335,20 +335,31 @@ func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string,
 
 	idleExec, idleHealth := d.SlotExec[idle], d.SlotHealth[idle]
 	activeExec := d.SlotExec[active]
-	if idleExec == nil || idleHealth == nil || activeExec == nil {
+	if idleExec == nil || idleHealth == nil {
 		return StateUnexecuted, fmt.Errorf("슬롯 배선 부재(active=%s idle=%s) — compose file·project·헬스 URL이 슬롯마다 있어야 한다(부작용 0 · fail-closed)", active, idle)
 	}
 
-	// 1-b. 동봉 경로라면 여기서 idle 슬롯의 candidate를 기록하고 실행기를 그 경로에 결박한다.
-	//      슬롯이 정해진 뒤에야 기록할 수 있으므로(경로가 슬롯별이다) preflight와 갈라져 있다.
-	//      실패해도 승격은 없으므로 잔류 candidate는 무해하다(GC 대상 · B4' 재기술).
+	// 1-b. 동봉 경로라면 여기서 두 슬롯의 실행기를 각자의 정의에 결박한다. 슬롯이 정해진
+	//      뒤에야 할 수 있으므로 preflight와 갈라져 있다.
+	//        idle   — 이번 서명 바이트로 만든 candidate(기록이 여기서 일어난다).
+	//        active — applied 인덱스의 그 슬롯 최근 record = 지금 떠 있는 정의(E-7).
+	//      idle 결박이 실패해도 승격은 없으므로 잔류 candidate는 무해하다(GC 대상 · B4').
 	var injected map[string]string
 	if plan != nil {
+		aexec, aerr := plan.bindActive(string(active), activeExec)
+		if aerr != nil {
+			return StateUnexecuted, aerr
+		}
+		activeExec = aexec
+
 		var berr error
 		idleExec, idleHealth, injected, berr = plan.bind(string(idle))
 		if berr != nil {
 			return StateUnexecuted, berr
 		}
+	}
+	if activeExec == nil {
+		return StateUnexecuted, fmt.Errorf("구 active 슬롯(%s)의 실행기 배선이 없다 — 전환 후 그 슬롯을 내릴 수 없다(부작용 0 · fail-closed)", active)
 	}
 
 	// 2. ②③④ — 새 버전을 idle slot에 올리고 CD-1 헬스까지 통과시킨다. 여기까지의 실패는
@@ -385,7 +396,7 @@ func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string,
 	// BG 완주 후에만 승격한다(B4') — 여기 도달했다는 것은 헬스·전환·드레인·구 slot 종료가
 	// 전부 끝났다는 뜻이고, 그때의 정의만이 "마지막 정상본"으로 복원 재료가 될 자격이 있다.
 	if plan != nil {
-		plan.promote(string(idle), injected)
+		plan.promote(ctx, string(idle), injected)
 	}
 	return StateCompleted, nil
 }

@@ -423,6 +423,26 @@ func buildDispatcher() (dispatcherBuild, error) {
 	if gatewayURL != "" && appService == "" {
 		return b, errors.New("DEPLOY_GATEWAY_URL이 설정되면 DEPLOY_APP_SERVICE(배포 대상 app compose 서비스명 — 현 .9 구조는 \"app\")가 필수다 — 사후조건을 대상 서비스에 결박하지 않으면 사이드카/orphan이 pinned digest를 실행 중일 때 틀린 이미지가 COMPLETED로 기록되고 그 위로 라우트가 전환된다(H2 fail-open · fail-closed)")
 	}
+
+	// 동봉이 필수인 배선(= legacy opt-in이 꺼져 있다)에서는 두 값이 **단일 경로를 포함해**
+	// 기동 필수다(리뷰 E-4). 둘 다 동봉 검증의 입력이라, 없으면 검증이 성립하지 않는다:
+	//   DEPLOY_APP_SERVICE — CP-3 3자 일치의 호스트 쪽 한 자리. 비면 대조할 상대가 없다.
+	//   DEPLOY_IMAGE_ENV   — 동봉 compose의 `image: ${...}` 정확일치 대상. 기본값에 기대면
+	//                        정본 compose가 쓰는 변수명(.9: CORE_IMAGE)과 어긋난 채 기동하고,
+	//                        그 어긋남은 매 배포의 검증 실패로만 드러난다.
+	allowLegacy, err := parseAllowLegacy()
+	if err != nil {
+		return b, err
+	}
+	if !allowLegacy {
+		if appService == "" {
+			return b, fmt.Errorf("동봉 compose가 필수인 배선에서는 DEPLOY_APP_SERVICE가 기동 필수다(단일 경로 포함) — CP-3 3자 일치의 호스트 쪽 값이 없으면 서명된 appService와 대조할 상대가 없다(%s=1로 과도기 경로를 켜지 않는 한 fail-closed)", envAllowLegacy)
+		}
+		if strings.TrimSpace(os.Getenv("DEPLOY_IMAGE_ENV")) == "" {
+			return b, fmt.Errorf("동봉 compose가 필수인 배선에서는 DEPLOY_IMAGE_ENV가 기동 필수다 — 정본 compose의 `image: ${...}` 변수명과 정확히 같아야 하며(현 .9: CORE_IMAGE) 기본값에 기대면 어긋남이 매 배포의 검증 실패로만 드러난다(%s=1로 과도기 경로를 켜지 않는 한 fail-closed)", envAllowLegacy)
+		}
+	}
+
 	if appService == "" {
 		fmt.Println("경고: DEPLOY_APP_SERVICE 미설정 — 사후조건·재시작 검사가 compose 프로젝트 전체를 대상으로 한다(대상 app 서비스 결박 없음 · H2·M1 잔여). 배포 대상 서비스명을 설정하면 결박이 켜진다")
 	} else {

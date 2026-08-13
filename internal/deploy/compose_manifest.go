@@ -169,8 +169,20 @@ func validLowerHex(s string) bool {
 	return true
 }
 
-// strictTopLevelKeys는 body를 토큰 수준으로 훑어 ⑴ 중복 키(중첩 포함) ⑵ 후행 데이터를
-// 거절하고 최상위 키 집합을 준다. encoding/json의 구조체 디코드로는 이 둘을 볼 수 없다 —
+// canonicalManifestKeys는 manifest 최상위에 허용되는 **정확한 키 문자열** 8개다.
+//
+// DisallowUnknownFields만으로 부족한 이유(리뷰 E-5): encoding/json의 필드 매칭은 대소문자를
+// 무시한다. `{"COMPOSECONTENT":"…"}`는 구조체의 ComposeContent에 **매칭되므로** 미지 필드로
+// 걸리지 않고 조용히 디코드된다. 그러면 2분법의 판정 소스가 둘이 된다: 키 존재 검사(정확
+// 문자열)는 "없다"고 보고 디코드 값은 "있다"가 되어, 부분 조합이 legacy로 접힌 채 내용은
+// 실려 있는 상태가 만들어진다. 정확 문자열 allowlist가 그 갈림을 원천에서 닫는다.
+var canonicalManifestKeys = map[string]bool{
+	"target": true, "commitSha": true, "imageDigest": true, "composeRevision": true,
+	"configVersion": true, "requestId": true, "composeContent": true, "appService": true,
+}
+
+// strictTopLevelKeys는 body를 토큰 수준으로 훑어 ⑴ 중복 키(중첩 포함) ⑵ 후행 데이터
+// ⑶ canonical 키 밖의 최상위 키를 거절하고 최상위 키 집합을 준다. encoding/json의 구조체 디코드로는 이 둘을 볼 수 없다 —
 // 중복 키는 뒤엣것이 조용히 이기고, 첫 값 뒤의 쓰레기는 Unmarshal이 아니라 Decoder만 본다.
 //
 // 최상위 키 집합이 필요한 이유는 2분법이 "값이 무엇인가"가 아니라 "키가 있는가"로 갈리기
@@ -199,6 +211,9 @@ func strictTopLevelKeys(body []byte) (map[string]bool, error) {
 		}
 		if keys[key] {
 			return nil, fmt.Errorf("%w: 최상위 중복 키 %q", ErrManifestJSONStrict, key)
+		}
+		if !canonicalManifestKeys[key] {
+			return nil, fmt.Errorf("%w: 최상위 키가 canonical 목록 밖이다 %q(대소문자 변형 포함 — JSON 필드 매칭은 대소문자를 무시하므로 변형 키가 구조체에 조용히 실린다)", ErrManifestJSONStrict, key)
 		}
 		keys[key] = true
 		if verr := skipJSONValue(dec); verr != nil {
