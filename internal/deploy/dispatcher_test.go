@@ -40,6 +40,7 @@ type fakeExec struct {
 	downCtxErr  error     // 마지막 Down에 넘어온 context의 Err()(취소된 ctx 재사용 감시 — O1).
 	blockUp     bool      // true면 Up이 ctx.Done까지 블록하고 ctx.Err()를 낸다(phase budget 초과 재현).
 	blockVerify bool      // true면 VerifyImageDigest가 ctx.Done까지 블록한다(phase budget이 verify를 상한하는지 — H1).
+	onDown      func()    // Down **직전**에 불린다 — 실행 시점의 파일 상태를 포착하기 위한 주입점.
 }
 
 // record는 호출을 공유 순서 로그에 남긴다(log가 nil이면 아무것도 하지 않는다).
@@ -80,6 +81,9 @@ func (f *fakeExec) VerifyImageDigest(ctx context.Context, ref string) error {
 	return f.verifyErr
 }
 func (f *fakeExec) Down(ctx context.Context) error {
+	if f.onDown != nil {
+		f.onDown()
+	}
 	f.downs++
 	f.downAt = time.Now()
 	f.downCtxErr = ctx.Err()
@@ -91,9 +95,15 @@ type fakeHealth struct {
 	err  error
 	name string
 	log  *[]string
+	// hook은 판정 직전에 불린다 — 배포 **시퀀스 중간**(기동 뒤·전환 앞)에 외부 상태를
+	// 흔들어 보기 위한 주입점이다(TOCTOU 창 시험).
+	hook func()
 }
 
 func (f fakeHealth) Check(context.Context) error {
+	if f.hook != nil {
+		f.hook()
+	}
 	if f.log != nil {
 		step := "health"
 		if f.name != "" {

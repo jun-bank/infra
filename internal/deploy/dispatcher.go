@@ -346,7 +346,10 @@ func (d LocalDispatcher) dispatchBlueGreen(ctx context.Context, imageRef string,
 	//      idle 결박이 실패해도 승격은 없으므로 잔류 candidate는 무해하다(GC 대상 · B4').
 	var injected map[string]string
 	if plan != nil {
-		aexec, aerr := plan.bindActive(string(active), activeExec)
+		aexec, releaseSnapshot, aerr := plan.bindActive(string(active), activeExec)
+		// 스냅샷 정리는 **이 함수를 벗어날 때** 한다(성공·실패·UNKNOWN 무관) — down이
+		// ⑨까지 가야 쓰이므로, 그 전에 지우면 결박한 파일이 실행 시점에 사라진다.
+		defer releaseSnapshot()
 		if aerr != nil {
 			return StateUnexecuted, aerr
 		}
