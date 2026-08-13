@@ -192,6 +192,55 @@ func TestGuardLocalDispatcherDecoratesBindExecutor(t *testing.T) {
 	}
 }
 
+// orderedConfirmer는 C-B1 동시성 방어심층 테스트용이다: 첫 확인(느린 성공)은 진입을 알리고
+// release까지 블록하며, 둘째 확인(빠른 실패)은 즉시 오류를 낸다 — 두 확인의 순서를 채널로
+// 제어해 "늦게 성공한 확인이 그 사이 고정된 denied를 만나는" 창을 만든다.
+type orderedConfirmer struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	n       int
+}
+
+func (c *orderedConfirmer) Confirm(context.Context, deploy.Target, string, uint64) error {
+	c.mu.Lock()
+	c.n++
+	call := c.n
+	c.mu.Unlock()
+	if call == 1 { // B — 느린 성공(release까지 블록)
+		close(c.entered)
+		<-c.release
+		return nil
+	}
+	return errors.New("fence stale") // A — 빠른 실패
+}
+
+// TestGuardSessionStickyRaceBlocksLateSuccess는 C-B1이다: 두 확인이 동시에 denied 검사를 통과한
+// 뒤, 하나(A)가 실패해 denied를 고정하면 **늦게 성공한** 다른 확인(B)도 nil을 반환하지 않고
+// 그 denied를 반환함을 본다(성공 반환 직전 원자 재판정). 이 재판정을 제거하면 B가 nil을 내
+// 이미 잃은 fence 위로 mutation이 열린다(뮤테이션 — 이 테스트가 FAIL한다). -race로도 검증된다.
+func TestGuardSessionStickyRaceBlocksLateSuccess(t *testing.T) {
+	conf := &orderedConfirmer{entered: make(chan struct{}), release: make(chan struct{})}
+	session := NewGuardSession(conf, deploy.TargetSettlement, "req-1", 7)
+	ctx := context.Background()
+
+	var bErr error
+	done := make(chan struct{})
+	go func() { bErr = session.guard(ctx, "up-B"); close(done) }() // 확인 1 = B(느린 성공)
+	<-conf.entered                                                 // B가 Confirm 안에서 블록 중
+
+	aErr := session.guard(ctx, "up-A") // 확인 2 = A(빠른 실패) → denied 고정
+	if aErr == nil {
+		t.Fatal("A(fence 실패)는 오류를 내야 한다")
+	}
+	close(conf.release) // B의 Confirm이 이제 nil을 반환
+	<-done
+
+	if bErr == nil {
+		t.Fatal("늦게 성공한 B는 그 사이 고정된 denied를 만나 차단돼야 한다(C-B1 — 성공 반환 직전 재판정)")
+	}
+}
+
 // TestGuardWithRealClientStaleDeniesMutation은 실 FenceClient→main(stale)→GuardSession→
 // guardedExecutor를 한 줄로 엮어, stale lease가 up을 막고(변이 금지) sticky가 이후 down까지
 // 막으며 store가 정확히 1회만 읽힘을 본다(전체 왕복의 mutation 차단 실증).

@@ -516,3 +516,50 @@ func TestBuildRoutingDispatcherRejectsOneSidedRemote(t *testing.T) {
 		t.Fatal("원격 미설정인데 remoteRegistered=true")
 	}
 }
+
+// TestFenceBootConfigRejectsMisconfig는 C-B2 방어심층이다: 원격 위성 키가 있을 때 fence 리스너의
+// boot 입력이 잘못되면 조용히 축소하지 않고 거부함을 본다(fenceBootConfig 순수 검증 — bind 없음).
+func TestFenceBootConfigRejectsMisconfig(t *testing.T) {
+	reject := []struct {
+		name              string
+		rawAddr, rawAllow string
+	}{
+		{"addr 미설정(loopback 조용한 축소 금지)", "", "10.0.0.158"},
+		{"addr loopback", "127.0.0.1:9443", "10.0.0.158"},
+		{"addr 공개 IP", "8.8.8.8:9443", "10.0.0.158"},
+		{"allowlist 미설정", "10.0.0.9:9443", ""},
+		{"allowlist 빈 파싱(콤마만)", "10.0.0.9:9443", ", ,"},
+		{"allowlist 공개 IP", "10.0.0.9:9443", "8.8.8.8"},
+		{"allowlist hostname", "10.0.0.9:9443", "sat.host"},
+	}
+	for _, c := range reject {
+		if _, _, _, err := fenceBootConfig(c.rawAddr, true /*hasKeys*/, c.rawAllow); err == nil {
+			t.Errorf("%s인데 fenceBootConfig 통과(boot fail-closed 위반)", c.name)
+		}
+	}
+
+	// addr만 있고 위성 키 없음 = 검증할 위성 없는 오배선 → 거부.
+	if _, _, _, err := fenceBootConfig("10.0.0.9:9443", false /*hasKeys*/, ""); err == nil {
+		t.Error("위성 키 없이 fence addr만 설정됐는데 통과(오배선 fail-closed 위반)")
+	}
+}
+
+// TestFenceBootConfigAcceptsValid는 올바른 배선(원격 위성 + non-loopback private addr + private
+// allowlist)이 통과하고, 위성 키 없음은 fencing 미배선(enabled=false)으로 통과함을 본다.
+func TestFenceBootConfigAcceptsValid(t *testing.T) {
+	addr, allowed, enabled, err := fenceBootConfig("10.0.0.9:9443", true /*hasKeys*/, "10.0.0.158, 10.0.0.164")
+	if err != nil || !enabled {
+		t.Fatalf("올바른 배선은 통과·enabled여야 한다: enabled=%v err=%v", enabled, err)
+	}
+	if addr != "10.0.0.9:9443" {
+		t.Fatalf("검증된 addr 기대: %q", addr)
+	}
+	if !allowed["10.0.0.158"] || !allowed["10.0.0.164"] {
+		t.Fatalf("allowlist에 위성 IP가 있어야 한다: %v", allowed)
+	}
+
+	// 위성 키 없음 → fencing 미배선(enabled=false), 오류 없음.
+	if _, _, enabled, err := fenceBootConfig("", false /*hasKeys*/, ""); err != nil || enabled {
+		t.Fatalf("위성 키 없음은 fencing 미배선(enabled=false)으로 통과해야 한다: enabled=%v err=%v", enabled, err)
+	}
+}

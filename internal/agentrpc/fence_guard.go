@@ -71,7 +71,18 @@ func (g *GuardSession) guard(ctx context.Context, op string) error {
 
 	cerr := g.confirmer.Confirm(ctx, g.target, g.requestID, g.token)
 	if cerr == nil {
-		return nil // HELD — 이 mutation 진행 허가
+		// C-B1 방어심층 — RPC 성공과 nil 반환 사이에, 동시에 도는 다른 확인이 fence를 잃어
+		// denied를 고정했을 수 있다(현 경로는 단일 dispatch 순차라 실경합이 없지만, 조각 C가
+		// mutation을 동시화하면 열린다). 반환 직전에 mutex를 다시 잡아 denied를 **원자 재판정**해,
+		// 늦게 성공한 이 확인이 이미 잃은 fence 위로 mutation을 열지 않게 한다 — 세대/in-flight
+		// 추적 없이 "성공 반환 직전 denied 재확인"이면 sticky 불변식이 동시성에서도 유지된다.
+		g.mu.Lock()
+		denied := g.denied
+		g.mu.Unlock()
+		if denied != nil {
+			return denied
+		}
+		return nil // HELD · 그 사이 denied 고정 없음 — 이 mutation 진행 허가
 	}
 
 	g.mu.Lock()
