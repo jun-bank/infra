@@ -36,5 +36,8 @@ infra는 jun-bank의 배포 파이프라인 중 **수신·검증·실행** 축�
 | #29 | #28 | [pr-29-oidc-allowlist.md](pr-29-oidc-allowlist.md) | repo별 allowlist·repo↔target 결박 |
 | #30 | #20·#21 | [pr-30-outcome-identity.md](pr-30-outcome-identity.md) | Outcome 분리·identity 결박 |
 | #31 | #19 | [pr-31-compose-embed.md](pr-31-compose-embed.md) | compose 동봉 실행 결박 — S2의 마지막 조각 |
+| #34·#37·#38·#36 | S3 | [pr-34-38-satellite-transport.md](pr-34-38-satellite-transport.md) | 위성으로 배포를 넓히다 — 재슬라이스 3조각(전송·fencing·재개)+실배선·CDT-1 종결 |
+
+S3(위성 배포)는 코드 전 재슬라이스로 3조각(#34 전송·#37 fencing·#38 자동 재개)으로 나뉘고 #36 실배선으로 정산(.158)·원장(.164)이 실동작한다 — 배포 대상 넷 완성. PR 단위가 아니라 여정 종합 1편으로 읽는다.
 
 전체 아키텍처 해설과 설계 패턴 문서는 docs repo의 `study/tech/infra-journey/`에 있다 — 이 폴더가 PR 단위의 세로 읽기라면 그쪽은 구조의 가로 읽기다.
